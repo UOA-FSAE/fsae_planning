@@ -17,88 +17,109 @@ def _heading_error(car_pos, car_yaw, target_global) -> float:
 
 
 def compute_steering(car_pos, car_yaw, target_global) -> float:
-    """
-    Pure-proportional steering (legacy helper, kept for reference).
-    Prefer SteeringPID for closed-loop driving.
-    """
+    """Pure-proportional steering (legacy helper, kept for reference)."""
     return float(np.clip(-_heading_error(car_pos, car_yaw, target_global)
                          / MAX_STEER_RAD, -1.0, 1.0))
 
 
-class SteeringPID:
+class StanleyController:
     """
-    PID controller for heading-error steering.
+    Stanley path-tracking steering controller (Thrun et al., DARPA 2005).
+
+    δ = θ_e + arctan(k_cte · e / (v + k_soft))
+
+    θ_e — heading error: path tangent angle minus car yaw (rad).
+          Positive when path turns left relative to the car.
+    e   — cross-track error: signed lateral distance from the front axle
+          to the nearest path point (m), positive when the axle is to
+          the RIGHT of the path.
+    v   — car speed (m/s); k_soft prevents division by zero at standstill.
 
     Sign convention (FSDS ENU: x forward, y left):
-      heading_error > 0  → target is left  → need negative steering (steer left)
-      heading_error < 0  → target is right → need positive steering (steer right)
-      steering output ∈ [-1, 1]
+      output > 0  → steer right
+      output < 0  → steer left
+      output ∈ [-1, 1]
 
-    Gains:
-      Kp — proportional.  Default 1/MAX_STEER_RAD keeps the same proportional
-           response as the original pure-pursuit controller.
-      Ki — integral.      Corrects steady-state drift from road camber, etc.
-           Accumulated error is clamped to ±integral_limit to prevent windup.
-      Kd — derivative.    The primary anti-sway term: damps oscillation by
-           counter-steering when the heading error is changing rapidly.
-           A simple EMA filter (d_alpha) reduces differentiation noise.
+    Tuning:
+      k_cte     — cross-track gain.  Higher values correct lateral error faster
+                  but cause oscillation on a high-speed straight.
+      k_soft    — speed softening (m/s).  Set to ~walking speed so the CTE
+                  term doesn't saturate the steering at low speeds.
+      k_d       — yaw-rate damper gain.  Subtracts k_d·ω from the Stanley
+                  angle before normalising, opposing rapid heading changes.
+                  This is the primary fix for left-right sway: the CTE term
+                  alone has no memory of how fast the heading is already
+                  changing, so it overshoots; k_d·ω counters each swing.
+      wheelbase — distance from rear to front axle (m).  Used to project
+                  the control point to the front axle, which is where Stanley
+                  measures cross-track error.
     """
 
     def __init__(
         self,
-        kp: float = 1.0 / MAX_STEER_RAD,
-        ki: float = 0.2,
-        kd: float = 0.15,
-        integral_limit: float = 0.5,
-        d_alpha: float = 0.3,
+        k_cte: float = 1.0,
+        k_soft: float = 1.0,
+        k_d: float = 0.1,
+        wheelbase: float = 1.5,
     ):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self._integral_limit = integral_limit
-        self._d_alpha = d_alpha          # EMA weight for previous derivative
+        self.k_cte     = k_cte
+        self.k_soft    = k_soft
+        self.k_d       = k_d
+        self.wheelbase = wheelbase
 
-        self._integral  = 0.0
-        self._prev_err  = 0.0
-        self._prev_d    = 0.0            # filtered derivative
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def compute(self, car_pos, car_yaw, target_global, dt: float) -> float:
+    def compute(
+        self,
+        path: np.ndarray,
+        car_pos: np.ndarray,
+        car_yaw: float,
+        car_speed: float,
+        car_yaw_rate: float = 0.0,
+    ) -> float:
         """
-        Compute a steering command in [-1, 1].
+        Return a steering command in [-1, 1].
 
-        car_pos        — (2,) array, car position in map frame
-        car_yaw        — float, car heading in radians
-        target_global  — (2,) array, lookahead target in map frame
-        dt             — seconds since the last call (must be > 0)
+        path         — (N, 2) array of waypoints in map frame (must have N ≥ 2)
+        car_pos      — (2,) car position in map frame
+        car_yaw      — car heading in radians
+        car_speed    — car speed in m/s
+        car_yaw_rate — yaw rate in rad/s (positive = left / CCW); used by the
+                       damper term to oppose rapid heading changes
         """
-        dt  = max(dt, 1e-4)
-        err = _heading_error(car_pos, car_yaw, target_global)
+        if len(path) < 2:
+            return 0.0
 
-        # --- P ---
-        p = self.kp * err
+        # Project control point to front axle
+        fa = car_pos + self.wheelbase * np.array([math.cos(car_yaw), math.sin(car_yaw)])
 
-        # --- I  (with anti-windup clamp) ---
-        self._integral = float(np.clip(
-            self._integral + err * dt,
-            -self._integral_limit,
-            self._integral_limit,
-        ))
-        i = self.ki * self._integral
+        # Nearest waypoint index to front axle
+        idx = int(np.argmin(np.linalg.norm(path - fa, axis=1)))
 
-        # --- D  (EMA-filtered finite difference) ---
-        d_raw         = (err - self._prev_err) / dt
-        self._prev_d  = self._d_alpha * self._prev_d + (1.0 - self._d_alpha) * d_raw
-        self._prev_err = err
-        d = self.kd * self._prev_d
+        # Unit tangent in direction of travel at that waypoint
+        if idx < len(path) - 1:
+            seg = path[idx + 1] - path[idx]
+        else:
+            seg = path[idx] - path[idx - 1]
+        seg_len = float(np.linalg.norm(seg))
+        if seg_len < 1e-6:
+            return 0.0
+        t = seg / seg_len
 
-        return float(np.clip(-(p + i + d), -1.0, 1.0))
+        # Heading error: path_yaw - car_yaw, normalised to (-π, π)
+        path_yaw = math.atan2(t[1], t[0])
+        theta_e = math.atan2(
+            math.sin(path_yaw - car_yaw),
+            math.cos(path_yaw - car_yaw),
+        )
 
-    def reset(self) -> None:
-        """Reset integrator and derivative state (call when car stops)."""
-        self._integral = 0.0
-        self._prev_err = 0.0
-        self._prev_d   = 0.0
+        # Cross-track error: right-normal of path, positive = axle right of path
+        right_n = np.array([t[1], -t[0]])   # 90° CW rotation of tangent
+        e = float(np.dot(fa - path[idx], right_n))
+
+        # Stanley angle — positive in standard convention = left turn = FSDS negative.
+        # Damper subtracts k_d·ω: when the car is already swinging left (ω > 0),
+        # this reduces δ so the next tick steers less left, preventing overshoot.
+        delta = (theta_e
+                 + math.atan2(self.k_cte * e, car_speed + self.k_soft)
+                 - self.k_d * car_yaw_rate)
+
+        return float(np.clip(-delta / MAX_STEER_RAD, -1.0, 1.0))

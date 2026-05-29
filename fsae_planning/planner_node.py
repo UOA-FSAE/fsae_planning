@@ -48,7 +48,6 @@ class PlannerNode(Node):
         self._car_pos = np.zeros(2)
         self._car_yaw = 0.0
         self._centreline: np.ndarray | None = None
-        self._viz_target: np.ndarray | None = None
 
         self.create_timer(0.05, self._planning_loop)
 
@@ -118,7 +117,6 @@ class PlannerNode(Node):
         target = get_lookahead_waypoint(
             self._centreline, self._car_pos, self._car_yaw, LOOKAHEAD_DIST
         )
-        self._viz_target = target
 
         if target is None:
             return
@@ -154,7 +152,6 @@ class PlannerNode(Node):
             self._blue_cones,
             self._yellow_cones,
             self._centreline,
-            self._viz_target,
         )
 
     def _publish_path(self) -> None:

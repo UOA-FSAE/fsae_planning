@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 
 
 class Visualizer:
-    """Non-blocking overhead ego-view: car, cones, centreline, lookahead target.
+    """Non-blocking overhead ego-view: car, cones, centreline.
 
     Coordinate convention for the plot:
         +y  = ahead of car  (up on screen)
@@ -27,7 +27,6 @@ class Visualizer:
         blue_cones: np.ndarray,
         yellow_cones: np.ndarray,
         centreline: np.ndarray | None,
-        target: np.ndarray | None = None,
     ) -> None:
         ax = self._ax
         ax.cla()
@@ -58,11 +57,6 @@ class Visualizer:
         if centreline is not None and len(centreline) > 0:
             cl = to_plot(centreline)
             ax.plot(cl[:, 0], cl[:, 1], 'g--', lw=1.5, label='Centreline', zorder=2)
-
-        if target is not None:
-            tgt = to_plot(np.atleast_2d(target))
-            ax.scatter(tgt[:, 0], tgt[:, 1], c='red', s=150,
-                       marker='*', zorder=5, label='Target')
 
         # Car as filled triangle pointing up (= forward)
         ax.add_patch(plt.Polygon(

@@ -6,11 +6,10 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from fs_msgs.msg import ControlCommand, GoSignal, Track
-from geometry_msgs.msg import PointStamped
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Float32
 
-from .control_utils import SteeringPID
+from .control_utils import StanleyController
 from fsae_planning.planning_utils import separate_cones_by_color
 
 KP_THROTTLE      = 0.06  # throttle P-gain  (throttle per m/s of under-speed)
@@ -31,26 +30,26 @@ class ControlNode(Node):
             depth=10,
         )
 
-        self.create_subscription(PointStamped, '/fsds/lookahead_target',  self._target_cb, 10)
-        self.create_subscription(Float32,      '/fsds/desired_speed',     self._speed_cb,  10)
-        self.create_subscription(Odometry,     '/fsds/testing_only/odom', self._odom_cb,   sensor_qos)
-        self.create_subscription(Track,        '/FusionCones',            self._track_cb,  10)
-        self.create_subscription(GoSignal,     '/fsds/signal/go',         self._go_cb,     10)
+        self.create_subscription(Path,      '/fsds/planned_path',      self._path_cb,   10)
+        self.create_subscription(Float32,   '/fsds/desired_speed',     self._speed_cb,  10)
+        self.create_subscription(Odometry,  '/fsds/testing_only/odom', self._odom_cb,   sensor_qos)
+        self.create_subscription(Track,     '/FusionCones',            self._track_cb,  10)
+        self.create_subscription(GoSignal,  '/fsds/signal/go',         self._go_cb,     10)
 
         self.pub_cmd = self.create_publisher(ControlCommand, '/fsds/control_command', 10)
 
         self._go_received    = False
-        self._target: np.ndarray | None = None
-        self._target_stamp   = None          # rclpy.time.Time
+        self._path_pts:  np.ndarray = np.empty((0, 2))
+        self._path_stamp = None          # rclpy.time.Time
         self._desired_speed: float = V_FALLBACK
         self._car_pos        = np.zeros(2)
         self._car_yaw        = 0.0
         self._car_speed      = 0.0
+        self._car_yaw_rate   = 0.0
         self._blue_cones:   np.ndarray = np.empty((0, 2))
         self._yellow_cones: np.ndarray = np.empty((0, 2))
 
-        self._pid = SteeringPID()        # PID state (integral + derivative memory)
-        self._last_tick      = None      # rclpy.time.Time — for real dt measurement
+        self._stanley = StanleyController()
 
         self.create_timer(0.05, self._control_loop)
 
@@ -65,9 +64,12 @@ class ControlNode(Node):
             self._go_received = True
             self.get_logger().info('GO received.')
 
-    def _target_cb(self, msg: PointStamped) -> None:
-        self._target       = np.array([msg.point.x, msg.point.y])
-        self._target_stamp = self.get_clock().now()
+    def _path_cb(self, msg: Path) -> None:
+        self._path_pts  = np.array(
+            [[ps.pose.position.x, ps.pose.position.y] for ps in msg.poses],
+            dtype=np.float64,
+        ) if msg.poses else np.empty((0, 2))
+        self._path_stamp = self.get_clock().now()
 
     def _speed_cb(self, msg: Float32) -> None:
         self._desired_speed = float(msg.data)
@@ -76,7 +78,8 @@ class ControlNode(Node):
         p = msg.pose.pose.position
         self._car_pos = np.array([p.x, p.y])
         v = msg.twist.twist.linear
-        self._car_speed = math.hypot(v.x, v.y)
+        self._car_speed    = math.hypot(v.x, v.y)
+        self._car_yaw_rate = msg.twist.twist.angular.z
 
         q = msg.pose.pose.orientation
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
@@ -101,28 +104,24 @@ class ControlNode(Node):
             self.get_logger().info('Waiting for GO signal...', throttle_duration_sec=2.0)
             return
 
-        # Brake if target is stale or missing
-        target_stale = (
-            self._target is None
-            or self._target_stamp is None
-            or (self.get_clock().now() - self._target_stamp).nanoseconds * 1e-9 > TARGET_TIMEOUT
+        # Brake if path is stale or missing
+        path_stale = (
+            self._path_stamp is None
+            or (self.get_clock().now() - self._path_stamp).nanoseconds * 1e-9 > TARGET_TIMEOUT
+            or len(self._path_pts) < 2
         )
-        if target_stale:
+        if path_stale:
             cmd.throttle = 0.0
             cmd.steering = 0.0
             cmd.brake    = 1.0
-            self._pid.reset()            # clear integral/derivative while stopped
-            self._last_tick = None
             self.pub_cmd.publish(cmd)
-            self.get_logger().warn('No fresh target — braking', throttle_duration_sec=1.0)
+            self.get_logger().warn('No fresh path — braking', throttle_duration_sec=1.0)
             return
 
-        # Measure real dt so the I and D terms are time-accurate
-        now = self.get_clock().now()
-        dt  = (now - self._last_tick).nanoseconds * 1e-9 if self._last_tick else 0.05
-        self._last_tick = now
-
-        cmd.steering = self._pid.compute(self._car_pos, self._car_yaw, self._target, dt)
+        cmd.steering = self._stanley.compute(
+            self._path_pts, self._car_pos, self._car_yaw,
+            self._car_speed, self._car_yaw_rate,
+        )
 
         # Cone proximity brake
         cone_parts = [c for c in (self._blue_cones, self._yellow_cones) if len(c) > 0]
