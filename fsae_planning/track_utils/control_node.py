@@ -3,20 +3,19 @@ import math
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from fs_msgs.msg import ControlCommand, GoSignal, Track
 from geometry_msgs.msg import PointStamped
 from nav_msgs.msg import Odometry
-
 from std_msgs.msg import Float32
 
-from fsae_planning.control_utils import SteeringPID
+from .control_utils import SteeringPID
 from fsae_planning.planning_utils import separate_cones_by_color
 
-KP_THROTTLE   = 0.06  # throttle P-gain  (throttle per m/s of under-speed)
-KP_BRAKE      = 0.40  # brake P-gain     (brake    per m/s of over-speed)
-V_FALLBACK    = 2.0   # m/s — desired speed used until planner publishes one
+KP_THROTTLE      = 0.06  # throttle P-gain  (throttle per m/s of under-speed)
+KP_BRAKE         = 0.40  # brake P-gain     (brake    per m/s of over-speed)
+V_FALLBACK       = 2.0   # m/s — desired speed used until planner publishes one
 CONE_BRAKE_DIST  = 2.5   # metres forward — hard-brake if cone enters this zone
 CONE_BRAKE_WIDTH = 0.6   # metres lateral half-width of the braking corridor
 TARGET_TIMEOUT   = 0.5   # seconds — brake if no fresh target received
@@ -26,12 +25,6 @@ class ControlNode(Node):
     def __init__(self):
         super().__init__('controller')
 
-        latched_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-        )
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
@@ -41,7 +34,7 @@ class ControlNode(Node):
         self.create_subscription(PointStamped, '/fsds/lookahead_target',  self._target_cb, 10)
         self.create_subscription(Float32,      '/fsds/desired_speed',     self._speed_cb,  10)
         self.create_subscription(Odometry,     '/fsds/testing_only/odom', self._odom_cb,   sensor_qos)
-        self.create_subscription(Track,        '/fsds/testing_only/track', self._track_cb, latched_qos)
+        self.create_subscription(Track,        '/FusionCones',            self._track_cb,  10)
         self.create_subscription(GoSignal,     '/fsds/signal/go',         self._go_cb,     10)
 
         self.pub_cmd = self.create_publisher(ControlCommand, '/fsds/control_command', 10)

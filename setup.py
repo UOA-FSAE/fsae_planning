@@ -23,8 +23,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'planner_node    = fsae_planning.planner_node:main',
-            'control_node    = fsae_planning.control_node:main',
+            'planner_node     = fsae_planning.planner_node:main',
+            'perception_node  = fsae_planning.track_utils.perception_node:main',
+            'control_node     = fsae_planning.track_utils.control_node:main',
             'integration_node = fsae_planning.integration_node:main',
         ],
     },

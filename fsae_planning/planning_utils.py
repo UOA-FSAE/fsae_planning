@@ -363,29 +363,31 @@ def compute_desired_speed(waypoints, v_max=5.0, v_min=1.5, a_lat_max=4.0,
     return float(max(v_min, min(v_max, v_target)))
 
 
+# Narrow window for direction checking — kept deliberately small so that
+# outer-arc cones at corners (which appear on the wrong side at distance)
+# are not mistaken for a wrong-way violation.
+_DIR_LOOK_AHEAD = 8.0   # metres
+_DIR_LOOK_WIDE  = 5.0   # metres lateral half-width
+
+
 def check_direction(
     car_pos,
     car_yaw,
     blue_cones,
     yellow_cones,
-    look_ahead: float = 8.0,
-    look_wide: float = 5.0,
     min_cones: int = 4,
 ) -> bool:
     """
     Return True when the car is travelling in the correct direction.
 
     Checks that blue cones are predominantly LEFT and yellow predominantly RIGHT
-    within a short forward window.  Defaults are tuned to avoid false positives
-    at corners:
+    within a short forward window (_DIR_LOOK_AHEAD / _DIR_LOOK_WIDE).  The
+    narrow window avoids false positives at corners where outer-arc cones
+    appear on the wrong side at distance.
 
-      look_ahead=8m  — only nearby cones are checked; outer-arc corner cones
-                       (which appear on the wrong side at distance) are ignored.
-      min_cones=4    — abstain when fewer than 4 of either colour are visible,
-                       which covers tight corners where cones thin out.
-      threshold=2/3  — both colours must have a clear two-thirds majority on the
-                       correct side before a stop is triggered; a bare majority
-                       (50 %) is not enough.
+      min_cones=4   — abstain when fewer than 4 of either colour are visible.
+      threshold=2/3 — both colours must have a clear two-thirds majority on the
+                      correct side before a stop is triggered.
     """
     cos_y = math.cos(car_yaw)
     sin_y = math.sin(car_yaw)
@@ -396,7 +398,7 @@ def check_direction(
         rel = cones - car_pos
         x_car =  rel[:, 0] * cos_y + rel[:, 1] * sin_y
         y_car = -rel[:, 0] * sin_y + rel[:, 1] * cos_y
-        mask = (x_car > 0.5) & (x_car < look_ahead) & (np.abs(y_car) < look_wide)
+        mask = (x_car > 0.5) & (x_car < _DIR_LOOK_AHEAD) & (np.abs(y_car) < _DIR_LOOK_WIDE)
         return np.column_stack([x_car[mask], y_car[mask]]) if mask.any() else np.empty((0, 2))
 
     blue_view   = in_window(blue_cones)

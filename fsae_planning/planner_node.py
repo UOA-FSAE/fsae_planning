@@ -3,7 +3,7 @@ import math
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from fs_msgs.msg import GoSignal, Track
 from geometry_msgs.msg import PointStamped, PoseStamped
@@ -20,7 +20,7 @@ from fsae_planning.planning_utils import (
 from fsae_planning.viz_utils import Visualizer
 
 LOOKAHEAD_DIST = 4.0  # metres ahead for pure-pursuit target
-V_MAX          = 20.0  # m/s — top speed on straights
+V_MAX          = 15.0  # m/s — top speed on straights
 V_MIN          = 1.5  # m/s — minimum speed through tight corners
 
 
@@ -28,19 +28,13 @@ class PlannerNode(Node):
     def __init__(self):
         super().__init__('centreline_planner')
 
-        latched_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-        )
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
         )
 
-        self.create_subscription(Track, '/fsds/testing_only/track', self._track_cb, latched_qos)
+        self.create_subscription(Track, '/FusionCones', self._track_cb, 10)
         self.create_subscription(Odometry, '/fsds/testing_only/odom', self._odom_cb, sensor_qos)
         self.create_subscription(GoSignal, '/fsds/signal/go', self._go_cb, 10)
 
