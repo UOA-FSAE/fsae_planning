@@ -52,5 +52,5 @@ fix(api)/handle null user
 
 Branches
 
-feature/xyz | fix/xyz | chore/xyz | docs/xyz | release/v1.2.3
+feat/xyz | fix/xyz | chore/xyz | docs/xyz | release/v1.2.3
 (use kebab-case)

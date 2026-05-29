@@ -10,8 +10,10 @@ from geometry_msgs.msg import PointStamped, PoseStamped
 from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Float32
 
+from fsae_planning.cone_map import ConeMap
 from fsae_planning.planning_utils import (
     build_local_path,
+    build_path_walls,
     check_direction,
     compute_desired_speed,
     get_lookahead_waypoint,
@@ -43,11 +45,15 @@ class PlannerNode(Node):
         self.pub_speed  = self.create_publisher(Float32,      '/fsds/desired_speed',    10)
 
         self._go_received = False
-        self._blue_cones:   np.ndarray = np.empty((0, 2))
+        self._cone_map    = ConeMap()          # accumulated historical cone map
+        self._blue_cones:   np.ndarray = np.empty((0, 2))   # latest sensor frame (viz)
         self._yellow_cones: np.ndarray = np.empty((0, 2))
         self._car_pos = np.zeros(2)
         self._car_yaw = 0.0
         self._centreline: np.ndarray | None = None
+        self._blue_segs:   list = []
+        self._yellow_segs: list = []
+        self._midpoints:   np.ndarray = np.empty((0, 2))
 
         self.create_timer(0.05, self._planning_loop)
 
@@ -71,8 +77,11 @@ class PlannerNode(Node):
         blue, yellow = separate_cones_by_color(msg)
         self._blue_cones   = blue
         self._yellow_cones = yellow
+        self._cone_map.update(blue, yellow)
         self.get_logger().info(
-            f'Track received: {len(blue)} blue + {len(yellow)} yellow cones'
+            f'Track update: {len(blue)} blue + {len(yellow)} yellow this frame  '
+            f'| map: {len(self._cone_map.blue)}b + {len(self._cone_map.yellow)}y total',
+            throttle_duration_sec=2.0,
         )
 
     def _odom_cb(self, msg: Odometry) -> None:
@@ -93,9 +102,24 @@ class PlannerNode(Node):
             self.get_logger().info('Waiting for GO signal...', throttle_duration_sec=2.0)
             return
 
-        self._centreline = build_local_path(
-            self._blue_cones, self._yellow_cones, self._car_pos, self._car_yaw
-        )
+        try:
+            self._centreline, self._blue_segs, self._yellow_segs, self._midpoints = \
+                build_path_walls(
+                    self._cone_map.blue, self._cone_map.yellow,
+                    self._car_pos, self._car_yaw,
+                )
+        except Exception as exc:
+            self.get_logger().warn(
+                f'Wall-barrier planner failed ({exc!r}), falling back to simple pairing',
+                throttle_duration_sec=5.0,
+            )
+            self._centreline = build_local_path(
+                self._cone_map.blue, self._cone_map.yellow,
+                self._car_pos, self._car_yaw,
+            )
+            self._blue_segs   = []
+            self._yellow_segs = []
+            self._midpoints   = np.empty((0, 2))
         self._publish_path()
 
         if self._centreline is None:
@@ -106,7 +130,8 @@ class PlannerNode(Node):
             return
 
         if not check_direction(
-            self._car_pos, self._car_yaw, self._blue_cones, self._yellow_cones
+            self._car_pos, self._car_yaw,
+            self._blue_cones, self._yellow_cones,   # use live frame for direction check
         ):
             self.get_logger().warn(
                 'Direction check failed: blue not left / yellow not right',
@@ -146,12 +171,16 @@ class PlannerNode(Node):
     # ------------------------------------------------------------------
 
     def _viz_loop(self) -> None:
+        # Show the full accumulated cone map so historical cones remain visible.
         self._viz.update(
             self._car_pos,
             self._car_yaw,
-            self._blue_cones,
-            self._yellow_cones,
+            self._cone_map.blue,
+            self._cone_map.yellow,
             self._centreline,
+            blue_segs=self._blue_segs,
+            yellow_segs=self._yellow_segs,
+            midpoints=self._midpoints,
         )
 
     def _publish_path(self) -> None:

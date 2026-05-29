@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 
 
 class Visualizer:
-    """Non-blocking overhead ego-view: car, cones, centreline.
+    """Non-blocking overhead ego-view: car, cones, walls, midpoints, centreline.
 
     Coordinate convention for the plot:
         +y  = ahead of car  (up on screen)
@@ -27,6 +27,9 @@ class Visualizer:
         blue_cones: np.ndarray,
         yellow_cones: np.ndarray,
         centreline: np.ndarray | None,
+        blue_segs: list | None = None,
+        yellow_segs: list | None = None,
+        midpoints: np.ndarray | None = None,
     ) -> None:
         ax = self._ax
         ax.cla()
@@ -42,23 +45,46 @@ class Visualizer:
             rel = pts - car_pos
             x_fwd  =  rel[:, 0] * cos_y + rel[:, 1] * sin_y
             y_left = -rel[:, 0] * sin_y + rel[:, 1] * cos_y
-            # negate y_left so left-of-car → negative plot_x → left side of screen
             return np.column_stack([-y_left, x_fwd])
 
+        # --- Wall segments (drawn first, lowest zorder) ---
+        if blue_segs:
+            for (p1, p2) in blue_segs:
+                pts = to_plot(np.array([p1, p2]))
+                ax.plot(pts[:, 0], pts[:, 1],
+                        color='dodgerblue', alpha=0.30, lw=0.9, zorder=1)
+
+        if yellow_segs:
+            for (p1, p2) in yellow_segs:
+                pts = to_plot(np.array([p1, p2]))
+                ax.plot(pts[:, 0], pts[:, 1],
+                        color='gold', alpha=0.30, lw=0.9, zorder=1)
+
+        # --- Candidate midpoints ---
+        if midpoints is not None and len(midpoints) > 0:
+            mc = to_plot(midpoints)
+            ax.scatter(mc[:, 0], mc[:, 1],
+                       c='lightgrey', edgecolors='grey', linewidths=0.4,
+                       s=14, zorder=2, label='Midpoints')
+
+        # --- Cones ---
         if len(blue_cones) > 0:
             bc = to_plot(blue_cones)
-            ax.scatter(bc[:, 0], bc[:, 1], c='dodgerblue', s=30, zorder=3, label='Blue')
+            ax.scatter(bc[:, 0], bc[:, 1],
+                       c='dodgerblue', s=30, zorder=3, label='Blue')
 
         if len(yellow_cones) > 0:
             yc = to_plot(yellow_cones)
-            ax.scatter(yc[:, 0], yc[:, 1], c='gold', edgecolors='darkorange',
-                       linewidths=0.5, s=30, zorder=3, label='Yellow')
+            ax.scatter(yc[:, 0], yc[:, 1],
+                       c='gold', edgecolors='darkorange', linewidths=0.5,
+                       s=30, zorder=3, label='Yellow')
 
+        # --- Centreline ---
         if centreline is not None and len(centreline) > 0:
             cl = to_plot(centreline)
-            ax.plot(cl[:, 0], cl[:, 1], 'g--', lw=1.5, label='Centreline', zorder=2)
+            ax.plot(cl[:, 0], cl[:, 1], 'g--', lw=1.5, label='Centreline', zorder=4)
 
-        # Car as filled triangle pointing up (= forward)
+        # --- Car triangle (pointing up = forward) ---
         ax.add_patch(plt.Polygon(
             [[0, 2.0], [-1.0, -0.8], [1.0, -0.8]], color='black', zorder=6
         ))
