@@ -10,19 +10,19 @@ from geometry_msgs.msg import PointStamped, PoseStamped
 from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Float32
 
+from fsae_planning.boundary import build_path_walls
 from fsae_planning.cone_map import ConeMap
-from fsae_planning.planning_utils import (
+from fsae_planning.cone_sorting import separate_cones_by_color
+from fsae_planning.path_utils import (
     build_local_path,
-    build_path_walls,
     check_direction,
     compute_desired_speed,
     get_lookahead_waypoint,
-    separate_cones_by_color,
 )
 from fsae_planning.viz_utils import Visualizer
 
 LOOKAHEAD_DIST = 4.0  # metres ahead for pure-pursuit target
-V_MAX          = 15.0  # m/s — top speed on straights
+V_MAX          = 20.0  # m/s — top speed on straights
 V_MIN          = 1.5  # m/s — minimum speed through tight corners
 
 
