@@ -250,6 +250,8 @@ feat/xyz  |  fix/xyz  |  chore/xyz  |  docs/xyz  |  release/v1.2.3
 ```
 Use kebab-case.
 
+**ALWAYS DELETE SHORTLIVED FIX/FEATURE BRANCH AFTER MERGING**
+
 ### Commit Format
 ```
 <type>(<scope>)/<subject>
