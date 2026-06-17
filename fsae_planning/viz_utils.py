@@ -17,8 +17,25 @@ class Visualizer:
         plt.ion()
         self._fig, self._ax = plt.subplots(figsize=(6, 8))
         self._w = window_half
+        self._zoom = 1.0   # user scroll-zoom multiplier (>1 = zoomed out)
+        self._fig.canvas.mpl_connect('scroll_event', self._on_scroll)
         self._fig.tight_layout()
         plt.show(block=False)
+
+    def _on_scroll(self, event) -> None:
+        """Scroll up = zoom in, scroll down = zoom out (persists across frames)."""
+        if event.button == 'up':
+            self._zoom *= 0.9
+        elif event.button == 'down':
+            self._zoom *= 1.1
+        self._zoom = float(min(max(self._zoom, 0.1), 20.0))
+
+    def _set_limits(self, ax, cx: float, cy: float, hx: float, hy: float) -> None:
+        """Set axis limits centred at (cx, cy) with half-extents scaled by zoom."""
+        hx *= self._zoom
+        hy *= self._zoom
+        ax.set_xlim(cx - hx, cx + hx)
+        ax.set_ylim(cy - hy, cy + hy)
 
     def update(
         self,
@@ -30,6 +47,9 @@ class Visualizer:
         blue_segs: list | None = None,
         yellow_segs: list | None = None,
         midpoints: np.ndarray | None = None,
+        local_mode: bool = False,
+        start_pos: np.ndarray | None = None,
+        drift: dict | None = None,
     ) -> None:
         ax = self._ax
         ax.cla()
@@ -79,24 +99,63 @@ class Visualizer:
                        c='gold', edgecolors='darkorange', linewidths=0.5,
                        s=30, zorder=3, label='Yellow')
 
-        # --- Centreline ---
+        # --- Centreline (dashed while mapping, solid closed loop in local mode) ---
         if centreline is not None and len(centreline) > 0:
             cl = to_plot(centreline)
-            ax.plot(cl[:, 0], cl[:, 1], 'g--', lw=1.5, label='Centreline', zorder=4)
+            if local_mode:
+                ax.plot(cl[:, 0], cl[:, 1], 'g-', lw=2.0,
+                        label='Closed loop', zorder=4)
+            else:
+                ax.plot(cl[:, 0], cl[:, 1], 'g--', lw=1.5,
+                        label='Centreline', zorder=4)
+
+        # --- Start / loop-closure marker ---
+        if start_pos is not None:
+            sp = to_plot(start_pos)
+            ax.scatter(sp[:, 0], sp[:, 1], marker='*', s=180,
+                       c='red', edgecolors='black', linewidths=0.6,
+                       zorder=5, label='Start')
 
         # --- Car triangle (pointing up = forward) ---
         ax.add_patch(plt.Polygon(
             [[0, 2.0], [-1.0, -0.8], [1.0, -0.8]], color='black', zorder=6
         ))
 
-        w = self._w
-        ax.set_xlim(-w * 0.5, w * 0.5)
-        ax.set_ylim(-w * 0.15, w * 0.85)
+        if local_mode:
+            # Closed-loop view: fit the whole loop so the full track is visible.
+            self._fit_to_loop(ax, centreline, to_plot)
+            title = 'LOCALISATION MODE — closed-loop tracking'
+            if drift is not None:
+                ax.text(
+                    0.02, 0.98,
+                    f'drift  mean={drift["mean"]:.2f} m  max={drift["max"]:.2f} m',
+                    transform=ax.transAxes, va='top', ha='left', fontsize=8,
+                    bbox=dict(boxstyle='round', fc='white', ec='grey', alpha=0.8),
+                )
+        else:
+            w = self._w
+            self._set_limits(ax, 0.0, w * 0.35, w * 0.5, w * 0.5)
+            title = 'Centreline Planner — Ego View'
+
         ax.set_aspect('equal')
         ax.set_xlabel('← left of car   |   right of car →')
         ax.set_ylabel('distance ahead (m)')
-        ax.set_title('Centreline Planner — Ego View')
+        ax.set_title(f'{title}   (scroll to zoom)')
         ax.legend(loc='upper right', fontsize=8)
         ax.grid(True, alpha=0.3)
 
         plt.pause(0.001)
+
+    def _fit_to_loop(self, ax, centreline: np.ndarray | None, to_plot) -> None:
+        """Auto-scale the axes to fit the whole closed loop, with a margin."""
+        if centreline is None or len(centreline) == 0:
+            w = self._w
+            self._set_limits(ax, 0.0, 0.0, w * 0.5, w * 0.5)
+            return
+        cl = to_plot(centreline)
+        margin = 5.0
+        cx = float((cl[:, 0].min() + cl[:, 0].max()) * 0.5)
+        cy = float((cl[:, 1].min() + cl[:, 1].max()) * 0.5)
+        hx = float((cl[:, 0].max() - cl[:, 0].min()) * 0.5) + margin
+        hy = float((cl[:, 1].max() - cl[:, 1].min()) * 0.5) + margin
+        self._set_limits(ax, cx, cy, hx, hy)

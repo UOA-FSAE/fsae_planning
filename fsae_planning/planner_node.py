@@ -13,6 +13,12 @@ from std_msgs.msg import Float32
 from fsae_planning.boundary import build_path_walls
 from fsae_planning.cone_map import ConeMap
 from fsae_planning.cone_sorting import separate_cones_by_color
+from fsae_planning.localisation import (
+    LoopClosureDetector,
+    build_completed_path,
+    compute_drift,
+    roll_loop_to_car,
+)
 from fsae_planning.path_utils import (
     build_local_path,
     check_direction,
@@ -22,8 +28,14 @@ from fsae_planning.path_utils import (
 from fsae_planning.viz_utils import Visualizer
 
 LOOKAHEAD_DIST = 4.0  # metres ahead for pure-pursuit target
-V_MAX          = 20.0  # m/s — top speed on straights
+V_MAX          = 15.0  # m/s — top speed on straights
 V_MIN          = 1.5  # m/s — minimum speed through tight corners
+
+# Master switch: when True the planner watches for a completed lap and, once the
+# track loop closes, switches from the rolling sensor window to closed-loop
+# planning on the full accumulated cone map.  Set False to disable entirely.
+ENABLE_LOCAL_MODE = True
+DRIFT_WARN_DIST   = 1.5  # m — mean perception-vs-map drift above this is warned
 
 
 class PlannerNode(Node):
@@ -54,6 +66,12 @@ class PlannerNode(Node):
         self._blue_segs:   list = []
         self._yellow_segs: list = []
         self._midpoints:   np.ndarray = np.empty((0, 2))
+
+        # --- Localisation / closed-loop mode ---
+        self._loop_detector = LoopClosureDetector()
+        self._local_mode    = False
+        self._global_loop: np.ndarray | None = None   # cached closed centreline
+        self._drift = {'mean': 0.0, 'max': 0.0, 'n': 0}
 
         self.create_timer(0.05, self._planning_loop)
 
@@ -102,24 +120,12 @@ class PlannerNode(Node):
             self.get_logger().info('Waiting for GO signal...', throttle_duration_sec=2.0)
             return
 
-        try:
-            self._centreline, self._blue_segs, self._yellow_segs, self._midpoints = \
-                build_path_walls(
-                    self._cone_map.blue, self._cone_map.yellow,
-                    self._car_pos, self._car_yaw,
-                )
-        except Exception as exc:
-            self.get_logger().warn(
-                f'Wall-barrier planner failed ({exc!r}), falling back to simple pairing',
-                throttle_duration_sec=5.0,
-            )
-            self._centreline = build_local_path(
-                self._cone_map.blue, self._cone_map.yellow,
-                self._car_pos, self._car_yaw,
-            )
-            self._blue_segs   = []
-            self._yellow_segs = []
-            self._midpoints   = np.empty((0, 2))
+        self._update_localisation()
+
+        if self._local_mode:
+            self._plan_closed_loop()
+        else:
+            self._plan_local_window()
         self._publish_path()
 
         if self._centreline is None:
@@ -129,7 +135,9 @@ class PlannerNode(Node):
             )
             return
 
-        if not check_direction(
+        # In local mode the path is the known closed loop, already oriented in
+        # the travel direction, so the live-frame direction guard is skipped.
+        if not self._local_mode and not check_direction(
             self._car_pos, self._car_yaw,
             self._blue_cones, self._yellow_cones,   # use live frame for direction check
         ):
@@ -167,6 +175,81 @@ class PlannerNode(Node):
         )
 
     # ------------------------------------------------------------------
+    # Localisation / planning strategies
+    # ------------------------------------------------------------------
+
+    def _update_localisation(self) -> None:
+        """Watch for loop closure; on the first close, cache the global loop."""
+        if not ENABLE_LOCAL_MODE or self._local_mode:
+            return
+
+        closed = self._loop_detector.update(
+            self._car_pos,
+            self._blue_cones, self._yellow_cones,
+        )
+        if not closed:
+            return
+
+        loop = build_completed_path(self._loop_detector.trajectory)
+        if loop is None:
+            # Path reported closed but was too short to fit — stay in mapping
+            # mode and retry on the next lap pass.
+            self._loop_detector.reopen()
+            return
+
+        self._global_loop = loop
+        self._local_mode  = True
+        self.get_logger().info(
+            f'PATH CLOSED — entering localisation mode '
+            f'(completed loop: {len(loop)} pts from '
+            f'{len(self._loop_detector.trajectory)} driven path points).'
+        )
+
+    def _plan_local_window(self) -> None:
+        """Default mapping planner: cone-wall mesh over the rolling sensor window."""
+        try:
+            self._centreline, self._blue_segs, self._yellow_segs, self._midpoints = \
+                build_path_walls(
+                    self._cone_map.blue, self._cone_map.yellow,
+                    self._car_pos, self._car_yaw,
+                )
+        except Exception as exc:
+            self.get_logger().warn(
+                f'Wall-barrier planner failed ({exc!r}), falling back to simple pairing',
+                throttle_duration_sec=5.0,
+            )
+            self._centreline = build_local_path(
+                self._cone_map.blue, self._cone_map.yellow,
+                self._car_pos, self._car_yaw,
+            )
+            self._blue_segs   = []
+            self._yellow_segs = []
+            self._midpoints   = np.empty((0, 2))
+
+    def _plan_closed_loop(self) -> None:
+        """
+        Localisation planner: plan on the cached closed loop built from the full
+        cone map.  Perception is no longer used for the path — only to monitor
+        drift between the live frame and the map the loop was built from.
+        """
+        self._drift = compute_drift(
+            self._blue_cones, self._yellow_cones,
+            self._cone_map.blue, self._cone_map.yellow,
+        )
+        if self._drift['mean'] > DRIFT_WARN_DIST:
+            self.get_logger().warn(
+                f'Perception drift vs map: mean={self._drift["mean"]:.2f} m '
+                f'max={self._drift["max"]:.2f} m over {self._drift["n"]} cones',
+                throttle_duration_sec=2.0,
+            )
+
+        self._centreline  = roll_loop_to_car(self._global_loop, self._car_pos, self._car_yaw)
+        # Wall mesh / candidate midpoints are mapping-mode artefacts only.
+        self._blue_segs   = []
+        self._yellow_segs = []
+        self._midpoints   = np.empty((0, 2))
+
+    # ------------------------------------------------------------------
     # Visualisation
     # ------------------------------------------------------------------
 
@@ -181,6 +264,9 @@ class PlannerNode(Node):
             blue_segs=self._blue_segs,
             yellow_segs=self._yellow_segs,
             midpoints=self._midpoints,
+            local_mode=self._local_mode,
+            start_pos=self._loop_detector.start_pos,
+            drift=self._drift if self._local_mode else None,
         )
 
     def _publish_path(self) -> None:
