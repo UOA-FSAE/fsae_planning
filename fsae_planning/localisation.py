@@ -139,9 +139,12 @@ def build_completed_path(
     """
     Smooth the accumulated driven path into a seamless closed centreline.
 
-    The path the car drove is already in track order, so it is fitted directly
-    with a *periodic* cubic spline to remove odometry jitter and close the seam
-    between its end (back at the start) and its beginning.
+    The path the car drove is already in track order.  Before fitting, the
+    lead-in is trimmed so the loop closes on the path *itself* (end → nearest
+    earlier point) rather than on the arbitrary start pose (end → start); the
+    latter stitches two non-coincident points together and leaves a kink at the
+    start line.  The trimmed path is then fitted with a *periodic* cubic spline
+    to remove odometry jitter and close the seam seamlessly.
 
     Returns an (N, 2) loop (last point == first point) or None if the path is
     too short to form a loop.
@@ -149,6 +152,7 @@ def build_completed_path(
     traj = np.asarray(trajectory, dtype=np.float64)
     if len(traj) < MIN_TRAJ_PTS:
         return None
+    traj = _close_on_self(traj)
     return _smooth_loop(traj, n_out=max(200, len(traj) * n_out_per_pt))
 
 
@@ -244,6 +248,29 @@ def _count_redetected(live: np.ndarray, reference: np.ndarray) -> int:
     return int(sum(
         np.min(np.linalg.norm(reference - p, axis=1)) < MATCH_DIST for p in live
     ))
+
+
+def _close_on_self(traj: np.ndarray) -> np.ndarray:
+    """
+    Trim the lead-in so the loop closes on the driven path itself.
+
+    The trajectory starts at the GO pose — which may sit off the racing line and
+    include a short lead-in onto it — and ends where the car returned, within
+    RETURN_RADIUS of the start.  Joining end → start (two non-coincident points
+    on different parts of the track) leaves a kink the car reads as a left/right
+    sway at the start line.  Instead, find the earliest trajectory point closest
+    to the end point and start the loop there: the closing seam then joins two
+    near-coincident points already on the driven line, so the loop closes
+    smoothly.  The dropped lead-in is redundant — the loop already covers that
+    region near the seam.
+    """
+    n = len(traj)
+    end = traj[-1]
+    # Search only the first half so the match is the lead-in near the start,
+    # never a point adjacent to the end.
+    search_n = max(1, n // 2)
+    j = int(np.argmin(np.linalg.norm(traj[:search_n] - end, axis=1)))
+    return traj if j == 0 else traj[j:]
 
 
 def _smooth_loop(pts: np.ndarray, n_out: int) -> np.ndarray | None:
