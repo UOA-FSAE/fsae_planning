@@ -51,7 +51,7 @@ DRIFT_WARN_DIST   = 1.5  # m — mean perception-vs-map drift above this is warn
 # The whole track is taken from the latched oracle topic /fsds/testing_only/track
 # (every cone, broadcast once) rather than the rolling perception window, so the
 # path is ready before the car moves and is independent of where the car starts.
-ENABLE_SKIDPAD_MODE = False
+ENABLE_SKIDPAD_MODE = True
 
 SKID_V_START      = 3.0    # m/s — speed at the start of the ramp
 SKID_RAMP_ACCEL   = 0.25   # m/s per second — how fast the target speed rises

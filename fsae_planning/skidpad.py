@@ -54,29 +54,68 @@ def fit_circle(points: np.ndarray) -> tuple[np.ndarray, float]:
     return centre, radius
 
 
-def _two_means(points: np.ndarray, iters: int = 20) -> list[np.ndarray]:
+def _fit_circle_pair(cones: np.ndarray, iters: int = 40):
     """
-    Split points into two clusters (the two skidpad circles) with Lloyd's
-    algorithm, seeded by the two points that are farthest apart.
-    """
-    d = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=2)
-    i, j = np.unravel_index(int(np.argmax(d)), d.shape)
-    c = np.array([points[i], points[j]], dtype=np.float64)
+    Fit the two skidpad circles to the pooled cones.
 
-    labels = np.zeros(len(points), dtype=int)
+    Clustering the cones by nearest centre does not work: each circle's *outer*
+    ring reaches past the midpoint between the two centres, so a nearest-centre
+    split steals each circle's near cones for its neighbour and drags the fitted
+    centres apart.  What is stable is which *ring* a cone lies on, so this is an
+    EM over ring membership: each circle is described by (centre, r_inner,
+    r_outer) and every cone is assigned to the circle whose nearer ring it sits
+    closest to.  A cone where one circle's outer ring meets the other's inner
+    ring is genuinely shared by both rings, so assigning it either way leaves it
+    exactly on the ring it lands in and does not bias that fit.
+
+    Each circle's centre is recovered by fitting its inner and outer rings
+    separately and averaging: a single algebraic fit over both concentric rings
+    at once is biased (it trades centre position against a radius that matches
+    neither ring).
+
+    Seeded by splitting the cones across their principal axis (the line through
+    the two centres).  Returns [(centre, r_inner, r_outer), ...] ordered left→
+    right by centre x, or None if it cannot form two circles.
+    """
+    if len(cones) < _MIN_CONES:
+        return None
+
+    m = cones.mean(axis=0)
+    _, _, vt = np.linalg.svd(cones - m)
+    axis = vt[0]                                   # line through the two centres
+    labels = (((cones - m) @ axis) > 0.0).astype(int)
+
+    params = None
     for _ in range(iters):
-        d0 = np.linalg.norm(points - c[0], axis=1)
-        d1 = np.linalg.norm(points - c[1], axis=1)
-        new_labels = (d1 < d0).astype(int)
-        if np.array_equal(new_labels, labels) and _ > 0:
+        params = []
+        for k in (0, 1):
+            g = cones[labels == k]
+            if len(g) < 3:
+                return None
+            c, _ = fit_circle(g)
+            d = np.linalg.norm(g - c, axis=1)
+            mid = 0.5 * (d.min() + d.max())
+            inner, outer = g[d < mid], g[d >= mid]
+            if len(inner) >= 3 and len(outer) >= 3:
+                ci, _ = fit_circle(inner)
+                co, _ = fit_circle(outer)
+                c = 0.5 * (ci + co)
+            d = np.linalg.norm(g - c, axis=1)
+            params.append((c, float(d.min()), float(d.max())))
+
+        residual = np.column_stack([
+            np.minimum(np.abs(np.linalg.norm(cones - c, axis=1) - ri),
+                       np.abs(np.linalg.norm(cones - c, axis=1) - ro))
+            for c, ri, ro in params
+        ])
+        new_labels = residual.argmin(axis=1)
+        if np.array_equal(new_labels, labels):
             break
         labels = new_labels
-        for k in (0, 1):
-            members = points[labels == k]
-            if len(members):
-                c[k] = members.mean(axis=0)
 
-    return [points[labels == 0], points[labels == 1]]
+    if params is None:
+        return None
+    return sorted(params, key=lambda p: p[0][0])   # left → right by centre x
 
 
 def _arc(centre: np.ndarray, radius: float,
@@ -95,9 +134,15 @@ def build_figure8(
     Reconstruct the figure-8 centreline from the cone map.
 
     Cone colour is irrelevant to the geometry (both circles use both colours as
-    inner/outer boundaries), so blue and yellow are pooled.  The cones are split
-    into the two circles, each circle is fitted, and the two are stitched into a
-    single figure-8 that crosses at the point between the centres.
+    inner/outer boundaries), so blue and yellow are pooled.  The two circles are
+    fitted together by ring membership (see _fit_circle_pair) and stitched into a
+    single figure-8 that crosses at the midpoint between the centres.
+
+    The two centreline circles of an FS skidpad are tangent (centres 2·R apart),
+    so the centreline radius is pinned to half the centre separation.  This makes
+    the circles kiss exactly at the midpoint — the arcs share that crossing point
+    with no gap — and keeps each circle's path concentric with its cone rings so
+    it stays centred between the inner and outer cones the whole way round.
 
     The crossing is built tangent-continuous: circle 0 is traversed CCW starting
     from the point facing circle 1, and circle 1 is traversed CW starting from
@@ -110,25 +155,11 @@ def build_figure8(
     if not cones:
         return None
     pts = np.vstack(cones)
-    if len(pts) < _MIN_CONES:
+
+    circles = _fit_circle_pair(pts)
+    if circles is None:
         return None
-
-    clusters = _two_means(pts)
-    if any(len(c) < 3 for c in clusters):
-        return None
-
-    centres, radii, half_widths = [], [], []
-    for cl in clusters:
-        centre, _ = fit_circle(cl)
-        radial = np.linalg.norm(cl - centre, axis=1)
-        centres.append(centre)
-        radii.append(float(radial.mean()))                       # centreline radius
-        half_widths.append(float((radial.max() - radial.min()) * 0.5))
-
-    # Order the two circles left→right so the loop winding is deterministic.
-    order = np.argsort([c[0] for c in centres])
-    c0, c1 = centres[order[0]], centres[order[1]]
-    r0, r1 = radii[order[0]],   radii[order[1]]
+    (c0, rin0, rout0), (c1, rin1, rout1) = circles
 
     u = c1 - c0
     u_norm = float(np.linalg.norm(u))
@@ -136,23 +167,27 @@ def build_figure8(
         return None
     u = u / u_norm
 
-    ang0 = float(np.arctan2(u[1], u[0]))          # c0 → point facing c1
-    ang1 = ang0 + np.pi                            # c1 → point facing c0
+    # Tangent circles: centreline radius is half the centre separation, so both
+    # circles pass through the midpoint and the figure-8 closes with no gap.
+    radius = 0.5 * u_norm
+    half_width = float(np.mean([(rout0 - rin0) * 0.5, (rout1 - rin1) * 0.5]))
+
+    ang0 = float(np.arctan2(u[1], u[0]))          # c0 → point facing c1 (= midpoint)
+    ang1 = ang0 + np.pi                            # c1 → point facing c0 (= midpoint)
 
     # Circle 0 CCW (+sweep), circle 1 CW (-sweep): travel through the crossing
     # is the same direction on both, giving a true figure-8 rather than an O.
-    arc0 = _arc(c0, r0, ang0, 2.0 * np.pi,  n_per_circle)
-    arc1 = _arc(c1, r1, ang1, -2.0 * np.pi, n_per_circle)
+    arc0 = _arc(c0, radius, ang0, 2.0 * np.pi,  n_per_circle)
+    arc1 = _arc(c1, radius, ang1, -2.0 * np.pi, n_per_circle)
     loop = np.vstack([arc0, arc1, arc0[:1]])       # close back to the start
 
-    half_width = float(np.mean(half_widths))
     if not np.isfinite(half_width) or half_width < 1e-3:
         half_width = _DEFAULT_HALF_WIDTH
 
     return Figure8Track(
         loop=loop,
         centres=np.array([c0, c1]),
-        lane_radius=float(np.mean([r0, r1])),
+        lane_radius=radius,
         half_width=half_width,
     )
 
