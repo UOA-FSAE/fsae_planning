@@ -13,16 +13,17 @@ sim_perception:
     full_track: false   # publish the whole map (set true for skidpad by sim.launch.py)
 
 # --- planning (one planner runs at a time; node name == executable) ---
-# `plot` shows the matplotlib ego-view; true in the sim (set false for a headless car).
+# `plot` shows the built-in matplotlib ego-view. Off by default now that an
+# external rosbridge-based visualiser is used; set true to bring it back.
 centerline_planner:
   ros__parameters:
-    plot: true
+    plot: false
 raceline_planner:
   ros__parameters:
-    plot: true
+    plot: false
 skidpad_planner:
   ros__parameters:
-    plot: true
+    plot: false
     v_start: 3.0        # m/s — speed at the start of the ramp
     ramp_accel: 0.25    # m/s per second — how fast the target speed rises
     v_cap: 25.0         # m/s — hard ceiling on the ramp

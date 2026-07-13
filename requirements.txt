@@ -18,6 +18,10 @@ matplotlib>=3.8      # planning: live ego-view visualiser (viz_utils, plot:=true
 # ackermann_msgs — the /fsae/control/cmd_vel interface (control + skidpad):
 #     sudo apt install ros-jazzy-ackermann-msgs
 #
+# rosbridge-suite — websocket server that feeds the external visualiser
+# (launched by launch_terminals.sh, Terminal 4):
+#     sudo apt install ros-jazzy-rosbridge-suite
+#
 # python3-tk — OPTIONAL: the skidpad manual speed-entry GUI (speed_input.py).
 # Falls back to terminal input if absent, so only needed for the GUI box:
 #     sudo apt install python3-tk
