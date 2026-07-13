@@ -1,0 +1,37 @@
+# Central parameter config for the FSDS-simulator planning stack.
+#
+# Single source of truth for tunables (mirrors fsae_autonomous/common/fsae_bringup).
+# Launch files load this file and pass it to each node; ROS matches params by node
+# name, so each top-level key MUST equal the node name (== executable name).
+
+# --- perception (simulator stand-in) ---
+sim_perception:
+  ros__parameters:
+    look_ahead: 25.0    # m ahead included in the FOV window
+    look_wide: 10.0     # m lateral half-width of the FOV window
+    min_ahead: 0.5      # m; ignore cones behind / at the car
+    full_track: false   # publish the whole map (set true for skidpad by sim.launch.py)
+
+# --- planning (one planner runs at a time; node name == executable) ---
+# `plot` shows the matplotlib ego-view; true in the sim (set false for a headless car).
+centerline_planner:
+  ros__parameters:
+    plot: true
+raceline_planner:
+  ros__parameters:
+    plot: true
+skidpad_planner:
+  ros__parameters:
+    plot: true
+    v_start: 3.0        # m/s — speed at the start of the ramp
+    ramp_accel: 0.25    # m/s per second — how fast the target speed rises
+    v_cap: 25.0         # m/s — hard ceiling on the ramp
+
+# --- control ---
+controller:
+  ros__parameters:
+    v_max: 15.0         # m/s — top speed on straights
+    v_min: 1.5          # m/s — minimum speed through tight corners
+    stanley_gain: 1.0   # cross-track gain (k_cte)
+fsds_bridge:
+  ros__parameters: {}   # no tunables yet
