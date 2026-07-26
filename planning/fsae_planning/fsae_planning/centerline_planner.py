@@ -25,6 +25,7 @@ from rclpy.node import Node
 
 from fsae_interfaces.msg import Track
 from geometry_msgs.msg import Pose, PoseArray
+from std_msgs.msg import Empty
 
 from fsae_planning.boundary import build_path_walls
 from fsae_planning.cone_map import ConeMap
@@ -49,7 +50,26 @@ class CenterlinePlanner(Node):
         self.create_subscription(Track, '/fsae/slam/right_track', self._right_cb, 10)
         self.create_subscription(Pose,  '/fsae/slam/car_position', self._pose_cb, 10)
 
+        # Debug hook: the accumulated ConeMap never forgets a cone (see cone_map.py),
+        # so an external tool that edits the track has no way to retract one.  An
+        # Empty here drops the map; the next boundary frame rebuilds it from scratch.
+        self.create_subscription(Empty, '/fsae/planning/reset_map', self._reset_cb, 10)
+
         self.pub_traj = self.create_publisher(PoseArray, '/fsae/planning/selected_trajectory', 10)
+
+        # Debug: expose the wall mesh and candidate midpoints that build_path_walls
+        # computes but otherwise keeps to itself.  Off by default — this is pure
+        # instrumentation for the external path analyser.
+        self.declare_parameter('debug_viz', False)
+        self._debug_viz = self.get_parameter('debug_viz').get_parameter_value().bool_value
+        self._dbg_pubs: dict = {}
+        if self._debug_viz:
+            self._dbg_pubs = {
+                'midpoints':    self.create_publisher(PoseArray, '/fsae/planning/debug/midpoints', 10),
+                'blue_walls':   self.create_publisher(PoseArray, '/fsae/planning/debug/blue_walls', 10),
+                'yellow_walls': self.create_publisher(PoseArray, '/fsae/planning/debug/yellow_walls', 10),
+            }
+            self.get_logger().info('debug_viz on — publishing /fsae/planning/debug/*')
 
         self._cone_map    = ConeMap()          # accumulated historical cone map
         self._blue_cones:   np.ndarray = np.empty((0, 2))   # latest boundary frame
@@ -93,6 +113,17 @@ class CenterlinePlanner(Node):
         self._have_pose = True
         self._planning_loop()
 
+    def _reset_cb(self, _msg: Empty) -> None:
+        """Drop the accumulated cone map (debug/testing only)."""
+        self._cone_map.reset()
+        self._blue_cones   = np.empty((0, 2))
+        self._yellow_cones = np.empty((0, 2))
+        self._centreline   = None
+        self._blue_segs    = []
+        self._yellow_segs  = []
+        self._midpoints    = np.empty((0, 2))
+        self.get_logger().info('cone map reset by external request')
+
     # ------------------------------------------------------------------
     # Planning loop (template — subclasses override the hooks)
     # ------------------------------------------------------------------
@@ -106,6 +137,7 @@ class CenterlinePlanner(Node):
 
         self._compute_path()
         self._publish_trajectory()
+        self._publish_debug()
 
         if self._centreline is None:
             self.get_logger().warn(
@@ -161,6 +193,33 @@ class CenterlinePlanner(Node):
             pose.position.y = float(wp[1])
             msg.poses.append(pose)
         self.pub_traj.publish(msg)
+
+    def _pose_array(self, points) -> PoseArray:
+        """(N, 2) points -> PoseArray in the map frame (positions only)."""
+        msg = PoseArray()
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'map'
+        for pt in points:
+            pose = Pose()
+            pose.position.x = float(pt[0])
+            pose.position.y = float(pt[1])
+            msg.poses.append(pose)
+        return msg
+
+    def _publish_debug(self) -> None:
+        """
+        Publish the wall mesh and candidate midpoints.
+
+        Wall segments go out as a flat PoseArray of consecutive endpoint PAIRS
+        (poses 0-1 are one segment, 2-3 the next, ...).  Reusing PoseArray keeps this
+        patch free of new interface definitions and rebuilds of fsae_interfaces.
+        """
+        if not self._dbg_pubs:
+            return
+        self._dbg_pubs['midpoints'].publish(self._pose_array(self._midpoints))
+        for key, segs in (('blue_walls', self._blue_segs), ('yellow_walls', self._yellow_segs)):
+            flat = [pt for seg in segs for pt in seg]
+            self._dbg_pubs[key].publish(self._pose_array(flat))
 
     def _viz_loop(self) -> None:
         if self._viz is None:

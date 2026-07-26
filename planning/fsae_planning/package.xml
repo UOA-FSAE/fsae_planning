@@ -9,6 +9,7 @@
 
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>fsae_interfaces</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
   <exec_depend>ros2launch</exec_depend>
 
   <depend>python3-numpy</depend>

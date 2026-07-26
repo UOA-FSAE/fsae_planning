@@ -43,6 +43,13 @@ class RacelinePlanner(CenterlinePlanner):
     # Overridden planning hook
     # ------------------------------------------------------------------
 
+    def _reset_cb(self, _msg) -> None:
+        super()._reset_cb(_msg)
+        self._loop_detector = LoopClosureDetector()
+        self._global_loop = None
+        self._local_mode  = False
+        self._start_pos   = None
+
     def _compute_path(self) -> None:
         self._update_localisation()
         # Expose the loop-closure start point to the visualiser once seeded.
