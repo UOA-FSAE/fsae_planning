@@ -154,10 +154,14 @@ keyed by node name (ROS matches params by node name, so `name == executable == k
 
 The active planner (`build_path_walls` in
 [planning/fsae_planning/fsae_planning/boundary.py](planning/fsae_planning/fsae_planning/boundary.py))
-connects same-colour boundary cones into a wall mesh, generates candidate midpoints between valid
-blue-yellow pairs, and chains them with a greedy walk that penalises steps crossing the mesh, then
-fits a cubic spline. Boundary cones arrive already colour-separated and in the global frame on
-`left_track` / `right_track`, and are accumulated into a persistent `ConeMap`.
+connects same-colour boundary cones into a wall mesh, then generates midpoints by anchoring on
+whichever boundary has more cones in view and matching each anchor cone to its single nearest
+unclaimed opposite-colour cone (within a bounded pairing distance) — an exclusive one-to-one match
+rather than pairing every cone within range, which avoids one cone on the sparser side fanning out
+into several conflicting midpoints on tight corners. Those midpoints are chained with a greedy walk
+that penalises steps crossing the wall mesh, then fit with a cubic spline. Boundary cones arrive
+already colour-separated and in the global frame on `left_track` / `right_track`, and are
+accumulated into a persistent `ConeMap`.
 
 `raceline_planner` additionally watches the driven path for loop closure
 ([localisation.py](planning/fsae_planning/fsae_planning/localisation.py)); once a lap closes it
