@@ -344,3 +344,103 @@ def blend_paths(prev, new, car_pos, alpha=0.4, ds=0.5, horizon=15.0,
     keep = np.concatenate([[True],
                            np.linalg.norm(np.diff(blended, axis=0), axis=1) > 1e-3])
     return blended[keep]
+
+
+def roll_loop_to_car(
+    loop: np.ndarray,
+    car_pos: np.ndarray,
+    car_yaw: float,
+    ahead: float = 35.0,
+    wall_segs: list[tuple[np.ndarray, np.ndarray]] | None = None,
+    tangent_entry: bool = False,
+) -> np.ndarray:
+    """
+    Reorder a closed loop so the segment ahead of the car comes first.
+
+    Finds the loop point nearest the car, rolls the loop to start there, orients
+    it in the car's heading direction, and wraps `ahead` metres of the loop tail
+    back onto the end so downstream lookahead / speed scans never run off the
+    array at the wrap seam.  car_pos is prepended as the near anchor (matching
+    the convention used by build_local_path / build_path_walls).
+
+    When `wall_segs` (same-colour cone-wall segments, see boundary.build_wall_
+    segments) is given, the entry point is the nearest loop point whose straight
+    connection from the car crosses no wall.  This stops the car latching onto a
+    loop point on the far side of a cone wall — e.g. on a skidpad it must reach
+    the figure-8 through the opening rather than cutting across the cone rings.
+
+    With `tangent_entry`, the entry point is not the *nearest* point but the
+    reachable point ahead whose loop tangent is most aligned with the approach
+    direction.  The car therefore merges onto the circle along a tangent — a
+    smooth join into the turn — instead of driving at the closest point and
+    cornering hard onto it.  This is a mode the caller turns on only while the
+    car is still approaching (see the skidpad planner, which drops it once the
+    car reaches the crossing); it should be off during normal loop following, or
+    it would keep steering the car back toward the tangent target.
+
+    This is a generic closed-loop geometry helper: the skidpad planner uses it to
+    follow its known figure-8.  (It formerly lived in a lap-localisation module
+    used by a raceline planner that has since been removed.)
+    """
+    pts = np.asarray(loop, dtype=np.float64)
+    n = len(pts)
+    if n < 3:
+        return pts.copy()
+
+    # Drop the duplicate closing point so rolling does not repeat it.
+    if float(np.linalg.norm(pts[0] - pts[-1])) < 1e-6:
+        pts = pts[:-1]
+        n -= 1
+
+    car = np.asarray(car_pos, dtype=np.float64)
+    heading = np.array([math.cos(car_yaw), math.sin(car_yaw)])
+    rel = pts - car
+    dist = np.linalg.norm(rel, axis=1)
+    order = np.argsort(dist)
+
+    reachable = None
+    idx = int(order[0])
+    if wall_segs:
+        from fsae_planning.boundary import segment_crosses_walls
+        reachable = np.array(
+            [not segment_crosses_walls(car, pts[i], wall_segs) for i in range(n)]
+        )
+        for cand in order:                       # nearest reachable point (via opening)
+            if reachable[cand]:
+                idx = int(cand)
+                break
+
+    # Tangent entry: join the circle where the approach direction is tangent to
+    # it (smooth merge) rather than at the nearest point.  The caller enables
+    # this only while approaching; near the skidpad crossing a circle arc passes
+    # within a lane-width of the entry lane, so a distance test cannot tell an
+    # approaching car from a following one — the mode is owned by the planner.
+    if tangent_entry:
+        with np.errstate(invalid='ignore'):
+            direction = rel / dist[:, None]
+        # Loop tangent (central difference), oriented toward the car's heading.
+        tang = np.roll(pts, -1, axis=0) - np.roll(pts, 1, axis=0)
+        tang /= np.linalg.norm(tang, axis=1, keepdims=True) + 1e-12
+        tang *= np.sign(tang @ heading)[:, None]
+        align = np.einsum('ij,ij->i', direction, tang)     # 1 = tangent, 0 = radial
+        eligible = (rel @ heading) > 0.0                    # ahead of the car
+        if reachable is not None:
+            eligible &= reachable
+        if np.any(eligible):
+            align = np.where(eligible, align, -np.inf)
+            idx = int(np.argmax(align))
+
+    rolled = np.vstack([pts[idx:], pts[:idx]])
+
+    # Orient in travel direction: if the next point is behind the car relative
+    # to its heading, the loop is wound the wrong way — reverse it.
+    if float(np.dot(rolled[1] - rolled[0], heading)) < 0.0:
+        rolled = np.vstack([rolled[:1], rolled[1:][::-1]])
+
+    # Wrap `ahead` metres of the loop back onto the tail for seamless lookahead.
+    seg = np.linalg.norm(np.diff(rolled, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    m = int(np.searchsorted(cum, ahead)) + 1
+    tail = rolled[: min(m, n)]
+
+    return np.vstack([np.asarray(car_pos, dtype=np.float64).reshape(1, 2), rolled, tail])

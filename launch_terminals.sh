@@ -1,6 +1,6 @@
 #!/bin/bash
-# Which planner to run: centerline_planner | raceline_planner | skidpad_planner
-PLANNER="${1:-raceline_planner}"
+# Which planner to run: centerline_planner | skidpad_planner
+PLANNER="${1:-centerline_planner}"
 
 # Launch Terminal 1: FSDS simulator
 gnome-terminal -- bash -c "cd ~/fsds-v2.2.0-linux && ./FSDS.sh; exec bash" &

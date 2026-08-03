@@ -15,7 +15,7 @@ path_deviation
     car has slid off the lane ("spun off course").
 
 The figure-8 loop is returned in track order (last point ≈ first point) so it
-drops straight into localisation.roll_loop_to_car for a forward planning window.
+drops straight into path_utils.roll_loop_to_car for a forward planning window.
 """
 import numpy as np
 

@@ -11,7 +11,6 @@ from launch.substitutions import LaunchConfiguration, PythonExpression
 # Pick the planner with `planner:=…`; the mode wires the rest automatically.
 #
 #   ros2 launch fsae_bringup sim.launch.py                              # centerline_planner (default)
-#   ros2 launch fsae_bringup sim.launch.py planner:=raceline_planner
 #   ros2 launch fsae_bringup sim.launch.py planner:=skidpad_planner
 #   ros2 launch fsae_bringup sim.launch.py controller:=mpc             # use the MPC controller
 def generate_launch_description():
@@ -34,7 +33,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'planner',
             default_value='centerline_planner',
-            description='centerline_planner | raceline_planner | skidpad_planner'),
+            description='centerline_planner | skidpad_planner'),
         DeclareLaunchArgument(
             'controller',
             default_value='stanley',

@@ -3,7 +3,7 @@
 <package format="3">
   <name>fsae_planning</name>
   <version>0.1.0</version>
-  <description>Simulator path planning: centerline, raceline (localisation), and skidpad planners</description>
+  <description>Simulator path planning: centerline and skidpad planners</description>
   <maintainer email="fsae@auckland.ac.nz">UoA FSAE</maintainer>
   <license>MIT</license>
 

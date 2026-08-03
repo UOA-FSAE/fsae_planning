@@ -31,7 +31,6 @@ ros2 launch fsds_ros2_bridge fsds_ros2_bridge.launch.py UDP_control:=false
 cd ~/ros2_fsd
 source /opt/ros/jazzy/setup.bash && source install/setup.bash
 ros2 launch fsae_bringup sim.launch.py                              # centerline_planner (default)
-ros2 launch fsae_bringup sim.launch.py planner:=raceline_planner
 ros2 launch fsae_bringup sim.launch.py planner:=skidpad_planner
 ```
 
@@ -41,8 +40,7 @@ Stanley controller and sets `sim_perception full_track:=true` in that mode).
 
 | `planner` | Package / node | Description |
 |-----------|----------------|-------------|
-| `centerline_planner` *(default)* | `planning/fsae_planning` | Barebone cone-wall centreline planner, no localisation |
-| `raceline_planner` | `planning/fsae_planning` | Centreline mapping that closes the loop and switches to closed-loop raceline planning once a lap completes (sim-only extension) |
+| `centerline_planner` *(default)* | `planning/fsae_planning` | Cone-wall centreline planner: follows a rolling first-lap centreline every lap, no localisation |
 | `skidpad_planner` | `planning/fsae_planning/special_utils` | Figure-8 characterisation: laps a precomputed figure-8 at a ramping speed and logs the spin-off (sim-only extension) |
 
 **Build**
@@ -68,13 +66,10 @@ fsae_planning/
 ├── perception/
 │   └── fsae_sim_perception/    # sim stand-in for camera+SLAM: FSDS oracle+odom → /fsae/* inputs
 ├── planning/
-│   └── fsae_planning/          # centerline_planner, raceline_planner, skidpad_planner + utils
+│   └── fsae_planning/          # centerline_planner, skidpad_planner + utils
 └── control/
     └── fsae_control/           # controller (Stanley → cmd_vel) + fsds_bridge (cmd_vel → FSDS)
 ```
-
-`raceline_planner` subclasses `centerline_planner` — it reuses all the cone-wall mapping,
-publishing and visualisation machinery and only adds loop-closure + closed-loop planning.
 
 ---
 
@@ -92,7 +87,7 @@ to the car. Two bridge nodes isolate everything FSDS-specific.
                                                                              /fsae/perception/cone_detection (ConeDetection)
                                                                                        │
                                                                                        ▼
-                                                                   centerline_/raceline_planner
+                                                                     centerline_planner
                                                                                        │  /fsae/planning/selected_trajectory (PoseArray)
                                                                                        ▼
                                                                                   controller
@@ -130,7 +125,7 @@ FSDS uses **ENU**: `x` forward, `y` left, `z` up. Blue cones = left boundary, ye
 |----------|----------------------------------------|
 | `sim_perception` | ZED `cone_detection_node` + `cone_mapper` (SLAM) — produces `car_position` + `left/right_track` |
 | `centerline_planner` | upstream `centerline_planner` (same topics; our cone-wall implementation) |
-| `raceline_planner`, `skidpad_planner` | sim-only extensions (no car-stack equivalent) |
+| `skidpad_planner` | sim-only extension (no car-stack equivalent) |
 | `controller` | `stanley_controller` (`cmd_vel`) |
 | `fsds_bridge` | `ack_to_can_node` — turns `cmd_vel` into the vehicle command bus |
 
@@ -144,8 +139,8 @@ keyed by node name (ROS matches params by node name, so `name == executable == k
 | Node | Key params |
 |------|-----------|
 | `sim_perception` | `look_ahead` (25 m), `look_wide` (10 m), `min_ahead` (0.5 m), `full_track` (false) |
-| `centerline_planner` / `raceline_planner` | `plot` (matplotlib ego-view, default false) |
-| `skidpad_planner` | `plot`, `v_start` (3 m/s), `ramp_accel` (0.25 m/s²), `v_cap` (25 m/s) |
+| `centerline_planner` | `smooth` (0.015), `look_radius` (18 m), `plan_horizon` (15 m), `path_blend` (0.4) |
+| `skidpad_planner` | `v_start` (3 m/s), `ramp_accel` (0.25 m/s²), `v_cap` (25 m/s) |
 | `controller` | `v_max` (15 m/s), `v_min` (1.5 m/s), `stanley_gain` (1.0) |
 
 ---
@@ -161,11 +156,10 @@ rather than pairing every cone within range, which avoids one cone on the sparse
 into several conflicting midpoints on tight corners. Those midpoints are chained with a greedy walk
 that penalises steps crossing the wall mesh, then fit with a cubic spline. Boundary cones arrive
 already colour-separated and in the global frame on `left_track` / `right_track`, and are
-accumulated into a persistent `ConeMap`.
-
-`raceline_planner` additionally watches the driven path for loop closure
-([localisation.py](planning/fsae_planning/fsae_planning/localisation.py)); once a lap closes it
-plans on the full completed loop (the raceline) and monitors perception-vs-map drift.
+accumulated into a persistent `ConeMap`. The chain is clamped to an arc-length horizon
+(`plan_horizon`) and temporally blended frame-to-frame (`path_blend`) so the published centreline
+stays stable as the car drives. This is a **first-lap centreline follower** — it replans the same
+rolling window every lap and does not build or optimise a raceline.
 
 Speed is **curvature-limited in the controller** (`curvature_speed`,
 `v = safety·√(a_lat_max / κ_peak)` with a short-path cap) rather than published by the planner —

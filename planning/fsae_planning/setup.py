@@ -19,13 +19,12 @@ setup(
     zip_safe=True,
     maintainer='UoA FSAE',
     maintainer_email='fsae@auckland.ac.nz',
-    description='Simulator path planning: centerline, raceline (localisation), and skidpad planners',
+    description='Simulator path planning: centerline and skidpad planners',
     license='MIT',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'centerline_planner = fsae_planning.centerline_planner:main',
-            'raceline_planner   = fsae_planning.raceline_planner:main',
             'skidpad_planner    = fsae_planning.special_utils.skidpad_planner:main',
         ],
     },

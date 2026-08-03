@@ -37,12 +37,6 @@ centerline_planner:
     look_radius: 18.0
     plan_horizon: 15.0
     path_blend: 0.4
-raceline_planner:
-  ros__parameters:
-    smooth: 0.015
-    look_radius: 18.0
-    plan_horizon: 15.0
-    path_blend: 0.4
 skidpad_planner:
   ros__parameters:
     v_start: 3.0        # m/s — speed at the start of the ramp

@@ -5,7 +5,8 @@ Plans a centreline a few midpoints at a time using the cone-wall barrier planner
 (see boundary.build_path_walls): same-colour cones are connected into a wall mesh
 and midpoints are chained with a greedy walk that penalises steps crossing the
 mesh.  There is NO localisation — the car plans purely from the boundary cones it
-currently has, lap after lap.
+currently has, lap after lap.  This is a pure first-lap centreline follower; the
+same rolling-window plan is republished every lap.
 
 Interface (matches the fsae_autonomous car stack):
 
@@ -14,10 +15,7 @@ Interface (matches the fsae_autonomous car stack):
     in   /fsae/slam/car_position  geometry_msgs/Pose        x,y in position; yaw in orientation.w
     out  /fsae/planning/selected_trajectory  geometry_msgs/PoseArray   centreline waypoints
 
-The plan loop is triggered by each car_position update (upstream convention).  This
-node is also the base for the localisation-aware raceline planner
-(raceline_planner.RacelinePlanner), which reuses the mapping, publishing and
-visualisation machinery here and only swaps in a closed-loop path once a lap closes.
+The plan loop is triggered by each car_position update (upstream convention).
 """
 import numpy as np
 import rclpy
@@ -111,12 +109,6 @@ class CenterlinePlanner(Node):
         self._yellow_segs: list = []
         self._midpoints:   np.ndarray = np.empty((0, 2))
 
-        # Mode/localisation hooks — always off for the barebone planner; the
-        # raceline subclass sets these once it enters closed-loop mode.
-        self._local_mode = False
-        self._start_pos: np.ndarray | None = None
-        self._drift: dict | None = None
-
         self.get_logger().info(f'{node_name} ready — waiting for car_position.')
 
     # ------------------------------------------------------------------
@@ -185,8 +177,7 @@ class CenterlinePlanner(Node):
         else:
             self.get_logger().info(
                 f'trajectory published: {len(self._centreline)} pts  '
-                f'car=({self._car_pos[0]:.1f},{self._car_pos[1]:.1f}) '
-                f'{"[LOCALISED]" if self._local_mode else ""}',
+                f'car=({self._car_pos[0]:.1f},{self._car_pos[1]:.1f})',
                 throttle_duration_sec=1.0,
             )
 

@@ -9,7 +9,6 @@ from launch_ros.actions import Node
 
 # Planning subsystem: launches ONE planner, selected by the `planner` arg.
 #   centerline_planner  - barebone cone-wall centreline (no localisation)
-#   raceline_planner    - centreline mapping that closes the loop and localises
 #   skidpad_planner     - figure-8 characterisation (special track type)
 # Node name == executable == config key, so params load from fsae_params.yaml.
 def generate_launch_description():
@@ -22,7 +21,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'planner',
             default_value='centerline_planner',
-            description='centerline_planner | raceline_planner | skidpad_planner'),
+            description='centerline_planner | skidpad_planner'),
         Node(
             package='fsae_planning',
             executable=planner,

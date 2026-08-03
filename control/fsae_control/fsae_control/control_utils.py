@@ -149,13 +149,34 @@ def curvature_speed(waypoints, v_max=15.0, v_min=1.5, a_lat_max=4.0,
     if total < scan_start + step:
         return float(v_max_eff)
 
-    sample_arcs = np.arange(scan_start, min(scan_end, total), step)
-    if len(sample_arcs) < 3:
-        return float(v_max_eff)
-
-    sx  = np.interp(sample_arcs, arc, waypoints[:, 0])
-    sy  = np.interp(sample_arcs, arc, waypoints[:, 1])
-    pts = np.column_stack([sx, sy])
+    hi = min(scan_end, total)
+    # The planner re-fits the centreline every frame, so on a straight the
+    # published path carries a few cm of per-point lateral wiggle.  Computing the
+    # MAX Menger curvature over raw ~2 m triples turns that noise into a large
+    # spurious kappa (true kappa is ~0 on a straight, so the max is pure noise),
+    # collapsing v_target and making it oscillate frame-to-frame — the "rapid
+    # accel/decel" on straights.  Fix at the source: densely resample the scan
+    # window and moving-average denoise it before measuring curvature.  A real
+    # corner is a sustained bend that survives the ~5 m smoothing; only the
+    # cm-scale wiggle is removed (this also stops noise from over-slowing corners).
+    pts = None
+    dense = np.arange(scan_start, hi, 1.0)
+    if len(dense) >= 7:                       # room to smooth and still leave >=3 triples
+        dx = np.interp(dense, arc, waypoints[:, 0])
+        dy = np.interp(dense, arc, waypoints[:, 1])
+        w  = min(5, len(dense) - 4)           # 'valid' conv keeps len-w+1 >= 3 points
+        ker = np.ones(w) / w
+        sx = np.convolve(dx, ker, mode='valid')
+        sy = np.convolve(dy, ker, mode='valid')
+        pts = np.column_stack([sx, sy])[::2]  # back to ~2 m spacing for the triples
+    if pts is None or len(pts) < 3:
+        # Short scan window: no headroom to denoise — fall back to coarse sampling.
+        sample_arcs = np.arange(scan_start, hi, step)
+        if len(sample_arcs) < 3:
+            return float(v_max_eff)
+        sx  = np.interp(sample_arcs, arc, waypoints[:, 0])
+        sy  = np.interp(sample_arcs, arc, waypoints[:, 1])
+        pts = np.column_stack([sx, sy])
 
     max_kappa = 0.0
     for i in range(1, len(pts) - 1):

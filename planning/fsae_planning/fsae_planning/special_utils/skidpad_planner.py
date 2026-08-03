@@ -37,8 +37,7 @@ from nav_msgs.msg import Odometry
 
 from fsae_planning.boundary import build_wall_segments
 from fsae_planning.centerline_planner import cones_to_array
-from fsae_planning.localisation import roll_loop_to_car
-from fsae_planning.path_utils import get_lookahead_waypoint
+from fsae_planning.path_utils import get_lookahead_waypoint, roll_loop_to_car
 from fsae_planning.special_utils.skidpad import build_figure8, path_deviation
 from fsae_planning.special_utils.speed_input import SpeedInput
 
