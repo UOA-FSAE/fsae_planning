@@ -40,16 +40,18 @@ class SimPerception(Node):
         self.declare_parameters(
             namespace='',
             parameters=[
-                ('look_ahead', 25.0),   # m ahead to include in the window
-                ('look_wide', 10.0),    # m lateral half-width of the window
-                ('min_ahead', 0.5),     # m: ignore cones behind / at the car
+                ('look_ahead', 25.0),   # m ahead to include in the forward box
+                ('look_wide', 10.0),    # m lateral half-width of the forward box
+                ('min_ahead', 0.5),     # m: box ignores cones behind / at the car
+                ('look_radius', 18.0),  # m: omni-directional visibility radius
                 ('full_track', False),  # publish the whole map instead of the window
             ],
         )
-        self._look_ahead = self.get_parameter('look_ahead').get_parameter_value().double_value
-        self._look_wide  = self.get_parameter('look_wide').get_parameter_value().double_value
-        self._min_ahead  = self.get_parameter('min_ahead').get_parameter_value().double_value
-        self._full_track = self.get_parameter('full_track').get_parameter_value().bool_value
+        self._look_ahead  = self.get_parameter('look_ahead').get_parameter_value().double_value
+        self._look_wide   = self.get_parameter('look_wide').get_parameter_value().double_value
+        self._min_ahead   = self.get_parameter('min_ahead').get_parameter_value().double_value
+        self._look_radius = self.get_parameter('look_radius').get_parameter_value().double_value
+        self._full_track  = self.get_parameter('full_track').get_parameter_value().bool_value
 
         latched_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -82,7 +84,8 @@ class SimPerception(Node):
 
         self.create_timer(0.1, self._publish)  # 10 Hz
 
-        mode = 'full map' if self._full_track else f'window {self._look_ahead}×{2 * self._look_wide} m'
+        mode = ('full map' if self._full_track else
+                f'radius {self._look_radius} m ∪ box {self._look_ahead}×{2 * self._look_wide} m')
         self.get_logger().info(f'sim_perception ready ({mode}).')
 
     # ------------------------------------------------------------------
@@ -119,16 +122,25 @@ class SimPerception(Node):
     # ------------------------------------------------------------------
 
     def _visible(self, cones: np.ndarray) -> np.ndarray:
-        """Crop cones to the forward FOV window (car frame), or pass all through."""
+        """
+        Crop cones to the sensor FOV (car frame), or pass all through.
+
+        FOV = within look_radius of the car (omni — mimics a 360° lidar and keeps
+        the cones around a bend that a forward-only box loses when the track
+        curves away) OR inside the forward box (longer-range preview straight
+        ahead).  Cropping still happens so the planner's cone map fills in track
+        order over a lap rather than being handed the whole oracle map at once.
+        """
         if self._full_track or len(cones) == 0:
             return cones
         cos_y, sin_y = math.cos(self._car_yaw), math.sin(self._car_yaw)
         rel = cones - np.array([self._car_x, self._car_y])
+        dist = np.hypot(rel[:, 0], rel[:, 1])
         x_car =  rel[:, 0] * cos_y + rel[:, 1] * sin_y
         y_car = -rel[:, 0] * sin_y + rel[:, 1] * cos_y
-        mask = (x_car > self._min_ahead) & (x_car < self._look_ahead) & \
-               (np.abs(y_car) < self._look_wide)
-        return cones[mask]
+        box = (x_car > self._min_ahead) & (x_car < self._look_ahead) & \
+              (np.abs(y_car) < self._look_wide)
+        return cones[(dist < self._look_radius) | box]
 
     def _car_pose_msg(self) -> Pose:
         pose = Pose()

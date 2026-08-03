@@ -76,7 +76,8 @@ class RacelinePlanner(CenterlinePlanner):
         if not closed:
             return
 
-        loop = build_completed_path(self._loop_detector.trajectory)
+        loop = build_completed_path(self._loop_detector.trajectory,
+                                    smooth_per_pt=self._smooth_per_pt)
         if loop is None:
             # Path reported closed but was too short to fit — stay in mapping
             # mode and retry on the next lap pass.

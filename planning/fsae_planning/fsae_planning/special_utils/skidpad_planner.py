@@ -63,13 +63,11 @@ class SkidpadPlanner(Node):
         self.declare_parameters(
             namespace='',
             parameters=[
-                ('plot', False),
                 ('v_start', 3.0),      # m/s — speed at the start of the ramp
                 ('ramp_accel', 0.25),  # m/s per second — how fast the target rises
                 ('v_cap', 25.0),       # m/s — hard ceiling on the ramp
             ],
         )
-        self._plot       = self.get_parameter('plot').get_parameter_value().bool_value
         self._v_start    = self.get_parameter('v_start').get_parameter_value().double_value
         self._ramp_accel = self.get_parameter('ramp_accel').get_parameter_value().double_value
         self._v_cap      = self.get_parameter('v_cap').get_parameter_value().double_value
@@ -114,12 +112,6 @@ class SkidpadPlanner(Node):
         ).start()
 
         self.create_timer(1.0, self._skid_log_loop)   # speed log @ 1 Hz
-
-        self._viz = None
-        if self._plot:
-            from fsae_planning.viz_utils import Visualizer
-            self._viz = Visualizer()
-            self.create_timer(1 / 3.0, self._viz_loop)
 
         self.get_logger().info('skidpad_planner ready (characterisation mode) — waiting for cones + car_position.')
 
@@ -331,27 +323,6 @@ class SkidpadPlanner(Node):
                 )
         except OSError:
             pass
-
-    # ------------------------------------------------------------------
-    # Visualisation
-    # ------------------------------------------------------------------
-
-    def _viz_loop(self) -> None:
-        if self._viz is None:
-            return
-        self._viz.update(
-            self._car_pos,
-            self._car_yaw,
-            self._blue_cones,
-            self._yellow_cones,
-            self._centreline,
-            blue_segs=self._skid_blue_segs,
-            yellow_segs=self._skid_yellow_segs,
-            midpoints=np.empty((0, 2)),
-            local_mode=False,
-            start_pos=None,
-            drift=None,
-        )
 
 
 def main(args=None):

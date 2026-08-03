@@ -33,6 +33,8 @@ import math
 import numpy as np
 from scipy.interpolate import splev, splprep
 
+from fsae_planning.path_utils import DEFAULT_SMOOTH_PER_PT
+
 # --- Loop-closure tuning ---------------------------------------------------
 DEPART_DIST   = 12.0  # m — car must leave this radius from start before a return counts
 RETURN_RADIUS = 5.0   # m — back within this of the start = path has closed on itself
@@ -135,6 +137,7 @@ class LoopClosureDetector:
 def build_completed_path(
     trajectory: np.ndarray,
     n_out_per_pt: int = 3,
+    smooth_per_pt: float = DEFAULT_SMOOTH_PER_PT,
 ) -> np.ndarray | None:
     """
     Smooth the accumulated driven path into a seamless closed centreline.
@@ -153,7 +156,8 @@ def build_completed_path(
     if len(traj) < MIN_TRAJ_PTS:
         return None
     traj = _close_on_self(traj)
-    return _smooth_loop(traj, n_out=max(200, len(traj) * n_out_per_pt))
+    return _smooth_loop(traj, n_out=max(200, len(traj) * n_out_per_pt),
+                        smooth_per_pt=smooth_per_pt)
 
 
 def roll_loop_to_car(
@@ -326,8 +330,17 @@ def _close_on_self(traj: np.ndarray) -> np.ndarray:
     return traj if j == 0 else traj[j:]
 
 
-def _smooth_loop(pts: np.ndarray, n_out: int) -> np.ndarray | None:
-    """Fit a periodic cubic spline through the points → seamless closed loop."""
+def _smooth_loop(pts: np.ndarray, n_out: int,
+                 smooth_per_pt: float = DEFAULT_SMOOTH_PER_PT) -> np.ndarray | None:
+    """
+    Fit a periodic cubic *approximating* spline through the points → seamless
+    closed loop.
+
+    smooth_per_pt scales splprep's s (s = smooth_per_pt * n_points).  With the
+    old s=0.0 the spline interpolated every driven-path point, freezing the
+    mapping-lap odometry jitter (and every wobble the car drove) permanently into
+    the raceline; a positive value actually removes it, as the docstring intends.
+    """
     pts = np.asarray(pts, dtype=np.float64)
     gaps = np.linalg.norm(np.diff(pts, axis=0), axis=1)
     pts = pts[np.concatenate([[True], gaps > 1e-4])]
@@ -339,7 +352,8 @@ def _smooth_loop(pts: np.ndarray, n_out: int) -> np.ndarray | None:
         pts = np.vstack([pts, pts[0]])
 
     try:
-        tck, _ = splprep([pts[:, 0], pts[:, 1]], s=0.0, per=1, k=3)
+        tck, _ = splprep([pts[:, 0], pts[:, 1]], s=smooth_per_pt * len(pts),
+                         per=1, k=3)
     except Exception:
         return pts
     u = np.linspace(0.0, 1.0, n_out)

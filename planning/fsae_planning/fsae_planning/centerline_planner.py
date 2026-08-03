@@ -29,7 +29,11 @@ from std_msgs.msg import Empty
 
 from fsae_planning.boundary import build_path_walls
 from fsae_planning.cone_map import ConeMap
-from fsae_planning.path_utils import build_local_path
+from fsae_planning.path_utils import (
+    blend_paths,
+    build_local_path,
+    DEFAULT_SMOOTH_PER_PT,
+)
 
 
 def cones_to_array(cones) -> np.ndarray:
@@ -43,8 +47,32 @@ class CenterlinePlanner(Node):
     def __init__(self, node_name: str = 'centerline_planner'):
         super().__init__(node_name)
 
-        self.declare_parameter('plot', False)
-        self._plot = self.get_parameter('plot').get_parameter_value().bool_value
+        # Per-point spline smoothing budget (splprep s = smooth * n_points).
+        # 0.0 → interpolating spline (reproduces every cone-pairing kink);
+        # a small positive value approximates the midpoints for a clean line.
+        self.declare_parameter('smooth', DEFAULT_SMOOTH_PER_PT)
+        self._smooth_per_pt = self.get_parameter('smooth').get_parameter_value().double_value
+
+        # Arc-length horizon (m) the published centreline is clamped to.  Keeps
+        # the near path in front of the car invariant to how far the lookahead
+        # reaches (extra far midpoints no longer reshape it) and stops distant
+        # apex points dragging the corner line inward.  See build_path_walls.
+        self.declare_parameter('plan_horizon', 15.0)
+        self._plan_horizon = self.get_parameter('plan_horizon').get_parameter_value().double_value
+
+        # Temporal path blend weight toward each freshly-planned path (EMA in the
+        # map frame).  The planner rebuilds the path from scratch every tick, so
+        # without blending successive paths jump and the controller jerks.
+        # 1.0 disables blending (pure new path); smaller = smoother/laggier.
+        self.declare_parameter('path_blend', 0.4)
+        self._path_blend = self.get_parameter('path_blend').get_parameter_value().double_value
+
+        # Cone visibility radius for planning (m).  The planner crops the
+        # accumulated cone map to this radius (omni) OR the forward box, so the
+        # path spans corners instead of truncating when the track curves out of
+        # a heading-aligned box.  See boundary.build_path_walls / filter_cones_window.
+        self.declare_parameter('look_radius', 18.0)
+        self._look_radius = self.get_parameter('look_radius').get_parameter_value().double_value
 
         self.create_subscription(Track, '/fsae/slam/left_track',  self._left_cb,  10)
         self.create_subscription(Track, '/fsae/slam/right_track', self._right_cb, 10)
@@ -78,21 +106,16 @@ class CenterlinePlanner(Node):
         self._car_yaw   = 0.0
         self._have_pose = False
         self._centreline: np.ndarray | None = None
+        self._prev_centreline: np.ndarray | None = None   # last published, for blending
         self._blue_segs:   list = []
         self._yellow_segs: list = []
         self._midpoints:   np.ndarray = np.empty((0, 2))
 
-        # Visualisation hooks — always off for the barebone planner; the raceline
-        # subclass sets these once it enters closed-loop mode.
+        # Mode/localisation hooks — always off for the barebone planner; the
+        # raceline subclass sets these once it enters closed-loop mode.
         self._local_mode = False
         self._start_pos: np.ndarray | None = None
         self._drift: dict | None = None
-
-        self._viz = None
-        if self._plot:
-            from fsae_planning.viz_utils import Visualizer
-            self._viz = Visualizer()
-            self.create_timer(1 / 3.0, self._viz_loop)
 
         self.get_logger().info(f'{node_name} ready — waiting for car_position.')
 
@@ -119,6 +142,7 @@ class CenterlinePlanner(Node):
         self._blue_cones   = np.empty((0, 2))
         self._yellow_cones = np.empty((0, 2))
         self._centreline   = None
+        self._prev_centreline = None
         self._blue_segs    = []
         self._yellow_segs  = []
         self._midpoints    = np.empty((0, 2))
@@ -136,6 +160,20 @@ class CenterlinePlanner(Node):
         self._cone_map.update(self._blue_cones, self._yellow_cones)
 
         self._compute_path()
+
+        # Temporally blend the fresh path with the last one so the published
+        # trajectory eases between frames instead of jumping (which the
+        # controller would track as a steering jerk).  Recursive EMA in the map
+        # frame; resets itself when the path genuinely diverges (see blend_paths).
+        if self._centreline is not None and len(self._centreline) >= 2:
+            self._centreline = blend_paths(
+                self._prev_centreline, self._centreline, self._car_pos,
+                alpha=self._path_blend, horizon=self._plan_horizon,
+            )
+            self._prev_centreline = self._centreline
+        else:
+            self._prev_centreline = None
+
         self._publish_trajectory()
         self._publish_debug()
 
@@ -163,6 +201,9 @@ class CenterlinePlanner(Node):
                 build_path_walls(
                     self._cone_map.blue, self._cone_map.yellow,
                     self._car_pos, self._car_yaw,
+                    smooth_per_pt=self._smooth_per_pt,
+                    look_radius=self._look_radius,
+                    plan_horizon=self._plan_horizon,
                 )
         except Exception as exc:
             self.get_logger().warn(
@@ -220,23 +261,6 @@ class CenterlinePlanner(Node):
         for key, segs in (('blue_walls', self._blue_segs), ('yellow_walls', self._yellow_segs)):
             flat = [pt for seg in segs for pt in seg]
             self._dbg_pubs[key].publish(self._pose_array(flat))
-
-    def _viz_loop(self) -> None:
-        if self._viz is None:
-            return
-        self._viz.update(
-            self._car_pos,
-            self._car_yaw,
-            self._cone_map.blue,
-            self._cone_map.yellow,
-            self._centreline,
-            blue_segs=self._blue_segs,
-            yellow_segs=self._yellow_segs,
-            midpoints=self._midpoints,
-            local_mode=self._local_mode,
-            start_pos=self._start_pos,
-            drift=self._drift if self._local_mode else None,
-        )
 
 
 def main(args=None):

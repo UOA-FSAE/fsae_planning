@@ -7,23 +7,44 @@
 # --- perception (simulator stand-in) ---
 sim_perception:
   ros__parameters:
-    look_ahead: 25.0    # m ahead included in the FOV window
-    look_wide: 10.0     # m lateral half-width of the FOV window
-    min_ahead: 0.5      # m; ignore cones behind / at the car
+    look_ahead: 25.0    # m ahead included in the forward preview box
+    look_wide: 10.0     # m lateral half-width of the forward box
+    min_ahead: 0.5      # m; forward box ignores cones behind / at the car
+    look_radius: 18.0   # m; omni-directional visibility radius (corner-robust)
     full_track: false   # publish the whole map (set true for skidpad by sim.launch.py)
 
 # --- planning (one planner runs at a time; node name == executable) ---
-# `plot` shows the built-in matplotlib ego-view. Off by default now that an
-# external rosbridge-based visualiser is used; set true to bring it back.
+# `smooth` is the per-point spline smoothing budget (splprep s = smooth * n_pts,
+# capped internally so a longer lookahead can't reshape the near path). 0.0 →
+# interpolating spline that reproduces every cone-pairing kink; a small positive
+# value approximates the midpoints, removing left-right bumps on straights. Kept
+# low so the corner line stays on the true centreline (first-lap safety);
+# residual straight-line jitter is absorbed downstream by the controller's
+# steering low-pass and the planner's path_blend. Raise for smoother/lazier
+# lines, lower if corners get cut.
+# `look_radius` (m): the planner crops the accumulated cone map to this radius
+# (omni) OR the forward box, so the path spans corners instead of truncating when
+# the track curves out of a heading-aligned box.
+# `plan_horizon` (m): arc-length the published centreline is clamped to. Makes
+# the near path invariant to how far look_radius reaches. Keep >= the ~14 m
+# controller speed-scan window.
+# `path_blend` (0<a<=1): temporal EMA weight toward each freshly-planned path, so
+# successive paths ease between frames instead of jumping (which the controller
+# tracks as a jerk). 1.0 disables blending; smaller = smoother/laggier.
 centerline_planner:
   ros__parameters:
-    plot: false
+    smooth: 0.015
+    look_radius: 18.0
+    plan_horizon: 15.0
+    path_blend: 0.4
 raceline_planner:
   ros__parameters:
-    plot: false
+    smooth: 0.015
+    look_radius: 18.0
+    plan_horizon: 15.0
+    path_blend: 0.4
 skidpad_planner:
   ros__parameters:
-    plot: false
     v_start: 3.0        # m/s — speed at the start of the ramp
     ramp_accel: 0.25    # m/s per second — how fast the target speed rises
     v_cap: 25.0         # m/s — hard ceiling on the ramp
