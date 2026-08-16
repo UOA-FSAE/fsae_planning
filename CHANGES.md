@@ -1,7 +1,16 @@
-# Changes in this session
+# Planning/control stack: delay compensation, NMPC, centralized tuning, live scoring
 
-Uncommitted working-tree changes to the live `fsae_planning` stack. Grouped by
-area; each item is a real fix or feature, not a debug/logging leftover.
+Closes the gap between offline-tuned weights and what the car actually runs:
+adds pose-age delay compensation and a second, curvature-aware NMPC
+controller to the control loop, centralizes every MPC weight/gain/flag into
+one dataclass shared by both controller nodes, and fixes live runs being
+scored identically to offline tuner rollouts (previously pinned at the DNF
+floor regardless of driving quality). Also tightens planner/perception
+timing (split pose/cone publish rates, atomic pose+twist snapshot) and fixes
+a cone-map duplication bug. Full detail grouped by subsystem below; the
+`fsae_MPCTest` repo's `docs/planning_control_sync.md` and
+`docs/logs/late_turn_in_investigation.md` carry the offline validation this
+was tuned against.
 
 ## Perception (`sim_perception.py`)
 
@@ -209,8 +218,10 @@ area; each item is a real fix or feature, not a debug/logging leftover.
 - New `MPCParams` dataclass: every `mpc_core.py` weight/gain/flag that used
   to be a hardcoded module-level constant or inline list literal (Q/R/R_rate
   weights, adaptive-gain shape constants, delay-compensation limits, the
-  a_lat-ceiling law, feature-enable flags — ~56 fields total) now lives in
-  one place, with the docstring cross-referencing the matching
+  a_lat-ceiling law, feature-enable flags — 44 fields as of the corner-factor
+  rewrite above, down from an original ~56; that rewrite deleted more fields
+  than the later NMPC work added) now lives in one place, with the docstring
+  cross-referencing the matching
   `fsae_MPCTest/settings.py` constant for each field. `mpc_core.py`'s
   `MPCController` takes an `MPCParams` instance (defaulting to
   `DEFAULT_MPC_PARAMS`) instead of reading bare constants. Pure mechanical
@@ -228,6 +239,70 @@ area; each item is a real fix or feature, not a debug/logging leftover.
 - `fsae_params.yaml`'s `controller:` block gains matching YAML defaults for
   every field, at full float precision to stay identical to `mpc_params.py`.
 
+## Control — NMPC MPCC-inspired additions (`nmpc_core.py`, `nmpc_params.py`)
+
+Compared the NMPC against Alexander Liniger's MPCC (Model Predictive
+Contouring Control) for transplantable ideas. Full MPCC (progress `θ` as a
+maximised decision variable) was assessed and rejected — `θ̇`-maximisation is
+a more aggressive version of the "exogenous, schedulable future obligation"
+failure mode `kappa(s)`-as-state already exists to avoid (see the forward-scanning-family
+removal above). Three narrower ideas were adopted instead, NMPC-only
+(`mpc_core.py`/LTV-QP untouched), mirrored identically into
+`fsae_MPCTest/controller/nmpc_optimiser.py`:
+
+- `nmpc_spline_reference_enabled` (default **true**): analytic
+  `CubicSpline`-derived `kappa(s)`/`psi_ref(s)`, replacing the moving-average
+  + finite-difference pipeline. Targets the known open centreline-curvature-spike
+  defect. Live-tested (implicitly, on by default): steering saturation
+  0.21%, |e_y| mean 0.213 m on `comp_test_map_3` — tighter than the
+  pre-existing NMPC baseline (0.58% saturation).
+- `nmpc_horizon_speed_profile_enabled` (default **false**, experimental):
+  samples a precomputed speed profile at each horizon stage's own predicted
+  arc length, mirroring `kappa(s)`'s non-schedulable pattern. **Live-tested
+  and rejected**: `v_actual` hit ~16.7 m/s against a `v_desired` of
+  ~3.3–5 m/s for ~2 s approaching a corner, car went off-track by up to
+  3.6 m. Cause: the QP sums `v_x − v_ref(s_k)` across all 20 horizon stages,
+  so a high `v_ref` at a later stage (post-corner straight) can offset a low
+  `v_ref` at an earlier stage (the corner itself) within the same solve —
+  the non-schedulability property does not transfer to a *summed* cost the
+  way it does to a single state-coupled term. Left in the code, disabled.
+- `nmpc_friction_circle_enabled` (default **false**, experimental): hard
+  per-axle `|F_yf|,|F_yr| <= F_max` QP constraint, additive to (not
+  replacing) the existing soft `alat_ceiling` tanh saturation. **Live-tested
+  and rejected, more severely than the speed profile**: SQP failed to solve
+  on 77.5% of all 614 ticks, steering pinned at the mechanical ±25° lock on
+  30.8% of ticks starting at t=0.65s, run ended in a full stall (4.94 m
+  off-track, heading error −52°). Cause: the hard force bound has no slack
+  variable (unlike the soft tanh saturation beside it), so when ordinary
+  cornering geometry conflicts with it — which happens under normal driving
+  on this track, not just extreme conditions — the subproblem goes
+  infeasible and steering stops updating. `F_max = m·ceiling(v_x)/2` per
+  axle is measurably tighter than normal cornering needs. Left in the code,
+  disabled.
+
+**Fixed, same day: NMPC steered hard-right to the ±25° mechanical lock for
+the first ~0.5–0.7s of every run from a standing start.** Not caused by any
+of the three features above (reproduces with only the spline reference
+active) and not track/spawn geometry (LTV-QP and Stanley see the identical
+initial `e_y≈0.16°` at the same spawn point with no equivalent snap). Cause:
+the tyre slip-angle formula `alpha_f = arctan((v_y+lf*r)/v_safe) - d` floors
+its denominator (`v_safe = max(|v_x|, v_blend_hi)`) to avoid a divide-by-zero
+at `v_x=0`, but this makes a *stationary* tyre's slip angle track the
+commanded steering directly (`alpha_f ≈ -d`), producing a large fictitious
+cornering force from steering alone at zero forward speed — backwards from a
+real tyre. Fixed by scaling `F_yf`/`F_yr` by the existing `blend` factor
+(already used for the kinematic/dynamic mix) immediately after computing
+them. Verified: parity holds (1e-13/1e-14), full `nmpc_offline_check` suite
+passes, no closed-loop regression. Not yet live-retested.
+
+Also fixed in this pass: `nmpc_fyf_max_abs`/`nmpc_fyr_max_abs` were added to
+`last_telemetry` but never added to `telemetry_logger.py`'s
+`ADAPTIVE_COLUMNS`, so they silently never reached any CSV.
+
+See `fsae_MPCTest/docs/planning_control_sync.md`'s "Three MPCC-inspired
+additions" and "Which settings affect which controller" sections for the
+full mechanism and field-by-field controller-scope map.
+
 ## Interface/config
 
 - `fsae_params.yaml`: `look_radius`/`plan_horizon`/`pose_rate`/`cone_rate`
@@ -237,9 +312,3 @@ area; each item is a real fix or feature, not a debug/logging leftover.
   and `cone_recorder`.
 - `centerline_planner.py`/`skidpad_planner.py`: updated to subscribe to
   `car_position` as `PoseStamped` instead of `Pose`.
-
-## Discarded from this patch
-
-`steering_sysid.py`/`steering_step.py` (open-loop steering system-ID
-diagnostics) and their launch scripts were dropped — standalone
-experiments, not part of the MPC controller's runtime dependencies.
