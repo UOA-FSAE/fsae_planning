@@ -30,8 +30,9 @@ ros2 launch fsds_ros2_bridge fsds_ros2_bridge.launch.py UDP_control:=false
 ```bash
 cd ~/ros2_fsd
 source /opt/ros/jazzy/setup.bash && source install/setup.bash
-ros2 launch fsae_bringup sim.launch.py                              # centerline_planner (default)
+ros2 launch fsae_bringup sim.launch.py                              # mpc_standalone (default)
 ros2 launch fsae_bringup sim.launch.py planner:=skidpad_planner
+ros2 launch fsae_bringup sim.launch.py controller:=stanley          # use the Stanley controller
 ```
 
 The **planner is selected at launch** (`planner:=…`); the mode wires the rest automatically
@@ -42,6 +43,21 @@ Stanley controller and sets `sim_perception full_track:=true` in that mode).
 |-----------|----------------|-------------|
 | `centerline_planner` *(default)* | `planning/fsae_planning` | Cone-wall centreline planner: follows a rolling first-lap centreline every lap, no localisation |
 | `skidpad_planner` | `planning/fsae_planning/special_utils` | Figure-8 characterisation: laps a precomputed figure-8 at a ramping speed and logs the spin-off (sim-only extension) |
+
+The **controller is selected independently** (`controller:=…`):
+
+| `controller` | Node | Description |
+|-----------|----------------|-------------|
+| `mpc_standalone` *(default)* | `control/fsae_control` | LTV-QP MPC (`mpc_core.py`), commands throttle/brake directly — bypasses `fsds_bridge`'s separate speed P-loop so the MPC's own longitudinal tuning actually reaches the car/sim |
+| `mpc` | `control/fsae_control` | Same LTV-QP MPC, routes a speed target through `fsds_bridge`'s P-loop instead — matches the car stack's split more closely |
+| `stanley` | `control/fsae_control` | Original Stanley controller (`cmd_vel`) |
+
+Both `mpc`/`mpc_standalone` can run either of two optimisers under the hood, picked with
+`use_nmpc:=true|false` (default `false`) — see "MPC tuning" below and
+[control/fsae_control/fsae_control/nmpc_core.py](control/fsae_control/fsae_control/nmpc_core.py).
+`record_cones:=false` skips the `cone_recorder` node that otherwise launches alongside every mode
+to log one completed lap's boundary cones for offline reuse (default on;
+`cone_out_path:=''` → `~/fsae_logs/cone_map_<timestamp>.json`).
 
 **Build**
 ```bash
@@ -81,7 +97,8 @@ to the car. Two bridge nodes isolate everything FSDS-specific.
 ```
 [FSDS]  /fsds/testing_only/track (oracle, latched)   ┐
         /fsds/testing_only/odom  (ground truth)      ├─▶ sim_perception ─┐
-                                                      ┘                   │  /fsae/slam/car_position   (Pose)
+                                                      ┘                   │  /fsae/slam/car_position   (PoseStamped)
+                                                                          ├─ /fsae/slam/car_odom       (Odometry)
                                                                           ├─ /fsae/slam/left_track     (Track, blue)
                                                                           └─ /fsae/slam/right_track    (Track, yellow)
                                                                              /fsae/perception/cone_detection (ConeDetection)
@@ -98,7 +115,8 @@ to the car. Two bridge nodes isolate everything FSDS-specific.
 
 | Topic | Type | Producer → Consumer |
 |-------|------|---------------------|
-| `/fsae/slam/car_position` | `geometry_msgs/Pose` | sim_perception → planners, controller. x,y in `position`; **yaw (rad) in `orientation.w`** (car-stack convention). Drives the plan/control loops. |
+| `/fsae/slam/car_position` | `geometry_msgs/PoseStamped` | sim_perception → planners, controller. x,y in `pose.position`; **yaw (rad) in `pose.orientation.w`** (car-stack convention). `header.stamp` carries the odom's own measurement time, for delay compensation (see MPC core below) — was a bare `Pose` until this was needed. Drives the plan/control loops. |
+| `/fsae/slam/car_odom` | `nav_msgs/Odometry` | sim_perception → controller. Position/yaw and speed/yaw-rate from one atomic snapshot. Exists because reading pose and twist off separately-timed topics gave no guarantee a given control tick's pair actually came from the same sample; the controller nodes read this instead of `/fsds/testing_only/odom` directly. |
 | `/fsae/slam/left_track` | `fsae_interfaces/Track` | sim_perception → planners. Blue (left) boundary, global frame (`Point[] cones`). |
 | `/fsae/slam/right_track` | `fsae_interfaces/Track` | sim_perception → planners. Yellow (right) boundary, global frame. |
 | `/fsae/perception/cone_detection` | `fsae_interfaces/ConeDetection` | sim_perception → fsds_bridge (proximity brake). Local-frame detections + embedded `car_pose`. |
@@ -297,6 +315,32 @@ cannot import this one, so the two are kept in sync by hand, the same as
 unit-normalised (e.g. `q_e_y`, on metres², and `q_e_psi`, on radians², are
 not on a comparable scale) — see `mpc_params.py`'s own field comments for
 each constant's unit and tuning history.
+
+### NMPC — second controller (`use_nmpc`, `mpc` / `mpc_standalone` only)
+
+`use_nmpc:=true` swaps in
+[control/fsae_control/fsae_control/nmpc_core.py](control/fsae_control/fsae_control/nmpc_core.py)
+(`NMPCController`, Frenet-frame nonlinear MPC — Gauss-Newton SQP, condensed QP solved by OSQP) in
+place of `mpc_core.py`'s LTV-QP. Default `false`; `mpc_core.py`/`mpc_params.py` are byte-unchanged
+when off. Every field lives in `nmpc_params.py`'s `NMPCParams` dataclass, wired through
+`fsae_params.yaml`/`control.launch.py`/`sim.launch.py` the same mechanical way as `MPCParams` above
+— same override syntax, e.g. `use_nmpc:=true nmpc_horizon:=25`.
+
+Exists because the LTV-QP's linear prediction has no term for the path itself bending
+(`e_psi_dot = r`, missing `- kappa(s)*s_dot`) — a car dead on-line approaching a corner is predicted
+to stay on-line forever (measured, not assumed: exactly 0.000° commanded across 8 synthetic test
+states). The NMPC instead tracks arc length `s` as a state and looks up `kappa(s)` directly, so a
+bend ahead is part of the dynamics rather than bolted onto the cost. Offline closed-loop A/B
+(`comp_test_map_3`, identical weights, same simulated plant): steering saturation 12.5% → 0.8%,
+turns in earlier on 7/7 corners tested (median 25.6 m earlier). **Live-tested, matched same-day
+pair**: steering saturation 6.45% → 0.58%, lap 54.72s → 52.35s, composite score 0.695 → 0.532,
+|e_psi| mean 7.85° → 5.06°.
+
+Reproduce the offline A/B with no ROS/FSDS needed:
+[control/fsae_control/test/nmpc_offline_check.py](control/fsae_control/test/nmpc_offline_check.py)
+(optionally cross-checks against `fsae_MPCTest`'s closed-loop rollout if that repo is checked out
+alongside; degrades to synthetic-state checks only if it isn't). Must be kept numerically identical
+to `fsae_MPCTest/settings.py`'s NMPC constants, same parity rule as `MPCParams` above.
 
 ### Precomputed-map launch args (`sim.launch.py` / `control.launch.py`)
 
