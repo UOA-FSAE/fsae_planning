@@ -16,7 +16,7 @@ in skidpad mode.  It still publishes /fsae/planning/selected_trajectory for viz.
 Interface:
     in   /fsae/slam/left_track    fsae_interfaces/Track   blue cones  (full map; sim_perception full_track:=true)
     in   /fsae/slam/right_track   fsae_interfaces/Track   yellow cones (full map)
-    in   /fsae/slam/car_position  geometry_msgs/Pose      x,y in position; yaw in orientation.w
+    in   /fsae/slam/car_position  geometry_msgs/PoseStamped x,y in position; yaw in orientation.w
     in   /fsds/testing_only/odom  nav_msgs/Odometry       ground-truth speed (characterisation only)
     out  /fsae/planning/selected_trajectory  geometry_msgs/PoseArray
     out  /fsae/control/cmd_vel    ackermann_msgs/AckermannDriveStamped  ramped speed + pursuit steering
@@ -32,7 +32,7 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from ackermann_msgs.msg import AckermannDriveStamped
 from fsae_interfaces.msg import Track
-from geometry_msgs.msg import Pose, PoseArray
+from geometry_msgs.msg import Pose, PoseArray, PoseStamped
 from nav_msgs.msg import Odometry
 
 from fsae_planning.boundary import build_wall_segments
@@ -78,7 +78,7 @@ class SkidpadPlanner(Node):
         )
         self.create_subscription(Track, '/fsae/slam/left_track',  self._left_cb,  10)
         self.create_subscription(Track, '/fsae/slam/right_track', self._right_cb, 10)
-        self.create_subscription(Pose,  '/fsae/slam/car_position', self._pose_cb, 10)
+        self.create_subscription(PoseStamped, '/fsae/slam/car_position', self._pose_cb, 10)
         # Ground-truth speed for characterisation logging (sim-only input).
         self.create_subscription(Odometry, '/fsds/testing_only/odom', self._odom_cb, sensor_qos)
 
@@ -130,9 +130,9 @@ class SkidpadPlanner(Node):
         v = msg.twist.twist.linear
         self._car_speed = float(math.hypot(v.x, v.y))
 
-    def _pose_cb(self, msg: Pose) -> None:
-        self._car_pos = np.array([msg.position.x, msg.position.y])
-        self._car_yaw = float(msg.orientation.w)
+    def _pose_cb(self, msg: PoseStamped) -> None:
+        self._car_pos = np.array([msg.pose.position.x, msg.pose.position.y])
+        self._car_yaw = float(msg.pose.orientation.w)
         self._planning_loop()
 
     # ------------------------------------------------------------------

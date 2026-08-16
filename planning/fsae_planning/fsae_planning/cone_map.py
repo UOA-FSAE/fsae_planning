@@ -10,6 +10,8 @@ removed, so the map grows monotonically and historical walls are preserved.
 """
 import numpy as np
 
+# Well under typical cone spacing but comfortably above realistic
+# position noise between two detections of the same physical cone.
 MERGE_DIST = 0.8   # metres — two detections closer than this → same cone
 
 
@@ -51,25 +53,41 @@ def _absorb(store: np.ndarray, obs: np.ndarray) -> np.ndarray:
     Merge obs array into store:
     - points within MERGE_DIST of an existing entry → update that entry
       (running average to correct noisy repeated detections)
-    - points beyond MERGE_DIST of all existing entries → appended as new
+    - points beyond MERGE_DIST of all existing entries → appended as new,
+      but only once per physical cone: candidates are also checked against
+      each other (and against new_pts already accepted from this same
+      batch), so two same-frame detections of one cone newly entering the
+      map merge into a single entry instead of both being appended. Without
+      this, `store` starts empty on a cone's first sighting, so every
+      candidate in that frame compares only against `store` (still empty)
+      and each becomes its own permanent, never-again-merged duplicate —
+      confirmed to fire deterministically even for detections 1 cm apart.
     """
     if len(obs) == 0:
         return store
-    if len(store) == 0:
-        return obs.copy()
 
     store = store.copy()
     new_pts: list[np.ndarray] = []
 
     for pt in obs:
-        dists = np.linalg.norm(store - pt, axis=1)
-        best  = int(np.argmin(dists))
-        if dists[best] < MERGE_DIST:
-            store[best] = (store[best] + pt) * 0.5   # running mean
-        else:
-            new_pts.append(pt)
+        if len(store) > 0:
+            dists = np.linalg.norm(store - pt, axis=1)
+            best  = int(np.argmin(dists))
+            if dists[best] < MERGE_DIST:
+                store[best] = (store[best] + pt) * 0.5   # running mean
+                continue
+
+        if new_pts:
+            new_dists = np.linalg.norm(np.array(new_pts) - pt, axis=1)
+            nbest = int(np.argmin(new_dists))
+            if new_dists[nbest] < MERGE_DIST:
+                new_pts[nbest] = (new_pts[nbest] + pt) * 0.5   # running mean
+                continue
+
+        new_pts.append(pt)
 
     if new_pts:
-        store = np.vstack([store, np.array(new_pts, dtype=np.float64)])
+        store = np.vstack([store, np.array(new_pts, dtype=np.float64)]) if len(store) else \
+            np.array(new_pts, dtype=np.float64)
 
     return store

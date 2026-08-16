@@ -12,7 +12,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
     ],
     install_requires=['setuptools'],
-    zip_safe=True,
+    zip_safe=False,
     maintainer='UoA FSAE',
     maintainer_email='fsae@auckland.ac.nz',
     description='Lateral/longitudinal control (Stanley + MPC) + FSDS command bridge for the simulator',
@@ -20,9 +20,10 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'controller     = fsae_control.stanley_controller:main',
-            'mpc_controller = fsae_control.mpc_controller:main',
-            'fsds_bridge    = fsae_control.fsds_bridge:main',
+            'controller                = fsae_control.stanley_controller:main',
+            'mpc_controller            = fsae_control.mpc_controller:main',
+            'mpc_controller_standalone = fsae_control.mpc_controller_standalone:main',
+            'fsds_bridge               = fsae_control.fsds_bridge:main',
         ],
     },
 )

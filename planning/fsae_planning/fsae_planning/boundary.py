@@ -23,10 +23,19 @@ from fsae_planning.path_utils import (
 # Cone-wall barrier planner
 # ---------------------------------------------------------------------------
 
+# _WALL_MAX_DIST/_WALL_MID_DIST: wide enough that a normal cone gap never
+# breaks the link/pairing (missing a genuine link truncates the wall at that
+# gap), but well under a typical track width so a wall never bridges across
+# to the opposite boundary or a midpoint pairs with the wrong-side cone.
 _WALL_MAX_DIST      = 7.0      # metres — max dist to link same-colour cones into wall
 _WALL_MID_DIST      = 4.0      # metres — max blue-yellow dist for midpoint candidates
+# Large enough that no distance/angle saving in the greedy walk ever makes
+# crossing into the wall mesh worth it — acts as a hard constraint expressed
+# as a cost, not a real magnitude to be weighed against other terms.
 _WALL_CROSS_PENALTY = 100000.0   # cost per wall segment crossed by a path step
 _WALL_PATH_MAX_STEP = 10.0     # metres — max step between consecutive path midpoints
+# Sized so the walk is never cut short by count before _WALL_PLAN_HORIZON (25 m)
+# cuts it short by distance: 18 * _WALL_PATH_MAX_STEP comfortably exceeds it.
 _WALL_PATH_MAX_WALK = 18       # max midpoints in the constructed path
 # Softest per-step turn the walk will accept, as cos(max turn).  The old walk
 # used a hard 0.0 (a 90° per-step ceiling): at a tight hairpin every next
@@ -38,8 +47,15 @@ _WALL_MAX_TURN_COS  = -0.5
 # Default arc-length horizon (m) the published centreline is clamped to before
 # smoothing.  Far midpoints beyond this are dropped so the near path in front of
 # the car does not change as the lookahead grows, and the global spline is not
-# dragged by distant apex points.  Kept ≥ the controller's ~14 m speed scan.
-_WALL_PLAN_HORIZON  = 15.0
+# dragged by distant apex points.  Kept >= the controller's ~24 m speed scan
+# (control_utils.curvature_speed's scan_end) — a tight hairpin (~2 m radius,
+# v_target ~2.7 m/s) approached at v_max=15 m/s needs ~24 m to brake for at a
+# realistic achieved deceleration (~4.5 m/s2, well under the 9 m/s2 hard limit
+# once the MPC's own speed-request low-pass and rate limits are accounted for);
+# the previous 15 m horizon only revealed such a corner a couple of car-lengths
+# before the car needed to already be nearly stopped, causing steering
+# saturation and a spin-out.
+_WALL_PLAN_HORIZON  = 25.0
 
 
 def build_wall_segments(
@@ -236,12 +252,24 @@ def _build_wall_path(
     cos_y, sin_y = math.cos(car_yaw), math.sin(car_yaw)
     heading = np.array([cos_y, sin_y], dtype=np.float64)
 
-    # Seed: the midpoint ahead of the car (in the heading frame) that is nearest
-    # to the car.  If none is clearly ahead (a sharp bend right at the car, every
-    # midpoint lateral), fall back to the nearest midpoint overall so the path
-    # still starts around the corner instead of collapsing to nothing.
+    # Seed: nearest midpoint that isn't clearly behind the car.
+    #
+    # A hard `fwd > 0.3` gate discards a midpoint outright the instant its
+    # heading-frame forward projection dips at or below the cutoff, which
+    # happens as the car's heading rotates through a corner even while the
+    # midpoint is still the closest point on the track and hasn't moved.
+    # Losing the nearest midpoint then forces the seed to jump to the next
+    # surviving one, which in a corner (where midpoints are sparser) can be
+    # several metres further away — a discontinuous jump in the published
+    # path's own near-field anchor right as the car needs to react to it.
+    #
+    # Fix: reject only midpoints clearly behind the car (a small negative
+    # margin, not a positive one), so a near midpoint stays eligible through
+    # the heading range where the old cutoff discarded it, and among eligible
+    # points always take the nearest. Falls back to the nearest midpoint
+    # overall if literally everything is behind (a sharp bend right at the car).
     fwd = (midpoints - car_pos) @ heading
-    forward_idx = np.where(fwd > 0.3)[0]
+    forward_idx = np.where(fwd > -0.5)[0]
     if len(forward_idx) == 0:
         forward_idx = np.arange(n)
     seed = int(forward_idx[np.argmin(np.linalg.norm(midpoints[forward_idx] - car_pos, axis=1))])
@@ -291,7 +319,7 @@ def build_path_walls(
     max_ahead: float = 25.0,
     max_lateral: float = 10.0,
     smooth_per_pt: float = DEFAULT_SMOOTH_PER_PT,
-    look_radius: float = 18.0,
+    look_radius: float = 25.0,   # kept >= _WALL_PLAN_HORIZON — see that constant's comment
     plan_horizon: float = _WALL_PLAN_HORIZON,
 ) -> tuple[np.ndarray | None,
            list[tuple[np.ndarray, np.ndarray]],

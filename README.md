@@ -119,15 +119,141 @@ FSDS uses **ENU**: `x` forward, `y` left, `z` up. Blue cones = left boundary, ye
 
 ---
 
+## CSV telemetry logs
+
+Set the `log_csv` parameter on a controller node (`log_dir` defaults to `~/fsae_logs`) to
+write two CSVs per run, via `fsae_control/telemetry_logger.py`:
+
+- `<tag>_control_<stamp>.csv` — one row per control step (20 Hz)
+- `<tag>_path_<stamp>.csv` — planned-path snapshots (~1 Hz), long form
+
+**Frame.** Everything positional is in the **global ENU frame** described above, written
+exactly as received — the logger performs no coordinate conversion, so control rows and path
+rows overlay directly on one plot with no transform. The two error signals are the exception:
+they are Frenet-style, measured **at the front axle** relative to the nearest path segment,
+not relative to the world.
+
+**Time.** `t` is **seconds since the run started** (first logged step = `0.0`), not a ROS
+epoch stamp — so it reads directly as lap time. Both CSVs share one origin. The epoch of that
+origin is preserved in the header as `t0_epoch_s` if you need to line a run up against a rosbag.
+
+### `<tag>_control_<stamp>.csv`
+
+| Column | Unit | Meaning |
+|---|---|---|
+| `t` | s | Run-relative time, `0.0` at first control step |
+| `car_x` | m | Global ENU east position |
+| `car_y` | m | Global ENU north position |
+| `car_yaw` | rad | Global ENU heading, right-handed, `0` = +x/east |
+| `v_actual` | m/s | Measured forward speed |
+| `v_desired` | m/s | Target speed (post-filtering) |
+| `steer_deg` | deg | Commanded **roadwheel** angle, +ve = left |
+| `e_y` | m | Lateral error at front axle, +ve = car is **left** of path |
+| `e_psi_deg` | deg | Heading error vs path tangent, +ve = CCW/left |
+| `yaw_rate` | rad/s | Measured yaw rate, +ve = CCW/left |
+| `delta_cmd` | rad | MPC steering command (`u[0]`) — `steer_deg` in radians |
+| `a_cmd` | m/s² | MPC longitudinal command (`u[1]`), −ve = braking |
+| `solver_failed` | 0/1 | MPC solve failed this step |
+| `inaccurate` | 0/1 | Solver returned `OPTIMAL_INACCURATE` |
+| `pose_age_s` | s | Age of the pose this solve used (now − pose header stamp) |
+| `path_age_s` | s | Age of the planner path this solve used |
+| `n_delay` | steps | Rollforward depth the controller chose to compensate the lag |
+| `solve_ms` | ms | QP solve wall time |
+| `cmd_latency_ms` | ms | Control-loop entry → command published |
+
+### Latency diagnostics
+
+The last five columns exist to answer one question: **does the real latency
+chain match what the offline simulator assumes?** `fsae_MPCTest` models a fixed
+`DELAY_STEPS = 1` (50 ms) of actuation lag on a perfectly uniform 20 Hz loop;
+these columns let a live run be checked against that assumption instead of it
+being taken on trust.
+
+Read them together — they separate the failure modes:
+
+- **`pose_age_s` >> 50 ms** → the controller is steering toward where the car
+  *was*. This is the leading hypothesis for the heading-error gap.
+- **`path_age_s` large but `pose_age_s` fine** → the reference is stale, not the
+  state. Expected to sit near ~1 s since the planner publishes at ~1 Hz against
+  a 20 Hz control loop; that alone is not a fault.
+- **`solve_ms` ≈ `cmd_latency_ms`** → the QP dominates the loop budget.
+- **`cmd_latency_ms` >> `solve_ms`** → the time is going somewhere other than
+  the solver.
+- **`n_delay` changing tick to tick** → the compensation depth is dithering,
+  which is itself a source of oscillation (the hysteresis in `mpc_core` exists
+  to prevent this; this column verifies it works).
+
+All five are optional in `log_control()` and written as empty cells when the
+caller doesn't supply them, so the Stanley controller still logs normally.
+
+`delta_cmd`/`a_cmd` are logged in the MPC's own units rather than normalised FSDS command
+units so the score can be recomputed from the file without re-deriving any scaling.
+
+> **Units gotcha.** `log_control()` takes **radians**. Passing the normalised
+> `ControlCommand.steering` (`[-1, 1]`) instead silently inflates `steer_deg` by
+> ~2.3× and still looks plausible — this bug once hid live slew-rate saturation
+> for a whole tuning cycle. Scale by `MAX_STEER_RAD` first.
+
+### `<tag>_path_<stamp>.csv`
+
+| Column | Unit | Meaning |
+|---|---|---|
+| `t` | s | Run-relative time of this snapshot |
+| `idx` | — | Waypoint index within the snapshot |
+| `x`, `y` | m | Global ENU waypoint position (same frame as `car_x`/`car_y`) |
+
+### Score header
+
+On close, the control CSV is rewritten with a `#`-commented block holding the run's composite
+score and every component metric, computed by `fsae_control/scoring.py` — a verbatim copy of
+the offline tuner's `sim/scoring.py`. A live score is therefore directly comparable to an
+offline one. `pandas.read_csv(path, comment='#')` parses the file unchanged; numpy needs
+`skip_header=<number of '#' lines>` because `genfromtxt` won't skip comments when locating the
+`names=True` row.
+
+When a precomputed speed profile is loaded (`map_path` set — the normal live-driving
+setup), `telemetry_logger.py`'s `LapProgressTracker` derives real `progress`/`reached_end`/
+`time_bonus` from the car's position against that path, integrating `ds / v_target` over
+the profile for the time bound. The car still can't measure `offtrack` (needs
+ground-truth track edges), and a run against the live planner topic instead of a
+precomputed profile has no known path end either — either case leaves those terms at
+zero/`False` and the header records `score_is_partial=1`. The weighted-metric component
+is directly comparable regardless.
+
+---
+
 ## How the pieces map to the car
 
 | Sim node | Car-stack counterpart it stands in for |
 |----------|----------------------------------------|
-| `sim_perception` | ZED `cone_detection_node` + `cone_mapper` (SLAM) — produces `car_position` + `left/right_track` |
+| `sim_perception` | ZED `cone_detection_node` + `cone_mapper` (SLAM) — produces `car_position` + `left/right_track`. **Stands in for range only, not accuracy** — see the limitation note below. |
 | `centerline_planner` | upstream `centerline_planner` (same topics; our cone-wall implementation) |
 | `skidpad_planner` | sim-only extension (no car-stack equivalent) |
 | `controller` | `stanley_controller` (`cmd_vel`) |
 | `fsds_bridge` | `ack_to_can_node` — turns `cmd_vel` into the vehicle command bus |
+
+### Simulator fidelity limits
+
+`sim_perception` replaces the camera + SLAM front-end, but it only models
+**limited range** — not sensing error. Specifically:
+
+- **Pose is exact.** It copies FSDS's ground-truth `/fsds/testing_only/odom`
+  verbatim. No noise, no drift, no estimation lag. The real car's pose comes
+  from ZED visual odometry + `cone_mapper` and has all three.
+- **Cones are an oracle.** The map is FSDS's exact cone list, cropped to a
+  forward window and radius. No false positives/negatives, no position error,
+  no colour confusion.
+
+So a clean FSDS run does **not** certify real-car behaviour. The offline tuner
+can model the localisation half of this (`SLAM_NOISE_ENABLED` in
+`fsae_MPCTest/settings.py`, default off since FSDS has no such error); the
+cone-detection half is not modelled anywhere yet.
+
+One rate constraint worth knowing: **`pose_rate` must be >= the controller's
+rate** (`CONTROL_HZ` = 20 Hz). Pose and cones previously shared a single 10 Hz
+timer, so the 20 Hz MPC re-solved against an unchanged pose on 50.5% of control
+steps, which drove steering oscillation. They are now separate timers
+(`pose_rate` 20 Hz, `cone_rate` 10 Hz).
 
 ---
 
@@ -138,10 +264,72 @@ keyed by node name (ROS matches params by node name, so `name == executable == k
 
 | Node | Key params |
 |------|-----------|
-| `sim_perception` | `look_ahead` (25 m), `look_wide` (10 m), `min_ahead` (0.5 m), `full_track` (false) |
-| `centerline_planner` | `smooth` (0.015), `look_radius` (18 m), `plan_horizon` (15 m), `path_blend` (0.4) |
+| `sim_perception` | `look_ahead` (25 m), `look_wide` (10 m), `min_ahead` (0.5 m), `look_radius` (25 m), `full_track` (false), `pose_rate` (20 Hz), `cone_rate` (10 Hz) |
+| `centerline_planner` | `smooth` (0.015), `look_radius` (25 m), `plan_horizon` (25 m), `path_blend` (0.4) |
 | `skidpad_planner` | `v_start` (3 m/s), `ramp_accel` (0.25 m/s²), `v_cap` (25 m/s) |
-| `controller` | `v_max` (15 m/s), `v_min` (1.5 m/s), `stanley_gain` (1.0) |
+| `controller` | `v_max` (15 m/s), `v_min` (1.5 m/s), `stanley_gain` (1.0), plus every MPC tuning field below |
+
+### MPC tuning (`mpc` / `mpc_standalone` only)
+
+Single source of truth: [control/fsae_control/fsae_control/mpc_params.py](control/fsae_control/fsae_control/mpc_params.py)'s
+`MPCParams` dataclass — every field there (Q/R/R_rate weights, adaptive-gain
+shape constants, feature flags; ~56 total) has a matching key in
+`fsae_params.yaml`'s `controller:` block with the same default, and a
+matching `DeclareLaunchArgument` in `control.launch.py`/`sim.launch.py`
+(generated from `MPCParams` itself, not hand-written, so the three can't
+drift against each other). Override any of them the same way as
+`v_max`/`v_min` above, e.g.:
+
+```
+ros2 launch fsae_bringup sim.launch.py q_e_y:=6.5 adaptive_r_rate_during_floor:=0.55
+```
+
+`ros2/launch_all.sh` also exposes a small shortlist of the most commonly
+retuned fields (`MPC_Q_E_Y`, `MPC_Q_E_PSI`, `MPC_R_DELTA`,
+`MPC_ADAPTIVE_R_RATE_DURING_FLOOR`, `MPC_ADAPTIVE_R_RATE_ENTERING_FLOOR`) as
+commented-out shell variables near the top of that script — uncomment and
+set one to override it for that launch without touching `fsae_params.yaml`.
+
+Must be kept numerically identical to `fsae_MPCTest/settings.py`'s matching
+constants (see the outer repo's `CLAUDE.md` for the parity rule) — that repo
+cannot import this one, so the two are kept in sync by hand, the same as
+`Q_diag`/`R_diag`/`R_rate_diag` always have been. The weights are NOT
+unit-normalised (e.g. `q_e_y`, on metres², and `q_e_psi`, on radians², are
+not on a comparable scale) — see `mpc_params.py`'s own field comments for
+each constant's unit and tuning history.
+
+### Precomputed-map launch args (`sim.launch.py` / `control.launch.py`)
+
+For a track that's already been mapped, the `mpc`/`mpc_standalone`
+controllers can bypass parts of the live planner/perception pipeline and
+track a precomputed path/speed pair instead:
+
+| Launch arg | Default | Effect |
+|------|---------|--------|
+| `map_path` | `tracks/comp_test_map_3/speed_profile.csv` (this repo's own `tracks/`, under `ros2/src/fsae_planning/`) | CSV to read for `use_precomputed_speed` |
+| `use_precomputed_speed` | `true` | Look up target speed from `map_path`'s oracle profile instead of live `curvature_speed()` per tick |
+| `path_map_path` | `tracks/comp_test_map_3/raceline.csv` | CSV to read for `use_precomputed_path` (same `x,y,psi,v_target` format, different file — see below) |
+| `use_precomputed_path` | `true` | Track `path_map_path`'s precomputed path instead of subscribing to `centerline_planner.py`'s `/fsae/planning/selected_trajectory` — removes the live planner from the control loop entirely, to isolate controller/plant tracking error from planner-induced path error. On by default so `mpc`/`mpc_standalone` track the precomputed oracle path/speed pair; override with `use_precomputed_path:=false` for the planner-vs-controller isolation / live-planner-in-loop experiment mode. |
+
+Example: `ros2 launch fsae_bringup sim.launch.py use_precomputed_path:=false`
+
+`comp_test_map_3` (cone map + both exported CSVs) is committed under this
+repo's own `tracks/comp_test_map_3/`, so a checkout of FSDS + `fsae_planning`
+alone can drive it with no other repo cloned. **To switch to a different
+already-committed track, edit `ros2/launch_all.sh`'s `TRACK=` variable** —
+it expands to both launch args above from this repo's `tracks/<TRACK>/`, so
+the per-controller defaults here only matter for a bare `ros2 launch`
+outside that script.
+
+**To record and export a NEW track**, see the separate `fsae_MPCTest` repo's
+developer guide, section "Recording, exporting and driving a track"
+(`docs/developer_guide.md` in that repo) — that repo's tools write directly
+into this repo's `tracks/<name>/` when both are checked out side by side.
+Copy the resulting directory in manually if you're exporting from elsewhere.
+`fsae_MPCTest` is only needed to *produce* a new track; nothing here needs
+it to *drive* one that already exists. This repo has no fixed relative path
+to `fsae_MPCTest` — it does not need to be nested under the same root, or
+even present, to build/drive `fsae_planning` on its own.
 
 ---
 

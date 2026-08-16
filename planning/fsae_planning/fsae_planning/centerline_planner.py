@@ -12,7 +12,7 @@ Interface (matches the fsae_autonomous car stack):
 
     in   /fsae/slam/left_track    fsae_interfaces/Track     blue (left) boundary, global frame
     in   /fsae/slam/right_track   fsae_interfaces/Track     yellow (right) boundary, global frame
-    in   /fsae/slam/car_position  geometry_msgs/Pose        x,y in position; yaw in orientation.w
+    in   /fsae/slam/car_position  geometry_msgs/PoseStamped x,y in position; yaw in orientation.w
     out  /fsae/planning/selected_trajectory  geometry_msgs/PoseArray   centreline waypoints
 
 The plan loop is triggered by each car_position update (upstream convention).
@@ -22,7 +22,7 @@ import rclpy
 from rclpy.node import Node
 
 from fsae_interfaces.msg import Track
-from geometry_msgs.msg import Pose, PoseArray
+from geometry_msgs.msg import Pose, PoseArray, PoseStamped
 from std_msgs.msg import Empty
 
 from fsae_planning.boundary import build_path_walls
@@ -54,8 +54,10 @@ class CenterlinePlanner(Node):
         # Arc-length horizon (m) the published centreline is clamped to.  Keeps
         # the near path in front of the car invariant to how far the lookahead
         # reaches (extra far midpoints no longer reshape it) and stops distant
-        # apex points dragging the corner line inward.  See build_path_walls.
-        self.declare_parameter('plan_horizon', 15.0)
+        # apex points dragging the corner line inward. Must match
+        # boundary._WALL_PLAN_HORIZON — see that constant's comment for why
+        # 25.0 (braking-distance math), not repeated here.
+        self.declare_parameter('plan_horizon', 25.0)
         self._plan_horizon = self.get_parameter('plan_horizon').get_parameter_value().double_value
 
         # Temporal path blend weight toward each freshly-planned path (EMA in the
@@ -69,12 +71,14 @@ class CenterlinePlanner(Node):
         # accumulated cone map to this radius (omni) OR the forward box, so the
         # path spans corners instead of truncating when the track curves out of
         # a heading-aligned box.  See boundary.build_path_walls / filter_cones_window.
-        self.declare_parameter('look_radius', 18.0)
+        # 25.0 — kept >= plan_horizon so the wall/midpoint mesh
+        # actually extends as far as the path is allowed to; see plan_horizon.
+        self.declare_parameter('look_radius', 25.0)
         self._look_radius = self.get_parameter('look_radius').get_parameter_value().double_value
 
         self.create_subscription(Track, '/fsae/slam/left_track',  self._left_cb,  10)
         self.create_subscription(Track, '/fsae/slam/right_track', self._right_cb, 10)
-        self.create_subscription(Pose,  '/fsae/slam/car_position', self._pose_cb, 10)
+        self.create_subscription(PoseStamped, '/fsae/slam/car_position', self._pose_cb, 10)
 
         # Debug hook: the accumulated ConeMap never forgets a cone (see cone_map.py),
         # so an external tool that edits the track has no way to retract one.  An
@@ -121,10 +125,10 @@ class CenterlinePlanner(Node):
     def _right_cb(self, msg: Track) -> None:
         self._yellow_cones = cones_to_array(msg.cones)
 
-    def _pose_cb(self, msg: Pose) -> None:
+    def _pose_cb(self, msg: PoseStamped) -> None:
         # x,y in position; yaw (rad) is stuffed into orientation.w (upstream convention).
-        self._car_pos   = np.array([msg.position.x, msg.position.y])
-        self._car_yaw   = float(msg.orientation.w)
+        self._car_pos   = np.array([msg.pose.position.x, msg.pose.position.y])
+        self._car_yaw   = float(msg.pose.orientation.w)
         self._have_pose = True
         self._planning_loop()
 

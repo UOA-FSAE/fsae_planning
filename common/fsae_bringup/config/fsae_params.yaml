@@ -10,8 +10,23 @@ sim_perception:
     look_ahead: 25.0    # m ahead included in the forward preview box
     look_wide: 10.0     # m lateral half-width of the forward box
     min_ahead: 0.5      # m; forward box ignores cones behind / at the car
-    look_radius: 18.0   # m; omni-directional visibility radius (corner-robust)
+    # 25.0 — kept >= centerline_planner's look_radius/plan_horizon,
+    # otherwise cones for a tight corner never reach the planner far enough
+    # out for it to detect and brake for the corner in time (see that block's
+    # own comment for the full derivation).
+    look_radius: 25.0   # m; omni-directional visibility radius (corner-robust)
     full_track: false   # publish the whole map (set true for skidpad by sim.launch.py)
+    # Pose and cones publish on SEPARATE timers.
+    # pose_rate MUST be >= the controller rate (CONTROL_HZ = 20 Hz). Both used
+    # to share one 10 Hz timer, so the 20 Hz MPC re-solved against an unchanged
+    # pose on half its ticks (measured: 50.5% of control steps had a
+    # byte-identical car_x/car_y), which drove steering oscillation. FSDS
+    # publishes odom at 250 Hz, so 20 Hz here costs nothing.
+    pose_rate: 20.0     # Hz; car_position. Keep >= controller rate.
+    # Cones stay slower on purpose: cropping the map and building three
+    # messages is this node's expensive path, and the planner gains nothing
+    # from it running at the control rate.
+    cone_rate: 10.0     # Hz; left/right_track + cone_detection
 
 # --- planning (one planner runs at a time; node name == executable) ---
 # `smooth` is the per-point spline smoothing budget (splprep s = smooth * n_pts,
@@ -26,16 +41,20 @@ sim_perception:
 # (omni) OR the forward box, so the path spans corners instead of truncating when
 # the track curves out of a heading-aligned box.
 # `plan_horizon` (m): arc-length the published centreline is clamped to. Makes
-# the near path invariant to how far look_radius reaches. Keep >= the ~14 m
-# controller speed-scan window.
+# the near path invariant to how far look_radius reaches. Keep >= the ~24 m
+# controller speed-scan window (control_utils.curvature_speed's scan_end) — a
+# tight hairpin (~2 m radius, v_target ~2.7 m/s) approached at v_max needs
+# ~24 m to brake for at a realistic achieved deceleration; a shorter horizon
+# reveals such a corner too late, saturating steering and spinning out at
+# corner entry.
 # `path_blend` (0<a<=1): temporal EMA weight toward each freshly-planned path, so
 # successive paths ease between frames instead of jumping (which the controller
 # tracks as a jerk). 1.0 disables blending; smaller = smoother/laggier.
 centerline_planner:
   ros__parameters:
     smooth: 0.015
-    look_radius: 18.0
-    plan_horizon: 15.0
+    look_radius: 25.0
+    plan_horizon: 25.0
     path_blend: 0.4
 skidpad_planner:
   ros__parameters:
@@ -49,5 +68,157 @@ controller:
     v_max: 15.0         # m/s — top speed on straights
     v_min: 1.5          # m/s — minimum speed through tight corners
     stanley_gain: 1.0   # cross-track gain (k_cte)
+
+    # Real-time curvature-lookahead speed cap layered under the precomputed
+    # speed profile (map_path), mpc/mpc_standalone only — see
+    # control_utils.dynamic_speed_cap()'s docstring. No effect when map_path
+    # is unset. Mirrors fsae_MPCTest/settings.py's ENABLE_DYNAMIC_SPEED_CAP /
+    # DYNAMIC_CAP_A_LAT_MAX / DYNAMIC_CAP_SAFETY.
+    enable_dynamic_speed_cap: true
+    dynamic_cap_a_lat_max: 3.2   # m/s^2 — lateral-accel budget for the dynamic cap only
+    dynamic_cap_safety: 0.9      # safety margin for the dynamic cap only
+
+    # MPC tuning (mpc/mpc_standalone only; ignored by stanley). Single source
+    # of truth is fsae_control/mpc_params.py's MPCParams dataclass — every
+    # field there has a matching key here with the SAME default, so leaving
+    # these untouched changes nothing. Must be kept numerically identical to
+    # fsae_MPCTest/settings.py's matching constants (CLAUDE.md's plant/model
+    # parity rule) — see mpc_params.py / settings.py for the full tuning
+    # history behind each value; this file only carries the current numbers.
+
+    # Core cost weights — Q penalises tracking error, R penalises control
+    # effort, R_rate penalises tick-to-tick jerk. States x are
+    # [e_y, e_yd, e_psi, r, e_v, e_a, delta_act, a_act]; inputs u are
+    # [delta_cmd, a_cmd].
+    q_e_y: 6.35                # lateral deviation from path centreline (1/m^2)
+    q_e_yd: 0.5                # rate of change of lateral deviation (1/(m/s)^2)
+    q_e_psi: 1.65              # heading error relative to path tangent (1/rad^2)
+    q_r: 1.0                   # yaw rate (1/(rad/s)^2)
+    q_e_v: 5.40                # speed error: car_speed - desired_speed (1/(m/s)^2)
+    r_delta: 1.8               # steering command effort (1/rad^2)
+    r_a_accel: 2.25            # acceleration command effort, a_cmd >= 0 (1/(m/s^2)^2)
+    r_a_brake: 0.5             # acceleration command effort, a_cmd < 0 -- braking (1/(m/s^2)^2)
+    r_rate_delta: 2.5          # steering rate of change (1/(rad/s)^2)
+    r_rate_a: 2.25             # acceleration rate of change (1/(m/s^3)^2)
+    terminal_q_scale: 1.0      # extra weight on terminal predicted state; 1.0 = no-op
+
+    # Feature enable/disable flags
+    adaptive_q_scaling_enabled: true              # soften Q[0,0] near centreline to reduce small-error hunting
+    steer_rate_anti_hunt_enabled: true            # extra R_rate[0,0] penalty when centred/aligned/uncurving
+    adaptive_r_rate_enable_in_corners: true       # keep R_rate softening active in corners (continuous, no cutoff)
+    delay_compensation_enabled: true              # roll x0 forward through pending commands via predict_ahead()
+    ref_heading_rate_limit_enabled: false         # cap how fast the tracked reference heading may change per tick
+
+    # Reference-heading rate limit (only used if ref_heading_rate_limit_enabled)
+    ref_heading_rise_rate_deg_s: 90.0   # deg/s — max rate the reference heading may change
+
+    # Delay compensation
+    max_delay_compensation_steps: 3    # steps — cap on predict_ahead() rollforward depth
+    predict_epsi_clip: 0.5             # rad — small-angle bound used inside predict_ahead()
+
+    # n_delay stabilisation
+    pose_age_lp_alpha: 0.15      # per-tick low-pass coefficient on pose_age_s
+    n_delay_hysteresis: 0.25     # steps — deadband either side of an n_delay bin boundary
+
+    # Adaptive R_rate corner softening floor
+    adaptive_r_rate_during_floor: 0.625     # R_rate[0,0] floor driven by CURRENT-position curvature
+
+    # Straight-line R_rate[0,0] (steering rate) anti-hunt boost
+    anti_hunt_boost_max: 6.0   # ceiling on the steer_rate_anti_hunt multiplier
+
+    # Current-state corner-factor scheduler -- replaces the whole deleted
+    # lookahead gain-scheduling family (see mpc_params.py's/mpc_core.py's
+    # comments). corner_factor(kappa) = 1 - 1/(1 + k*|kappa|), CURRENT-position
+    # kappa only, no forward scan.
+    corner_factor_k: 8.0   # corner_factor curve sharpness vs CURRENT |kappa|
+
+    # Q[0,0] (e_y) straight/corner blend endpoints
+    q_ey_straight: 4.5   # Q[0,0] on a clear straight (corner_frac=0)
+    q_ey_corner: 9.0     # Q[0,0] at full corner (corner_frac=1)
+
+    # Q[2,2] (e_psi) straight/corner blend endpoints
+    q_epsi_straight: 1.5   # Q[2,2] on a clear straight (corner_frac=0)
+    q_epsi_corner: 3.0     # Q[2,2] at full corner (corner_frac=1)
+
+    # Q[3,3] (r, yaw rate) straight/corner blend endpoints -- RELAXES in-corner
+    q_r_straight: 1.0   # Q[3,3] on a clear straight (corner_frac=0)
+    q_r_corner: 0.5      # Q[3,3] at full corner (corner_frac=1)
+
+    # R_rate[0,0] (steering rate) straight/corner blend endpoints -- RELAXES in-corner
+    rrate_steer_straight: 2.0   # R_rate[0,0] on a clear straight (corner_frac=0)
+    rrate_steer_corner: 1.25    # R_rate[0,0] at full corner (corner_frac=1)
+
+    # R[0,0] (steering effort) corner blend target -- a MIDDLE value, not the
+    # same low extreme as R_rate/Q[3,3] (discourages saturation)
+    r_steer_corner_mid: 1.35   # R[0,0] blend target at full corner (corner_frac=1)
+
+    # Low-speed-in-corner extra boost -- corner-GATED, exact no-op on a
+    # straight regardless of speed (unlike a speed-only gate, this is
+    # corner-gated)
+    low_speed_corner_boost_v_half: 4.0     # m/s — speed at which the boost has decayed to half its max_extra
+    low_speed_corner_boost_max_extra: 0.3  # max extra corner_frac added at car_speed=0, fully inside a corner
+
+    # Heading-error-driven accel/brake asymmetry -- always-on, independent
+    # of the corner-factor scheduler above
+    epsi_ra_half_rad: 0.17453292519943295   # rad (10 deg) — |e_psi| at which the asymmetry reaches half its max effect
+    epsi_ra_accel_boost_max: 2.0            # max multiplier on r_a_accel at large |e_psi|
+    epsi_ra_brake_floor: 0.5                # min multiplier on r_a_brake at large |e_psi|
+
+    # NMPC weight overrides (nmpc_core.NMPCController only; no-op on the
+    # LTV-QP path above). -1.0 = inherit the field of the same name above
+    # (q_e_y, r_delta, ...) -- see mpc_params.py's own section comment for
+    # the full reasoning, and this file's "NONLINEAR MPC" block below for
+    # the NMPC's remaining (structural/solver, non-weight) settings.
+    nmpc_q_e_y: -1.0          # override q_e_y for the NMPC only (-1 = inherit) (1/m^2)
+    nmpc_q_e_yd: -1.0         # override q_e_yd (-1 = inherit) (1/(m/s)^2)
+    nmpc_q_e_psi: -1.0        # override q_e_psi (-1 = inherit) (1/rad^2)
+    nmpc_q_epsi_dot: -1.0     # override q_r (-1 = inherit). NOTE this weights HEADING-ERROR rate (r - kappa*s_dot), not absolute yaw rate (1/(rad/s)^2)
+    nmpc_q_e_v: -1.0          # override q_e_v (-1 = inherit) (1/(m/s)^2)
+    nmpc_r_delta: -1.0        # override r_delta (-1 = inherit) (1/rad^2)
+    nmpc_r_a_accel: -1.0      # override r_a_accel (-1 = inherit) (1/(m/s^2)^2)
+    nmpc_r_a_brake: -1.0      # override r_a_brake (-1 = inherit) (1/(m/s^2)^2)
+    nmpc_r_rate_delta: -1.0   # override r_rate_delta (-1 = inherit) (1/rad^2)
+    nmpc_r_rate_a: -1.0       # override r_rate_a (-1 = inherit) (1/(m/s^2)^2)
+    nmpc_terminal_scale: -1.0 # override terminal_q_scale (-1 = inherit)
+
+    # ── NONLINEAR MPC (nmpc_core.py's NMPCController) ────────────────────
+    # use_nmpc=false (default) means none of this is used and the LTV-QP
+    # MPCController runs exactly as it always has. Single source of truth for
+    # these is fsae_control/nmpc_params.py's NMPCParams dataclass — every
+    # field there has a matching key here with the SAME default.
+    #
+    # These are STRUCTURAL/SOLVER settings only (no LTV-QP analogue to
+    # inherit from) — they have an fsae_MPCTest/settings.py parity partner
+    # (settings.py's NMPC_* constants, from that repo's own offline NMPC
+    # port, controller/nmpc_optimiser.py), kept numerically identical by
+    # hand, the same discipline as every other field in this file. The NMPC's
+    # COST WEIGHTS (nmpc_q_e_y, nmpc_r_delta, ...) live in the MPC tuning
+    # block above instead, alongside the weights they inherit from when
+    # left at their -1.0 sentinel — see that block's own comment.
+
+    use_nmpc: false   # true -> use nmpc_core.NMPCController (Frenet-frame nonlinear MPC) instead of mpc_core.MPCController (LTV-QP). Default false.
+    nmpc_horizon: 20   # prediction horizon in steps (20 * dt=0.05 = 1.0 s). See Part 16 §16.7 for the horizon choice. (steps)
+    nmpc_sqp_iters: 1   # max Gauss-Newton SQP iterations per control tick (real-time-iteration style: the previous tick's shifted solution is the warm start, so one iteration per tick still converges across ticks). See Part 16 §16.7 for the iteration-count choice. (iterations)
+    nmpc_solve_budget_ms: 25.0   # wall-clock budget per tick; SQP stops early (shipping the best feasible iterate) once exceeded. Half of the 50 ms control period, leaving the rest of the tick for the node (ms)
+    nmpc_rk_substeps: 2   # RK4 substeps per dt in the prediction rollout. 2 is needed because tau_a=0.02 s is stiff against dt=0.05 s (lambda*dt = -2.5, near RK4's real-axis stability edge) (substeps)
+    nmpc_jac_substeps: 1   # RK4 substeps used when finite-differencing the QP's A_k/B_k sensitivities. Deliberately coarser than nmpc_rk_substeps: these only set the SQP STEP DIRECTION, never the predicted trajectory, and thi... (substeps)
+    nmpc_trust_delta_rad: 0.15707963267948966   # per-iteration trust region on each stage's steering deviation. 9 deg = MPCController's own du_max steering slew per tick (180 deg/s * 0.05 s) — reused, not invented (rad)
+    nmpc_trust_a: 0.6   # per-iteration trust region on each stage's accel deviation. 0.6 = MPCController's du_max[1] — reused, not invented (m/s^2)
+    nmpc_backtrack_max: 2   # max step halvings if a full SQP step increases the true nonlinear cost (divergence guard). 0 disables backtracking (halvings)
+    nmpc_track_halfwidth: 3.5   # soft |e_y| bound with slack, copied from _build_qp's existing +-3.5 m literal. <=0 removes the constraint (and its slack variables) entirely (m)
+    nmpc_slack_weight: 10000.0   # penalty on the track-bound slack, copied from _build_qp's existing W_slack = 10000.0 (1/m^2)
+    nmpc_curvature_dense_step: 0.5   # arc-length resampling step for the kappa(s) reference (= curvature_speed()'s dense_step) (m)
+    nmpc_curvature_smooth_w: 3   # moving-average width applied before differencing headings (= curvature_speed()'s w). 1 disables smoothing (samples)
+    nmpc_kappa_clip: 0.5   # hard clamp on |kappa(s)|. GUARD, not a tuning knob: 0.5 = a 2 m radius, the tightest corner curvature_speed()'s own docstring contemplates, so it is inert on any real track line and only catches a ... (1/m)
+    nmpc_alat_ceiling_enabled: true   # include FSDS's measured sustained lateral-acceleration ceiling (MPCParams.alat_ceiling_flat/_slope/_intercept, the same law mpc_core._alat_ceiling_at uses) as a smooth saturation of the prediction'...
+    # [NMPC only] MPCC-inspired additions (2026-08-13) -- see mpc_params.py's
+    # own field metadata (controller: "nmpc_only") and
+    # fsae_MPCTest/docs/planning_control_sync.md's "Three MPCC-inspired
+    # additions" / "Which settings affect which controller" sections.
+    nmpc_spline_reference_enabled: true   # [NMPC only] true (default) -> PathReference builds kappa(s)/psi_ref(s) from an analytic CubicSpline fit to the raw waypoints instead of the dense-resample + moving-average + finite-difference pipeline. Numerical-quality fix, no new solver coupling, defaults on unlike every other flag in this block. False restores the old moving-average path exactly, for A/B comparison (bool)
+    nmpc_horizon_speed_profile_enabled: false   # [NMPC only, EXPERIMENTAL] true -> sample a precomputed per-lap speed profile v(s) at each horizon stage's own PREDICTED arc length s_k instead of holding v_ref constant across the horizon. Mirrors kappa(s)'s state-keyed, non-schedulable lookup on purpose. No-op unless a speed-profile array is supplied at PathReference construction time. Default false: unvalidated, do not enable for a live run without an offline A/B first (bool)
+    nmpc_friction_circle_enabled: false   # [NMPC only, EXPERIMENTAL] true -> add a HARD |F_yf|/|F_yr| <= F_max bound to the condensed QP, ADDITIONAL to (not a replacement for) the existing SOFT alat-ceiling tanh saturation. F_max derived from the same measured ceiling law via F_max = m * ceiling(v_x) / 2 per axle. Default false: unvalidated, do not enable for a live run without an offline A/B first (bool)
+    nmpc_osqp_max_iter: 500   # OSQP iteration cap for the SQP subproblem. Bounded well below MPCController's 8000 on purpose: this is a step DIRECTION that the true-cost backtracking test validates before it is kept, so a hard s... (iterations)
+    nmpc_osqp_eps: 0.0001   # OSQP eps_abs/eps_rel for the SQP subproblem. Looser than MPCController's 1e-5 on purpose: an SQP subproblem is a STEP direction that the next iteration corrects, not the final answer, so sub-1e-4 a...
 fsds_bridge:
   ros__parameters: {}   # no tunables yet
