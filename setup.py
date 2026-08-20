@@ -27,6 +27,7 @@ setup(
             'perception_node  = fsae_planning.track_utils.perception_node:main',
             'control_node     = fsae_planning.track_utils.control_node:main',
             'integration_node = fsae_planning.integration_node:main',
+            'lap_timer_node   = fsae_planning.lap_timer_node:main',
         ],
     },
 )

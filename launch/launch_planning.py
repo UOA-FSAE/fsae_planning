@@ -22,4 +22,10 @@ def generate_launch_description():
             name='controller',
             output='screen',
         ),
+        Node(
+            package='fsae_planning',
+            executable='lap_timer_node',
+            name='lap_timer',
+            output='screen',
+        ),
     ])
