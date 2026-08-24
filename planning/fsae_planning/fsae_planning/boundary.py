@@ -23,10 +23,19 @@ from fsae_planning.path_utils import (
 # Cone-wall barrier planner
 # ---------------------------------------------------------------------------
 
+# _WALL_MAX_DIST/_WALL_MID_DIST: wide enough that a normal cone gap never
+# breaks the link/pairing (missing a genuine link truncates the wall at that
+# gap), but well under a typical track width so a wall never bridges across
+# to the opposite boundary or a midpoint pairs with the wrong-side cone.
 _WALL_MAX_DIST      = 7.0      # metres — max dist to link same-colour cones into wall
 _WALL_MID_DIST      = 4.0      # metres — max blue-yellow dist for midpoint candidates
+# Large enough that no distance/angle saving in the greedy walk ever makes
+# crossing into the wall mesh worth it — acts as a hard constraint expressed
+# as a cost, not a real magnitude to be weighed against other terms.
 _WALL_CROSS_PENALTY = 100000.0   # cost per wall segment crossed by a path step
 _WALL_PATH_MAX_STEP = 10.0     # metres — max step between consecutive path midpoints
+# Sized so the walk is never cut short by count before _WALL_PLAN_HORIZON (25 m)
+# cuts it short by distance: 18 * _WALL_PATH_MAX_STEP comfortably exceeds it.
 _WALL_PATH_MAX_WALK = 18       # max midpoints in the constructed path
 # Softest per-step turn the walk will accept, as cos(max turn).  The old walk
 # used a hard 0.0 (a 90° per-step ceiling): at a tight hairpin every next
@@ -34,12 +43,26 @@ _WALL_PATH_MAX_WALK = 18       # max midpoints in the constructed path
 # the path truncated into the corner (car then drove straight off).  -0.5 (~120°)
 # lets the chain follow a genuine hairpin; the angle cost + wall-cross penalty
 # still keep it from doubling back or hopping to a parallel track.
+#
+# This was set below -1.0 for a time to test corner-truncation on a 60-90 deg
+# turn (a cosine can never go that low, so the `fwd_dot <= _WALL_MAX_TURN_COS`
+# gate never fired and the walk no longer stopped on turn-angle grounds at
+# all) -- that left ONLY the wall-cross penalty guarding against the walk
+# doubling back on itself, and it doubled back (path pointing behind the car
+# at a teardrop pinch). Restored to -0.5.
 _WALL_MAX_TURN_COS  = -0.5
 # Default arc-length horizon (m) the published centreline is clamped to before
 # smoothing.  Far midpoints beyond this are dropped so the near path in front of
 # the car does not change as the lookahead grows, and the global spline is not
-# dragged by distant apex points.  Kept ≥ the controller's ~14 m speed scan.
-_WALL_PLAN_HORIZON  = 15.0
+# dragged by distant apex points.  Kept >= the controller's ~24 m speed scan
+# (control_utils.curvature_speed's scan_end) — a tight hairpin (~2 m radius,
+# v_target ~2.7 m/s) approached at v_max=15 m/s needs ~24 m to brake for at a
+# realistic achieved deceleration (~4.5 m/s2, well under the 9 m/s2 hard limit
+# once the controller's own speed-request low-pass and rate limits are accounted for);
+# the previous 15 m horizon only revealed such a corner a couple of car-lengths
+# before the car needed to already be nearly stopped, causing steering
+# saturation and a spin-out.
+_WALL_PLAN_HORIZON  = 25.0
 
 
 def build_wall_segments(
@@ -199,28 +222,47 @@ def _gen_midpoints(
     return np.array(mids, dtype=np.float64) if mids else np.empty((0, 2), dtype=np.float64)
 
 
+_SEED_DIR_MIN_ALIGN = 0.3   # cos of ~72 deg -- see prev_dir note in _build_wall_path
+
+
 def _build_wall_path(
     midpoints: np.ndarray,
     car_pos: np.ndarray,
     car_yaw: float,
     wall_segs: list[tuple[np.ndarray, np.ndarray]],
+    prev_dir: np.ndarray | None = None,
 ) -> np.ndarray:
     """
-    Chain midpoints into a path by following the local track direction.
+    Chain midpoints into a path by walking from the car's own position.
 
-    Step cost:
+    Step cost (identical for every hop, including the first, car → first
+    midpoint):
         distance  +  _WALL_CROSS_PENALTY × crossings  +  2.0 × heading_change(rad)
 
-    The walk seeds at the nearest midpoint ahead of the car and, at each step,
-    picks the cheapest unvisited midpoint whose bearing is within _WALL_MAX_TURN_COS
-    of the current travel direction, where cur_dir rotates as the walk turns.
+    At each step, picks the cheapest unvisited midpoint whose bearing is
+    within _WALL_MAX_TURN_COS of the current travel direction, where cur_dir
+    starts at the car's heading and rotates as the walk turns.
 
-    This is the key to not truncating at corners: an earlier version sorted
-    midpoints by forward distance in the *car's fixed heading frame* and only
-    chained to ever-greater forward distance, so as soon as the track curved away
-    from the initial heading the chain stalled (the apex/exit midpoints have
-    smaller heading-frame forward distance) — producing a stub path into corners.
-    Following cur_dir instead lets the chain turn with the track.
+    Starting the walk AT the car rather than seeding it with a separately
+    (and more loosely) chosen "nearest midpoint ahead" means the car → first
+    point segment — the one the controller weights most heavily — goes
+    through the same wall-crossing and turn-angle checks as every other step,
+    instead of bypassing the barrier entirely. The old seed rule only tested
+    whether a midpoint was "not clearly behind" the car (a loose distance-
+    along-heading gate with no lateral or wall-crossing check at all), which
+    let it flip onto the wrong leg of a self-intersecting corner: the
+    already-driven return leg can sit physically closer to the car than the
+    correct next midpoint while still passing that gate, and nothing in the
+    old seed rule penalised the resulting near-180° turn, so the walk from
+    there ran backward relative to true track progress.
+
+    This is also the key to not truncating at corners: an earlier version
+    sorted midpoints by forward distance in the *car's fixed heading frame*
+    and only chained to ever-greater forward distance, so as soon as the
+    track curved away from the initial heading the chain stalled (the
+    apex/exit midpoints have smaller heading-frame forward distance) —
+    producing a stub path into corners. Following cur_dir instead lets the
+    chain turn with the track.
 
     The per-step gate is a relaxed turn allowance (_WALL_MAX_TURN_COS, ~120°) not
     a hard 90° forward test: at an extreme bend the next along-track midpoint can
@@ -228,6 +270,15 @@ def _build_wall_path(
     truncated the path into the corner.  The angle cost still favours straighter
     chains and the wall-crossing penalty still blocks jumps to adjacent parallel
     tracks, so relaxing the gate wraps hairpins without doubling back.
+
+    prev_dir: unit direction (car → first point) of the path this function
+    produced last tick, if any. On the FIRST hop only, candidates whose
+    direction from the car disagrees with prev_dir (cosine <=
+    _SEED_DIR_MIN_ALIGN) are excluded before the cost comparison above, unless
+    that would exclude everything — an extra guard against the wrong-leg
+    flip described above surviving the turn-angle/wall-cross checks (e.g. a
+    return-leg midpoint within the ~120° per-step allowance). Later hops are
+    unaffected.
     """
     n = len(midpoints)
     if n == 0:
@@ -236,27 +287,25 @@ def _build_wall_path(
     cos_y, sin_y = math.cos(car_yaw), math.sin(car_yaw)
     heading = np.array([cos_y, sin_y], dtype=np.float64)
 
-    # Seed: the midpoint ahead of the car (in the heading frame) that is nearest
-    # to the car.  If none is clearly ahead (a sharp bend right at the car, every
-    # midpoint lateral), fall back to the nearest midpoint overall so the path
-    # still starts around the corner instead of collapsing to nothing.
-    fwd = (midpoints - car_pos) @ heading
-    forward_idx = np.where(fwd > 0.3)[0]
-    if len(forward_idx) == 0:
-        forward_idx = np.arange(n)
-    seed = int(forward_idx[np.argmin(np.linalg.norm(midpoints[forward_idx] - car_pos, axis=1))])
-
-    ordered  = [seed]
-    visited  = {seed}
+    ordered  = []
+    visited  = set()
     cur_dir  = heading.copy()
+    curr     = car_pos
 
-    for _ in range(_WALL_PATH_MAX_WALK - 1):
-        curr = midpoints[ordered[-1]]
+    for step_i in range(_WALL_PATH_MAX_WALK):
+        cand_idx = np.array([idx for idx in range(n) if idx not in visited], dtype=int)
+
+        if step_i == 0 and prev_dir is not None and len(cand_idx) > 0:
+            rel      = midpoints[cand_idx] - car_pos
+            rel_norm = np.linalg.norm(rel, axis=1)
+            rel_norm[rel_norm < 1e-6] = 1e-6
+            align    = (rel / rel_norm[:, None]) @ prev_dir
+            aligned  = cand_idx[align > _SEED_DIR_MIN_ALIGN]
+            if len(aligned) > 0:
+                cand_idx = aligned
+
         best_nb, best_cost = None, math.inf
-
-        for idx in range(n):
-            if idx in visited:
-                continue
+        for idx in cand_idx:
             cand = midpoints[idx]
             step = cand - curr
             d = float(np.linalg.norm(step))
@@ -271,7 +320,7 @@ def _build_wall_path(
             cost     = d + _WALL_CROSS_PENALTY * n_cross + 2.0 * angle
             if cost < best_cost:
                 best_cost = cost
-                best_nb   = idx
+                best_nb   = int(idx)
 
         if best_nb is None:
             break
@@ -279,6 +328,7 @@ def _build_wall_path(
         cur_dir = cur_dir / (float(np.linalg.norm(cur_dir)) + 1e-9)
         visited.add(best_nb)
         ordered.append(best_nb)
+        curr = midpoints[best_nb]
 
     return midpoints[ordered]
 
@@ -291,8 +341,9 @@ def build_path_walls(
     max_ahead: float = 25.0,
     max_lateral: float = 10.0,
     smooth_per_pt: float = DEFAULT_SMOOTH_PER_PT,
-    look_radius: float = 18.0,
+    look_radius: float = 25.0,   # kept >= _WALL_PLAN_HORIZON — see that constant's comment
     plan_horizon: float = _WALL_PLAN_HORIZON,
+    prev_dir: np.ndarray | None = None,
 ) -> tuple[np.ndarray | None,
            list[tuple[np.ndarray, np.ndarray]],
            list[tuple[np.ndarray, np.ndarray]],
@@ -310,6 +361,12 @@ def build_path_walls(
 
     Wall cones extend 5 m behind the car (min_ahead = -5) so recently-passed
     cones continue contributing as barriers after leaving the forward window.
+
+    prev_dir: unit direction (car → first path point) from the last tick's
+    result, passed straight through to _build_wall_path's seed selection to
+    stop it flipping onto the wrong leg at a pinch (see that function's
+    docstring). Caller is responsible for updating it from the returned
+    centreline after a successful tick and clearing it after a failure/reset.
 
     Returns
     -------
@@ -351,7 +408,7 @@ def build_path_walls(
                                max_ahead, max_lateral)
         return cl, blue_segs, yellow_segs, midpoints
 
-    ordered = _build_wall_path(midpoints, car_pos, car_yaw, all_segs)
+    ordered = _build_wall_path(midpoints, car_pos, car_yaw, all_segs, prev_dir=prev_dir)
 
     # A single ordered midpoint is enough: anchored to the car below it becomes a
     # short but ON-TRACK forward segment, which the controller happily extrapolates.

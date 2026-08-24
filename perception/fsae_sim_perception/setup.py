@@ -12,7 +12,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
     ],
     install_requires=['setuptools'],
-    zip_safe=True,
+    zip_safe=False,
     maintainer='UoA FSAE',
     maintainer_email='fsae@auckland.ac.nz',
     description='Simulator perception stand-in: bridges FSDS oracle map + odom to the fsae_autonomous interface',
@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'sim_perception = fsae_sim_perception.sim_perception:main',
+            'cone_recorder  = fsae_sim_perception.cone_recorder:main',
         ],
     },
 )

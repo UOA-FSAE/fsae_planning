@@ -3,6 +3,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 
@@ -10,18 +11,54 @@ from launch.substitutions import LaunchConfiguration, PythonExpression
 # Top-level simulator bring-up: composes perception + planning + control.
 # Pick the planner with `planner:=…`; the mode wires the rest automatically.
 #
-#   ros2 launch fsae_bringup sim.launch.py                              # centerline_planner (default)
+#   ros2 launch fsae_bringup sim.launch.py
 #   ros2 launch fsae_bringup sim.launch.py planner:=skidpad_planner
-#   ros2 launch fsae_bringup sim.launch.py controller:=mpc             # use the MPC controller
+#   ros2 launch fsae_bringup sim.launch.py record_cones:=false          # skip cone_recorder
+#   ros2 launch fsae_bringup sim.launch.py use_precomputed_speed:=false # live curvature_speed()
+#                                                                        # instead of the mapped-track
+#                                                                        # speed profile.
+#                                                                        # On (mapped-track profile) by
+#                                                                        # default -- edit this file's
+#                                                                        # use_precomputed_speed default
+#                                                                        # below to change the default
+#                                                                        # instead of passing the flag
+#                                                                        # every launch.
+#   ros2 launch fsae_bringup sim.launch.py use_precomputed_path:=false  # live planner's centreline
+#                                                                        # (centerline_planner.py) instead
+#                                                                        # of the precomputed oracle path
+#                                                                        # -- planner-vs-controller
+#                                                                        # isolation / live-planner-in-loop
+#                                                                        # experiment mode. Precomputed
+#                                                                        # path is on by default -- see
+#                                                                        # this file's use_precomputed_path
+#                                                                        # default below to change it.
 def generate_launch_description():
     launch_dir = os.path.join(get_package_share_directory('fsae_bringup'), 'launch')
     planner = LaunchConfiguration('planner')
-    controller = LaunchConfiguration('controller')
+    record_cones = LaunchConfiguration('record_cones')
+    cone_out_path = LaunchConfiguration('cone_out_path')
+    log_csv = LaunchConfiguration('log_csv')
+    log_dir = LaunchConfiguration('log_dir')
+    map_path = LaunchConfiguration('map_path')
+    use_precomputed_speed = LaunchConfiguration('use_precomputed_speed')
+    path_map_path = LaunchConfiguration('path_map_path')
+    use_precomputed_path = LaunchConfiguration('use_precomputed_path')
+    look_radius = LaunchConfiguration('look_radius')
+    plan_horizon = LaunchConfiguration('plan_horizon')
+    v_max = LaunchConfiguration('v_max')
+    v_min = LaunchConfiguration('v_min')
+    stanley_gain = LaunchConfiguration('stanley_gain')
 
-    # Skidpad needs the whole cone map up front to reconstruct the figure-8.
-    full_track = PythonExpression(
-        ["'true' if '", planner, "' == 'skidpad_planner' else 'false'"]
-    )
+    # Skidpad needs the whole cone map up front to reconstruct the figure-8,
+    # so it defaults on for that planner and off otherwise -- but this stays
+    # overridable (e.g. `full_track:=true` with centerline_planner) as a
+    # testing toggle: it hands the planner the whole oracle map immediately
+    # instead of a FOV-cropped window, which is useful to isolate whether a
+    # tight/teardrop corner's issues stem from sensing range or from the
+    # planning logic itself (build_path_walls's look_radius/plan_horizon
+    # crop and greedy walk in boundary.py). It is a sim-only cheat -- there
+    # is no equivalent oracle map on the real car.
+    full_track = LaunchConfiguration('full_track')
 
     def include(name, args):
         return IncludeLaunchDescription(
@@ -35,10 +72,119 @@ def generate_launch_description():
             default_value='centerline_planner',
             description='centerline_planner | skidpad_planner'),
         DeclareLaunchArgument(
-            'controller',
-            default_value='stanley',
-            description='stanley | mpc — path-tracking controller to run'),
+            'record_cones',
+            default_value='true',
+            description='Also launch cone_recorder to log one lap of boundary cones'),
+        DeclareLaunchArgument(
+            'cone_out_path',
+            default_value='',
+            description="cone_recorder output path ('' -> ~/fsae_logs/cone_map_<timestamp>.json)"),
+        DeclareLaunchArgument(
+            'log_csv',
+            default_value='true',
+            description='Write controller CSV telemetry (e_y/e_psi/steer/...) to log_dir'),
+        DeclareLaunchArgument(
+            'log_dir',
+            default_value='',
+            description="Controller CSV telemetry output dir ('' -> ~/fsae_logs). "
+                        "launch_all.sh passes the repo root here so logs land in "
+                        "<repo>/fsae_logs instead."),
+        DeclareLaunchArgument(
+            'map_path',
+            default_value='/home/Formula-Student-Driverless-Simulator/ros2/src/fsae_planning/tracks/comp_test_map_3/speed_profile.csv',
+            description="Passed through to control.launch.py — see that file's "
+                        "map_path description for the full explanation. To "
+                        "switch tracks, set TRACK= in ros2/launch_all.sh "
+                        "rather than editing this default: it fills in both "
+                        "map_path and path_map_path from one track name."),
+        DeclareLaunchArgument(
+            'use_precomputed_speed',
+            default_value='true',
+            description="Passed through to control.launch.py — see that file's "
+                        "use_precomputed_speed description. Toggle here (or "
+                        "override with use_precomputed_speed:=false on the "
+                        "command line) to switch back to live curvature_speed()."),
+        DeclareLaunchArgument(
+            'path_map_path',
+            default_value='/home/Formula-Student-Driverless-Simulator/ros2/src/fsae_planning/tracks/comp_test_map_3/raceline.csv',
+            description="Passed through to control.launch.py — see that file's "
+                        "path_map_path description. Points at the raceline "
+                        "(raceline.csv, tuner/raceline_optimizer.py's "
+                        "minimum-time line) rather than the centreline "
+                        "(speed_profile.csv) so the tracked geometry actually "
+                        "contains the widen-entry/clip-apex shape a corner "
+                        "needs -- the controller's optimum is always e_y=0 on "
+                        "whatever path it is given, so it can never invent a "
+                        "racing line from a centreline reference no matter how "
+                        "its gains are tuned. Same x,y,psi,v_target format as "
+                        "the centreline, so either can be dropped in here. NOTE: "
+                        "which speed applies is set "
+                        "by use_precomputed_speed, independently of this file "
+                        "— with it true (the default) the speed comes from "
+                        "map_path's profile, so the raceline's own v_target "
+                        "(min 5.89 m/s vs the centreline's 2.13) is used only "
+                        "if map_path is also pointed at raceline.csv. To "
+                        "switch tracks, set TRACK= in ros2/launch_all.sh."),
+        DeclareLaunchArgument(
+            'use_precomputed_path',
+            default_value='true',
+            description="Passed through to control.launch.py — see that file's "
+                        "use_precomputed_path description. On by default: "
+                        "matches use_precomputed_speed's default so the "
+                        "controller tracks the precomputed oracle path/speed "
+                        "pair by default, planner out of the loop. Override "
+                        "with use_precomputed_path:=false on the command "
+                        "line for the planner-vs-controller isolation / "
+                        "live-planner-in-loop experiment mode."),
+        DeclareLaunchArgument(
+            'look_radius', default_value='25.0',
+            description="Passed through to planning.launch.py — see that file's "
+                        "look_radius description (centerline_planner only). Raise "
+                        "alongside plan_horizon and full_track:=true to check "
+                        "whether a corner's inaccurate speed profile is caused by "
+                        "the planner's own crop window rather than sensing range."),
+        DeclareLaunchArgument(
+            'plan_horizon', default_value='25.0',
+            description="Passed through to planning.launch.py — see that file's "
+                        "plan_horizon description (centerline_planner only)."),
+        DeclareLaunchArgument(
+            'v_max', default_value='15.0',
+            description='m/s -- top speed on straights (overrides fsae_params.yaml controller.v_max)'),
+        DeclareLaunchArgument(
+            'v_min', default_value='1.5',
+            description='m/s -- minimum speed through tight corners (overrides fsae_params.yaml controller.v_min)'),
+        DeclareLaunchArgument(
+            'stanley_gain', default_value='1.0',
+            description='cross-track gain k_cte (overrides fsae_params.yaml controller.stanley_gain)'),
+        DeclareLaunchArgument(
+            'full_track',
+            default_value=PythonExpression(
+                ["'true' if '", planner, "' == 'skidpad_planner' else 'false'"]
+            ),
+            description="Passed through to perception.launch.py/sim_perception -- "
+                        "publish the whole oracle cone map every frame instead of a "
+                        "FOV-cropped window. Defaults true for skidpad_planner (needs "
+                        "the whole figure-8 up front) and false otherwise. Override "
+                        "with full_track:=true to test centerline_planner with full "
+                        "map visibility, e.g. to check whether a tight/teardrop "
+                        "corner's speed-profile issue is a sensing-range limit or a "
+                        "planning-logic one -- sim-only, no real-car equivalent."),
         include('perception.launch.py', {'full_track': full_track}),
-        include('planning.launch.py',   {'planner': planner}),
-        include('control.launch.py',    {'planner': planner, 'controller': controller}),
+        include('planning.launch.py',   {
+            'planner': planner,
+            'look_radius': look_radius,
+            'plan_horizon': plan_horizon,
+        }),
+        include('control.launch.py',    {
+            'planner': planner,
+            'log_csv': log_csv, 'log_dir': log_dir,
+            'map_path': map_path, 'use_precomputed_speed': use_precomputed_speed,
+            'path_map_path': path_map_path, 'use_precomputed_path': use_precomputed_path,
+            'v_max': v_max, 'v_min': v_min, 'stanley_gain': stanley_gain,
+        }),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(os.path.join(launch_dir, 'cone_recorder.launch.py')),
+            launch_arguments={'out_path': cone_out_path}.items(),
+            condition=IfCondition(record_cones),
+        ),
     ])

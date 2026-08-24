@@ -12,21 +12,28 @@ Interface (matches the fsae_autonomous car stack):
 
     in   /fsae/slam/left_track    fsae_interfaces/Track     blue (left) boundary, global frame
     in   /fsae/slam/right_track   fsae_interfaces/Track     yellow (right) boundary, global frame
-    in   /fsae/slam/car_position  geometry_msgs/Pose        x,y in position; yaw in orientation.w
+    in   /fsae/slam/car_position  geometry_msgs/PoseStamped x,y in position; yaw in orientation.w
     out  /fsae/planning/selected_trajectory  geometry_msgs/PoseArray   centreline waypoints
 
-The plan loop is triggered by each car_position update (upstream convention).
+The plan loop is triggered by each car_position update (upstream convention),
+using whatever left_track/right_track cones are cached at that moment. An
+earlier revision gated this behind a "new cone data has arrived" flag to
+avoid re-testing an unchanged cone frame against an ever-more-rotated pose;
+that halved the effective plan rate (cones publish at half the pose rate),
+which lengthened blend_paths' effective time constant enough to reintroduce
+path lag/flip symptoms at corners, so it was reverted. If the disappearing-
+path-at-a-corner symptom that fix targeted reappears, see path_hold_timeout
+and git history for that approach rather than re-deriving it from scratch.
 """
 import numpy as np
 import rclpy
 from rclpy.node import Node
 
 from fsae_interfaces.msg import Track
-from geometry_msgs.msg import Pose, PoseArray
+from geometry_msgs.msg import Pose, PoseArray, PoseStamped
 from std_msgs.msg import Empty
 
 from fsae_planning.boundary import build_path_walls
-from fsae_planning.cone_map import ConeMap
 from fsae_planning.path_utils import (
     blend_paths,
     build_local_path,
@@ -39,6 +46,30 @@ def cones_to_array(cones) -> np.ndarray:
     if not cones:
         return np.empty((0, 2))
     return np.array([[p.x, p.y] for p in cones], dtype=np.float64)
+
+
+def _direction_from_path(
+    path: np.ndarray | None,
+    origin: np.ndarray,
+    lookahead: float = 1.5,
+) -> np.ndarray | None:
+    """
+    Unit direction from `origin` toward the path point ~lookahead metres of arc
+    length along `path` (clamped to the last point on a shorter path).
+
+    Used to seed next tick's wrong-leg guard (see boundary.build_path_walls'
+    prev_dir) with a stable heading estimate -- the immediately-adjacent point
+    (index 1) sits too close to `origin` on a densely-resampled path for its
+    direction to be numerically reliable.
+    """
+    if path is None or len(path) < 2:
+        return None
+    seg = np.linalg.norm(np.diff(path, axis=0), axis=1)
+    arc = np.concatenate([[0.0], np.cumsum(seg)])
+    idx = min(int(np.searchsorted(arc, lookahead)), len(path) - 1)
+    d = path[idx] - origin
+    n = float(np.linalg.norm(d))
+    return d / n if n > 1e-6 else None
 
 
 class CenterlinePlanner(Node):
@@ -54,8 +85,10 @@ class CenterlinePlanner(Node):
         # Arc-length horizon (m) the published centreline is clamped to.  Keeps
         # the near path in front of the car invariant to how far the lookahead
         # reaches (extra far midpoints no longer reshape it) and stops distant
-        # apex points dragging the corner line inward.  See build_path_walls.
-        self.declare_parameter('plan_horizon', 15.0)
+        # apex points dragging the corner line inward. Must match
+        # boundary._WALL_PLAN_HORIZON — see that constant's comment for why
+        # 25.0 (braking-distance math), not repeated here.
+        self.declare_parameter('plan_horizon', 25.0)
         self._plan_horizon = self.get_parameter('plan_horizon').get_parameter_value().double_value
 
         # Temporal path blend weight toward each freshly-planned path (EMA in the
@@ -66,19 +99,32 @@ class CenterlinePlanner(Node):
         self._path_blend = self.get_parameter('path_blend').get_parameter_value().double_value
 
         # Cone visibility radius for planning (m).  The planner crops the
-        # accumulated cone map to this radius (omni) OR the forward box, so the
-        # path spans corners instead of truncating when the track curves out of
-        # a heading-aligned box.  See boundary.build_path_walls / filter_cones_window.
-        self.declare_parameter('look_radius', 18.0)
+        # latest boundary-frame cones to this radius (omni) OR the forward box,
+        # so the path spans corners instead of truncating when the track curves
+        # out of a heading-aligned box.  See boundary.build_path_walls / filter_cones_window.
+        # 25.0 — kept >= plan_horizon so the wall/midpoint mesh
+        # actually extends as far as the path is allowed to; see plan_horizon.
+        self.declare_parameter('look_radius', 25.0)
         self._look_radius = self.get_parameter('look_radius').get_parameter_value().double_value
+
+        # Bounded hold on the last known-good path when a tick fails to produce
+        # one (a thin perception frame, momentary occlusion at a tight corner).
+        # Bridges a short gap without accumulating any cone state -- if the gap
+        # outlasts this, the planner gives up and stops publishing rather than
+        # trusting an increasingly outdated path. See _planning_loop.
+        self.declare_parameter('path_hold_timeout', 0.3)
+        self._path_hold_timeout = self.get_parameter('path_hold_timeout').get_parameter_value().double_value
 
         self.create_subscription(Track, '/fsae/slam/left_track',  self._left_cb,  10)
         self.create_subscription(Track, '/fsae/slam/right_track', self._right_cb, 10)
-        self.create_subscription(Pose,  '/fsae/slam/car_position', self._pose_cb, 10)
+        self.create_subscription(PoseStamped, '/fsae/slam/car_position', self._pose_cb, 10)
 
-        # Debug hook: the accumulated ConeMap never forgets a cone (see cone_map.py),
-        # so an external tool that edits the track has no way to retract one.  An
-        # Empty here drops the map; the next boundary frame rebuilds it from scratch.
+        # Debug hook: the planner has no cone memory of its own (see _compute_path),
+        # but blend_paths() still eases between the last published path and each
+        # fresh one, and a bounded hold (path_hold_timeout) can republish the
+        # last known-good path for a tick or two. An Empty here drops all of
+        # that state so the next tick publishes a clean, unblended plan from
+        # the current boundary frame.
         self.create_subscription(Empty, '/fsae/planning/reset_map', self._reset_cb, 10)
 
         self.pub_traj = self.create_publisher(PoseArray, '/fsae/planning/selected_trajectory', 10)
@@ -97,14 +143,22 @@ class CenterlinePlanner(Node):
             }
             self.get_logger().info('debug_viz on — publishing /fsae/planning/debug/*')
 
-        self._cone_map    = ConeMap()          # accumulated historical cone map
-        self._blue_cones:   np.ndarray = np.empty((0, 2))   # latest boundary frame
+        # Latest boundary frame only — no persistent accumulation across ticks.
+        # A stale or misassociated cone from an earlier frame would otherwise
+        # sit in the map forever (a real problem once perception is a noisy
+        # real SLAM stack rather than sim ground truth). The planner
+        # re-derives the path each tick purely from whatever
+        # /fsae/slam/*_track publishes right now.
+        self._blue_cones:   np.ndarray = np.empty((0, 2))
         self._yellow_cones: np.ndarray = np.empty((0, 2))
         self._car_pos   = np.zeros(2)
         self._car_yaw   = 0.0
         self._have_pose = False
         self._centreline: np.ndarray | None = None
         self._prev_centreline: np.ndarray | None = None   # last published, for blending
+        self._last_valid_centreline: np.ndarray | None = None   # for the bounded hold
+        self._last_valid_time = None                            # rclpy.time.Time, set alongside it
+        self._prev_path_dir: np.ndarray | None = None   # wrong-leg guard, see boundary.build_path_walls
         self._blue_segs:   list = []
         self._yellow_segs: list = []
         self._midpoints:   np.ndarray = np.empty((0, 2))
@@ -121,24 +175,26 @@ class CenterlinePlanner(Node):
     def _right_cb(self, msg: Track) -> None:
         self._yellow_cones = cones_to_array(msg.cones)
 
-    def _pose_cb(self, msg: Pose) -> None:
+    def _pose_cb(self, msg: PoseStamped) -> None:
         # x,y in position; yaw (rad) is stuffed into orientation.w (upstream convention).
-        self._car_pos   = np.array([msg.position.x, msg.position.y])
-        self._car_yaw   = float(msg.orientation.w)
+        self._car_pos   = np.array([msg.pose.position.x, msg.pose.position.y])
+        self._car_yaw   = float(msg.pose.orientation.w)
         self._have_pose = True
         self._planning_loop()
 
     def _reset_cb(self, _msg: Empty) -> None:
-        """Drop the accumulated cone map (debug/testing only)."""
-        self._cone_map.reset()
+        """Drop blend/path state (debug/testing only)."""
         self._blue_cones   = np.empty((0, 2))
         self._yellow_cones = np.empty((0, 2))
         self._centreline   = None
         self._prev_centreline = None
+        self._last_valid_centreline = None
+        self._last_valid_time = None
+        self._prev_path_dir = None
         self._blue_segs    = []
         self._yellow_segs  = []
         self._midpoints    = np.empty((0, 2))
-        self.get_logger().info('cone map reset by external request')
+        self.get_logger().info('planner state reset by external request')
 
     # ------------------------------------------------------------------
     # Planning loop (template — subclasses override the hooks)
@@ -148,10 +204,8 @@ class CenterlinePlanner(Node):
         if not self._have_pose:
             return
 
-        # Accumulate the current boundary frame into the persistent map.
-        self._cone_map.update(self._blue_cones, self._yellow_cones)
-
         self._compute_path()
+        now = self.get_clock().now()
 
         # Temporally blend the fresh path with the last one so the published
         # trajectory eases between frames instead of jumping (which the
@@ -163,8 +217,28 @@ class CenterlinePlanner(Node):
                 alpha=self._path_blend, horizon=self._plan_horizon,
             )
             self._prev_centreline = self._centreline
+            self._last_valid_centreline = self._centreline
+            self._last_valid_time = now
+            self._prev_path_dir = _direction_from_path(self._centreline, self._car_pos)
+        elif (
+            self._last_valid_centreline is not None
+            and self._last_valid_time is not None
+            and (now - self._last_valid_time).nanoseconds * 1e-9 < self._path_hold_timeout
+        ):
+            # This tick's frame was too thin to plan from (see module docstring)
+            # but the gap is still within the bounded hold -- republish the last
+            # known-good path instead of going silent. _last_valid_time is left
+            # untouched so the hold has a hard deadline from the last GOOD plan,
+            # rather than resetting on every held tick and holding forever.
+            self._centreline = self._last_valid_centreline
+            self.get_logger().info(
+                'holding last path (no fresh plan this tick)',
+                throttle_duration_sec=1.0,
+            )
         else:
+            self._centreline = None
             self._prev_centreline = None
+            self._prev_path_dir = None
 
         self._publish_trajectory()
         self._publish_debug()
@@ -186,15 +260,16 @@ class CenterlinePlanner(Node):
     # ------------------------------------------------------------------
 
     def _compute_path(self) -> None:
-        """Cone-wall mesh planner over the accumulated boundary cones."""
+        """Cone-wall mesh planner over the latest boundary-frame cones."""
         try:
             self._centreline, self._blue_segs, self._yellow_segs, self._midpoints = \
                 build_path_walls(
-                    self._cone_map.blue, self._cone_map.yellow,
+                    self._blue_cones, self._yellow_cones,
                     self._car_pos, self._car_yaw,
                     smooth_per_pt=self._smooth_per_pt,
                     look_radius=self._look_radius,
                     plan_horizon=self._plan_horizon,
+                    prev_dir=self._prev_path_dir,
                 )
         except Exception as exc:
             self.get_logger().warn(
@@ -202,7 +277,7 @@ class CenterlinePlanner(Node):
                 throttle_duration_sec=5.0,
             )
             self._centreline = build_local_path(
-                self._cone_map.blue, self._cone_map.yellow,
+                self._blue_cones, self._yellow_cones,
                 self._car_pos, self._car_yaw,
             )
             self._blue_segs   = []
