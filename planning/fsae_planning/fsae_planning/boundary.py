@@ -1,16 +1,18 @@
 """
 Boundary detection: cone-wall mesh centreline planner.
 
-build_path_walls  — the planner.  Connects same-colour cones into a wall mesh,
-                    generates one midpoint per anchor-side cone via exclusive
-                    nearest-neighbour matching, then chains them with a greedy
-                    walk that penalises steps crossing the wall mesh.  The chain
-                    is clamped to a fixed arc-length horizon and smoothed into a
-                    centreline.
+build_path_walls  — the planner.  Delaunay-triangulates the in-window cones and
+                    keeps the same-colour edges as a wall mesh (see
+                    build_wall_segments_delaunay), generates one midpoint per
+                    anchor-side cone via exclusive nearest-neighbour matching,
+                    then chains them with a greedy walk that penalises steps
+                    crossing the wall mesh.  The chain is clamped to a fixed
+                    arc-length horizon and smoothed into a centreline.
 """
 import math
 
 import numpy as np
+from scipy.spatial import Delaunay
 
 from fsae_planning.cone_sorting import filter_cones_window
 from fsae_planning.path_utils import (
@@ -27,8 +29,22 @@ from fsae_planning.path_utils import (
 # breaks the link/pairing (missing a genuine link truncates the wall at that
 # gap), but well under a typical track width so a wall never bridges across
 # to the opposite boundary or a midpoint pairs with the wrong-side cone.
+#
+# _WALL_MAX_DIST is no longer the primary thing stopping a wall from bridging
+# across the track (see build_wall_segments_delaunay) -- the triangulation
+# does that structurally. It now only trims abnormally long edges that a
+# Delaunay triangulation can produce at the convex hull / in sparse regions
+# of a long thin point cloud (exactly the shape of a track boundary), and
+# it's still what build_wall_segments (kept for reference / degenerate-input
+# fallback, see build_wall_segments_delaunay) uses as its sole distance cutoff.
 _WALL_MAX_DIST      = 7.0      # metres — max dist to link same-colour cones into wall
 _WALL_MID_DIST      = 4.0      # metres — max blue-yellow dist for midpoint candidates
+# A genuine opposite-colour pair spans roughly the track width. A pair much
+# closer than that is far more likely to be a real cone paired with a stray/
+# mislabelled cone sitting right next to it than a real narrow section of
+# track -- accepting it anyway pulls the midpoint (and the path) toward that
+# stray cone instead of along the actual corridor.
+_WALL_MIN_MID_DIST  = 1.5      # metres — min blue-yellow dist for midpoint candidates
 # Large enough that no distance/angle saving in the greedy walk ever makes
 # crossing into the wall mesh worth it — acts as a hard constraint expressed
 # as a cost, not a real magnitude to be weighed against other terms.
@@ -104,16 +120,92 @@ def _seg_intersect(
     return 0.0 < t < 1.0 and 0.0 < u < 1.0
 
 
+def build_wall_segments_delaunay(
+    blue: np.ndarray,
+    yellow: np.ndarray,
+    max_dist: float = _WALL_MAX_DIST,
+) -> tuple[list[tuple[np.ndarray, np.ndarray]], list[tuple[np.ndarray, np.ndarray]]]:
+    """
+    Return (blue_segs, yellow_segs) wall segments from a Delaunay triangulation
+    of every cone (both colours) together, keeping only same-colour edges.
+
+    build_wall_segments() links every same-colour pair within max_dist with no
+    concept of what lies between them -- a stray/mislabelled cone sitting close
+    to the opposite boundary's cones links straight across the track, producing
+    a wall segment that cuts across the drivable corridor. Delaunay's
+    empty-circumcircle property means a direct edge between two same-coloured
+    cones on opposite sides of the track can't survive if there's any cone
+    (either colour) physically between them, so a stray cone edges to its
+    nearest (opposite-colour) neighbours instead -- which the same-colour
+    filter below then discards.
+
+    max_dist is kept as a safety net, not the primary filter: it trims
+    abnormally long edges a plain triangulation can produce at the convex hull
+    / in sparse regions of a long thin point cloud (exactly the shape of a
+    track boundary).
+
+    Falls back to the old per-colour build_wall_segments() if triangulation
+    itself can't run (fewer than 3 total cones, or a near-degenerate/collinear
+    point set -- both raise QhullError) -- publishing the old method's walls
+    is preferable to publishing none that tick.
+    """
+    blue = np.asarray(blue, dtype=np.float64).reshape(-1, 2)
+    yellow = np.asarray(yellow, dtype=np.float64).reshape(-1, 2)
+    points = np.vstack([blue, yellow])
+    is_blue = np.concatenate([
+        np.ones(len(blue), dtype=bool),
+        np.zeros(len(yellow), dtype=bool),
+    ])
+
+    if len(points) < 3:
+        return build_wall_segments(blue, max_dist), build_wall_segments(yellow, max_dist)
+
+    try:
+        tri = Delaunay(points)
+    except Exception:
+        return build_wall_segments(blue, max_dist), build_wall_segments(yellow, max_dist)
+
+    edges = set()
+    for simplex in tri.simplices:
+        i, j, k = int(simplex[0]), int(simplex[1]), int(simplex[2])
+        edges.add((min(i, j), max(i, j)))
+        edges.add((min(j, k), max(j, k)))
+        edges.add((min(i, k), max(i, k)))
+
+    blue_segs: list = []
+    yellow_segs: list = []
+    for i, j in edges:
+        if is_blue[i] != is_blue[j]:
+            continue  # cross-colour edge -- centreline midpoints come from _gen_midpoints, not here
+        if float(np.linalg.norm(points[i] - points[j])) > max_dist:
+            continue  # hull / low-density triangulation artifact -- safety net
+        seg = (points[i], points[j])
+        (blue_segs if is_blue[i] else yellow_segs).append(seg)
+
+    return blue_segs, yellow_segs
+
+
 def _gen_midpoints(
     blue: np.ndarray,
     yellow: np.ndarray,
     car_pos: np.ndarray,
     car_yaw: float,
     max_dist: float = _WALL_MID_DIST,
+    min_dist: float = _WALL_MIN_MID_DIST,
 ) -> np.ndarray:
     """
     Return midpoints from an exclusive nearest-neighbour match between blue
-    and yellow cones within max_dist metres.
+    and yellow cones between min_dist and max_dist metres apart.
+
+    The lower bound rejects an anchor cone's nearest opposite-colour
+    candidate when it sits implausibly close (closer than a real track is
+    ever narrow) -- almost always a stray/mislabelled cone next to a genuine
+    one rather than a real gap, and pairing it in anyway would pull the
+    midpoint (and the path) toward it. Unlike the upper bound, this does not
+    fall through to the next-nearest candidate: an anchor with only an
+    implausibly-close candidate in range produces no midpoint that tick
+    rather than a guessed one, consistent with a real narrow track simply
+    losing a midpoint at that gap.
 
     The denser side (more cones in view) is used as the anchor: every anchor
     cone claims its single nearest still-unclaimed opposite-colour cone, so no
@@ -212,7 +304,7 @@ def _gen_midpoints(
 
         dists      = np.linalg.norm(other[cand_idx] - a, axis=1)
         best_local = int(np.argmin(dists))
-        if dists[best_local] > max_dist:
+        if dists[best_local] > max_dist or dists[best_local] < min_dist:
             continue
 
         best_idx = cand_idx[best_local]
@@ -351,11 +443,13 @@ def build_path_walls(
     """
     Build a centreline using cone-wall segments as a path barrier.
 
-    Same-colour cones within _WALL_MAX_DIST are connected into a wall mesh.
-    Candidate midpoints are generated by exclusively matching each cone on the
-    denser boundary to its nearest unclaimed opposite-colour cone within
-    _WALL_MID_DIST (see _gen_midpoints).  A greedy walk picks the cheapest
-    chain through those midpoints; every wall-segment crossing adds
+    Windowed same-colour cones are Delaunay-triangulated together and the
+    same-colour triangle edges kept as the wall mesh (see
+    build_wall_segments_delaunay).  Candidate midpoints are generated by
+    exclusively matching each cone on the denser boundary to its nearest
+    unclaimed opposite-colour cone between _WALL_MIN_MID_DIST and
+    _WALL_MID_DIST metres away (see _gen_midpoints).  A greedy walk picks the
+    cheapest chain through those midpoints; every wall-segment crossing adds
     _WALL_CROSS_PENALTY to the step cost, blocking jumps to adjacent parallel
     tracks.
 
@@ -397,9 +491,8 @@ def build_path_walls(
         min_ahead=0.5, max_ahead=max_ahead, max_lateral=max_lateral,
     )
 
-    blue_segs   = build_wall_segments(blue_wall)
-    yellow_segs = build_wall_segments(yellow_wall)
-    all_segs    = blue_segs + yellow_segs
+    blue_segs, yellow_segs = build_wall_segments_delaunay(blue_wall, yellow_wall)
+    all_segs = blue_segs + yellow_segs
 
     midpoints = _gen_midpoints(blue_fwd, yellow_fwd, car_pos, car_yaw)
 
