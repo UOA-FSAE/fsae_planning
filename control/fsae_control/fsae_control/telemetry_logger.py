@@ -104,6 +104,8 @@ ADAPTIVE_COLUMNS = (
     'm_R_speed',          # adaptive_R_scaling's speed-based multiplier
     'm_Rrate_corner',     # adaptive_R_rate's current-curvature floor multiplier
     'm_Rrate_antihunt',   # steer_rate_anti_hunt's straight/centred/aligned boost multiplier
+    'm_Rrate_zone',       # nmpc_rrate_zone_enabled's three-zone (straight/approach/corner) multiplier; 1.0 = off
+    'm_Rrate_reversal',   # reversal_penalty_boost's near-zero-previous-steer boost multiplier
     # Absolute weights handed to the QP after all of the above.
     'Q_ey_eff', 'Q_epsi_eff', 'Q_r_eff', 'R_steer_eff', 'Rrate_steer_eff',
     'R_a_accel_eff', 'R_a_brake_eff',  # a_cmd effort weight, split by sign; R_a_*_eff already includes the heading-error-driven asymmetry (epsi_ra_*)
@@ -130,12 +132,15 @@ ADAPTIVE_COLUMNS = (
     'nmpc_pred_epsi_end',      # predicted e_psi at the end of the horizon (rad)
     'nmpc_pred_ey_max_abs',    # peak predicted |e_y| anywhere in the horizon (m)
     # nmpc_friction_circle_enabled only (empty otherwise, same convention as
-    # every other column above) -- added 2026-08-13, missing here for one
-    # live test (mpc_standalone_control_1786585910.csv) that could have used
-    # them to confirm how close to F_max the solve was running; see
-    # planning_control_sync.md's "Three MPCC-inspired additions" section.
+    # every other column above); see `docs/reference/README.md`'s "Three
+    # MPCC-inspired additions" section.
     'nmpc_fyf_max_abs',        # peak |front-axle lateral tyre force| anywhere in the horizon (N)
     'nmpc_fyr_max_abs',        # peak |rear-axle lateral tyre force| anywhere in the horizon (N)
+    # nmpc_speed_limit_enabled only (empty otherwise). CAUTION: a new
+    # feature-gated telemetry column needs adding to this tuple explicitly
+    # before it's live-tested, or last_telemetry silently drops it from the
+    # CSV -- this has happened more than once.
+    'nmpc_speed_limit_over_max',  # peak predicted v_x above v_max(s)+margin anywhere in the horizon (m/s); 0 = bound never active
 )
 
 
@@ -258,12 +263,33 @@ class LapProgressTracker:
         self._end_wall: float | None = None
         self._reached_end = False
 
-    def update(self, car_pos, now: float) -> None:
-        """Advance the forward-bounded nearest-index search by one sample."""
+    # Speed (m/s) above which the car counts as having launched, for the
+    # lap-timer start. The clock MUST NOT start on the first control tick:
+    # the node logs from the moment it comes up, which is before the GO
+    # signal and before the car physically moves, so a first-tick start
+    # silently folds the whole standstill into lap_time_s. Measured ~0.95 s
+    # of dead time on a normal run -- enough to make lap times
+    # non-comparable between runs (a longer hold looks like slower driving)
+    # and to deflate time_bonus, and hence the composite score, by ~2%.
+    # 0.5 m/s is well clear of pose noise at a standstill while still
+    # triggering within one or two ticks of a real launch.
+    LAUNCH_SPEED_MPS = 0.5
+
+    def update(self, car_pos, now: float, car_speed: float | None = None) -> None:
+        """
+        Advance the forward-bounded nearest-index search by one sample.
+
+        `car_speed` (m/s) gates the lap-timer start: the clock begins on the
+        first sample where the car is actually moving (see
+        LAUNCH_SPEED_MPS), not on the first tick. Omitted (None) falls back
+        to starting on the first call, preserving the old behaviour for any
+        caller that has no speed to hand.
+        """
         if self._reached_end or len(self._path_X) < 2:
             return
         if self._start_wall is None:
-            self._start_wall = now
+            if car_speed is None or abs(car_speed) >= self.LAUNCH_SPEED_MPS:
+                self._start_wall = now
 
         # Forward-bounded: only search from the current index onward, same
         # rationale as rollout_core.py's find_closest_reference_bounded — it
@@ -318,7 +344,24 @@ class ControlLogger:
                  config_lines: list[str] | None = None):
         log_dir = os.path.expanduser(log_dir) if log_dir else os.path.expanduser('~/fsae_logs')
         os.makedirs(log_dir, exist_ok=True)
-        stamp = int(time.time())
+        # Local wall-clock stamp, YYYYmmdd-HHMMSS. Chosen over the epoch
+        # seconds this used to write because a log's filename is the only
+        # thing that identifies it in a directory listing, and an operator
+        # comparing "the run before lunch" against "the one after" cannot do
+        # that from 1787532892.
+        #
+        # Format is deliberately lexicographically sortable, so a plain `ls`
+        # or a filename sort puts runs in chronological order — which the
+        # epoch form also gave, and which readers (see
+        # tuner/tools/plot_playback.py's _stamp) still rely on. Local time,
+        # not UTC: it is read by a person standing next to the car.
+        # Two separate values, deliberately: `stamp` names the FILE and is for
+        # a human reading a directory listing; `now_epoch` is the numeric time
+        # origin written into the CSV header and must stay a float. They were
+        # briefly the same variable, which crashed the node at startup once the
+        # filename form stopped being numeric.
+        now_epoch = time.time()
+        stamp = time.strftime('%Y%m%d-%H%M%S', time.localtime(now_epoch))
         self._tag = tag
         self._ctrl_path = os.path.join(log_dir, f'{tag}_control_{stamp}.csv')
         self._path_path = os.path.join(log_dir, f'{tag}_path_{stamp}.csv')
@@ -351,7 +394,7 @@ class ControlLogger:
         # Run-relative time origin — set from the first sample of either
         # stream so both CSVs share one t=0. See "TIME" in the module docstring.
         self._t0: float | None = None
-        self._t0_epoch: float = float(stamp)
+        self._t0_epoch: float = now_epoch
 
         # Live scoring accumulator (fsae_control.scoring == offline scoring).
         self._metrics = RolloutMetrics()
@@ -360,9 +403,9 @@ class ControlLogger:
 
         # Full-run-configuration dump (see module docstring's "Config
         # header" section): plain strings, ALREADY `# `-prefixed by the
-        # caller (mpc_controller.py / mpc_controller_standalone.py /
-        # stanley_controller.py -- see each node's own `_build_config_lines`-
-        # style helper). Stored here rather than written immediately because
+        # caller (mpc_controller.py / stanley_controller.py -- see each
+        # node's own `_build_config_lines`-style helper). Stored here rather
+        # than written immediately because
         # it's folded into the SAME single-rewrite-at-close() mechanism the
         # score header already uses (see _write_score_header) -- one header
         # write, not two.
@@ -379,10 +422,9 @@ class ControlLogger:
         method rather than a constructor-only argument because the
         controller object (whose params/effective weights make up most of
         this dump — see build_config_lines()) is often constructed AFTER
-        ControlLogger in a node's __init__ (e.g.
-        mpc_controller_standalone.py builds `self._telemetry` before
-        `self._mpc`); calling this any time before close() is fine, the
-        lines are only read at that point.
+        ControlLogger in a node's __init__ (e.g. mpc_controller.py builds
+        `self._telemetry` before `self._mpc`); calling this any time before
+        close() is fine, the lines are only read at that point.
         """
         self._config_lines = list(lines)
 

@@ -9,7 +9,7 @@ This is a SECOND, independently selectable controller. It does not modify,
 subclass or import behaviour from mpc_core.MPCController's solve path: that
 LTV-QP controller remains the default and is completely untouched. Selection
 happens at node construction time via NMPCParams.use_nmpc (default False) —
-see mpc_controller.py / mpc_controller_standalone.py.
+see mpc_controller.py.
 
 WHY IT EXISTS: MPCController's prediction model has no term for the path
 itself bending (`e_psi_dot = r`, missing `- kappa(s)*s_dot`), so with the car
@@ -22,7 +22,7 @@ attempts to inject curvature as exogenous horizon data (all producing a
 wrong-direction transient, see below), the obligation isn't schedulable.
 Full derivation, the model equations, the cost construction, and the
 real-time SQP structure (roll-forward feasibility, condensing, warm-start,
-solve-time budget): `planning_control_sync.md`'s "Nonlinear MPC (use_nmpc)"
+solve-time budget): `docs/reference/README.md`'s "Nonlinear MPC (use_nmpc)"
 section and `late_turn_in_investigation.md` Part 16 (§16.1 gap, §16.3 model,
 §16.5 correctness checks, §16.7 solve time/horizon-iteration sweep).
 
@@ -42,7 +42,12 @@ WHAT THIS CONTROLLER DELIBERATELY DOES NOT DO
 * No adaptive gain schedule (mpc_core's corner-factor/heading-error-asymmetry
   stack) — that exists to synthesise anticipation a curvature-blind model
   can't produce; layering it on a curvature-aware model would double-count an
-  effect that's now structural. Left untouched on the LTV-QP path.
+  effect that's now structural. Left untouched on the LTV-QP path. The one
+  exception is steer_rate_anti_hunt (see EXPERIMENTAL ADDITIONS below) — it
+  only ever makes steering-RATE more expensive when already
+  centred/aligned/uncurving, the opposite direction from anticipation, so it
+  is offered as a separate, independently-defaulted-False opt-in rather than
+  assumed exempt from this section's reasoning.
 * No shaped heading-lead profile. set_heading_profile() is accepted (so the
   nodes need no branch) and IGNORED with a one-time log line — that profile is
   a workaround for the same missing curvature term this controller closes
@@ -68,6 +73,25 @@ exactly)
   |F_yf|/|F_yr| <= F_max QP constraint on top of (not instead of) the
   existing soft alat-ceiling saturation below — see NH_FRICTION and
   _build_qp/_solve_step.
+* nmpc_steer_rate_anti_hunt_enabled (MPCParams field, default False):
+  reuses mpc_core._steer_rate_anti_hunt verbatim (imported, not
+  reimplemented, so it is byte-identical by construction) to scale
+  R_rate[0,0] up to nmpc_anti_hunt_boost_max (inherits anti_hunt_boost_max)
+  when the CURRENT state is centred/aligned/uncurving. Computed once per
+  compute() call from the measured state (not per SQP iteration, not a
+  function of horizon step), so it is fresh every tick with no cross-tick
+  memory — unlike a temporal low-pass filter on the output, this adds no
+  lag. See "WHAT THIS CONTROLLER DELIBERATELY DOES NOT DO" above for why
+  this is scoped separately from the rest of the gain-schedule family.
+* nmpc_corner_rrate_blend_enabled (MPCParams field, default False): a
+  narrower, ALTERNATIVE port of mpc_core's corner_factor family — blends
+  R_rate[0,0] between nmpc_rrate_steer_straight/_corner by CURRENT curvature
+  alone (mpc_core._corner_factor/_blend, imported verbatim). Unlike the rest
+  of that family (Q[e_y]/Q[e_psi]/Q[r]/R[steer], deliberately excluded
+  above), only R_rate[steer] is touched here, to limit how much of the
+  "no adaptive gain schedule" reasoning this overrides. NOT composed with
+  nmpc_steer_rate_anti_hunt_enabled — takes priority over it when both are
+  set; the two are meant to be used one at a time.
 """
 
 import math
@@ -84,9 +108,12 @@ except ImportError as _exc:      # pragma: no cover - see package.xml
     osqp = None
     _OSQP_IMPORT_ERROR = _exc
 
-from fsae_control.mpc_core import MAX_ACCEL, MAX_BRAKE, MAX_STEER_RAD
-from fsae_control.mpc_params import DEFAULT_MPC_PARAMS, MPCParams
-from fsae_control.nmpc_params import DEFAULT_NMPC_PARAMS, NMPCParams
+from fsae_control.mpc.mpc_core import (
+    MAX_ACCEL, MAX_BRAKE, MAX_STEER_RAD, _steer_rate_anti_hunt,
+    _corner_factor, _blend, _reversal_penalty_boost,
+)
+from fsae_control.mpc.mpc_params import DEFAULT_MPC_PARAMS, MPCParams
+from fsae_control.mpc.nmpc_params import DEFAULT_NMPC_PARAMS, NMPCParams
 
 # ── State/input/output layout ────────────────────────────────────────────
 IDX_S     = 0   # arc length along the reference path (m)
@@ -248,7 +275,7 @@ class PathReference:
         # caller's scalar. Built from the speed profile's OWN (path_v_xy)
         # points, NOT self.arc: the speed-profile array is a separate object
         # from the path array handed to this constructor (confirmed at the
-        # mpc_controller_standalone.py call site -- self._static_path and
+        # mpc_controller.py call site -- self._static_path and
         # self._speed_profile are loaded from two different CSVs), so its own
         # cumulative arc length must be computed independently.
         self.s_v = None
@@ -777,6 +804,86 @@ def _outputs(X, ref, p, v_ref, horizon_speed_profile_enabled=False,
     return H
 
 
+def _rrate_zone_scale(kappa_now, kappa_ahead, k, boost_straight, ease_approach,
+                      floor_corner):
+    """
+    Continuous three-zone multiplier on the steering-rate cost, driven by
+    CURRENT curvature and the peak curvature the HORIZON predicts ahead:
+
+        straight  (nothing now, nothing ahead)  -> boost_straight  (>= 1)
+        approach  (nothing now, corner ahead)   -> ease_approach
+        corner    (turning now)                 -> floor_corner    (<= 1)
+
+    Both inputs go through the same saturating `_corner_factor` curve, so
+    this is a smooth surface with no thresholds or hysteresis -- it degrades
+    gracefully on a continuously-winding road (where `now` and `ahead` are
+    both high, giving the corner value throughout) and on a lone kink
+    (where `ahead` leads `now` by a tick or two, giving a brief approach
+    ease).
+
+    Blend order matters: the approach ease is applied FIRST against the
+    straight boost, then the corner floor takes over as `now` rises. That
+    ordering means a corner entered from a straight passes
+    boost -> ease -> floor in that sequence, which is the intended
+    "release the brake before you need to turn" behaviour.
+
+    CAUTION on `k`: the ease/floor endpoints are only REACHED as
+    `_corner_factor` approaches 1, so this schedule is only as strong as `k`
+    lets it saturate over the TRACK's curvature range. At the LTV-QP's
+    inherited k=8.0 a track whose tightest corner is |kappa|~0.2 tops
+    `_corner_factor` out near 0.63, which silently degrades this from a
+    three-zone schedule into a mild global rate boost -- the multiplier never
+    leaves the boost band. Check a run's `m_Rrate_zone` column against
+    `floor_corner` before concluding the endpoints did anything; if it never
+    approaches the floor, raise `k` rather than lowering the endpoints
+    (k ~= target/((1 - target) * kappa_max)).
+    CAUTION on `kappa_ahead`: this is the peak |kappa| the horizon predicts,
+    which leads current curvature by roughly the horizon length. Against a
+    static raceline that is a clean signal. Against a LIVE planner path it
+    inherits the open centreline curvature-spike defect, and unlike a speed
+    target there is no rate limiter downstream to absorb a spurious spike --
+    re-validate before trusting this with use_planner=True.
+    """
+    now = _corner_factor(abs(kappa_now), k)
+    ahead = _corner_factor(abs(kappa_ahead), k)
+    # Lead-only component: how much more corner is COMING than is here now.
+    lead = max(0.0, ahead - now)
+    s = boost_straight + (ease_approach - boost_straight) * lead
+    return s + (floor_corner - s) * now
+
+
+def _rrate_stage_ramp(N, near):
+    """
+    Per-stage multiplier on the steering-rate cost: `near` at horizon stage 0,
+    rising linearly to 1.0 at the last stage. Returns shape (N,).
+
+    WHY: the plain rate cost is uniform across the horizon
+    (`np.tile(self.r_rate, N)`), so it charges the same price for a steering
+    change whether that change is the FIRST move into a corner or the tenth
+    tick of an oscillation. One weight cannot be both stiff enough to kill
+    tick-to-tick hunting and compliant enough for a gentle corner's small
+    early input, which is why a high flat weight makes the solver defer
+    turn-in until it must catch up at the actuator slew limit.
+
+    Ramping by STAGE is keyed on horizon POSITION, not measured state -- a
+    measured-state schedule (curvature/error) was live-tested and failed
+    because ~27% of jerk events show no curvature or heading-error signal at
+    all one second beforehand, while the horizon already predicts the corner.
+
+    CAUTION: offline-rejected as a fix for that jerk -- it moved
+    slew-limited ticks the WRONG way (8.4% -> 12-15%) because a cheaper
+    near-stage rate simply spends more of the slew budget every tick. It IS
+    the only change found so far that clears the offline nmpc_offline_check
+    DNF, which is why it is kept. See
+    fsae_MPCTest/docs/steering_turn_in_upgrade_options.md (Option 1).
+
+    `near` = 1.0 is an exact no-op, so the flag-off path is byte-identical.
+    """
+    if N <= 1:
+        return np.ones(max(N, 1))
+    return np.linspace(float(near), 1.0, N)
+
+
 def _csc_pattern(mask):
     """
     Build a CSC matrix with an explicit, fixed sparsity pattern from a boolean
@@ -866,6 +973,9 @@ class NMPCController:
             self._fmax_flat = 0.5 * self.plant.m * self.plant.alat_ceiling_flat
             self._fmax_slope = 0.5 * self.plant.m * self.plant.alat_ceiling_slope
             self._fmax_intercept = 0.5 * self.plant.m * self.plant.alat_ceiling_intercept
+        self.speed_limit_enabled = bool(nm0.nmpc_speed_limit_enabled)
+        self.speed_limit_margin = float(nm0.nmpc_speed_limit_margin)
+        self.speed_limit_slack_weight = float(nm0.nmpc_speed_limit_slack_weight)
 
         # ── Limits: identical to MPCController's ────────────────────────
         self.a_max = MAX_ACCEL
@@ -902,10 +1012,56 @@ class NMPCController:
         ])
         self.terminal_scale = _pick(pm.nmpc_terminal_scale, pm.terminal_q_scale)
 
+        # Independent of steer_rate_anti_hunt_enabled (the LTV-QP's own
+        # flag) — see nmpc_params.py/mpc_params.py's field comments and the
+        # module docstring's "WHAT THIS CONTROLLER DELIBERATELY DOES NOT DO"
+        # for why this is opt-in and separately defaulted False.
+        self.steer_rate_anti_hunt_enabled = bool(pm.nmpc_steer_rate_anti_hunt_enabled)
+        self.anti_hunt_boost_max = _pick(pm.nmpc_anti_hunt_boost_max, pm.anti_hunt_boost_max)
+
+        # Composes with EITHER of the two flags above (not an alternative to
+        # either) -- see mpc_params.py's nmpc_reversal_penalty_enabled field
+        # comment for why this one's signal (last tick's actual steering)
+        # doesn't double-count with curvature/e_y/e_psi-keyed mechanisms.
+        self.reversal_penalty_enabled = bool(pm.nmpc_reversal_penalty_enabled)
+        self.reversal_penalty_boost_max = _pick(
+            pm.nmpc_reversal_penalty_boost_max, pm.reversal_penalty_boost_max)
+        self.reversal_penalty_k = _pick(pm.nmpc_reversal_penalty_k, pm.reversal_penalty_k)
+
+        # EXPERIMENTAL, default off. Discounts the steering-rate cost at the
+        # NEAR horizon stages -- see _rrate_stage_ramp's docstring, including
+        # why it is NOT a fix for the shallow-corner jerk. Composes with the
+        # flags above: they set the rate weight's MAGNITUDE, this shapes it
+        # across STAGES.
+        self.rrate_stage_ramp_enabled = bool(pm.nmpc_rrate_stage_ramp_enabled)
+        self.rrate_stage_near = float(pm.nmpc_rrate_stage_near)
+
+        # EXPERIMENTAL, default off. Continuous three-zone schedule on the
+        # steering-rate cost: boost on a true straight, ease on the approach
+        # to a corner the HORIZON can see, floor through the corner itself.
+        # See _rrate_zone_scale. MULTIPLIES r_rate_delta (unlike the corner
+        # blend, which overwrites it).
+        self.rrate_zone_enabled = bool(pm.nmpc_rrate_zone_enabled)
+        self.rrate_zone_boost_straight = float(pm.nmpc_rrate_zone_boost_straight)
+        self.rrate_zone_ease_approach = float(pm.nmpc_rrate_zone_ease_approach)
+        self.rrate_zone_floor_corner = float(pm.nmpc_rrate_zone_floor_corner)
+        # Steering/accel JERK weights (second difference of the input). 0.0
+        # (default) disables the term entirely -- see _build_qp's _E2 comment.
+        self.rjerk_delta = float(pm.nmpc_rjerk_delta)
+        self.rjerk_a = float(pm.nmpc_rjerk_a)
+
+        # Alternative to the above, not a composition with it -- see
+        # mpc_params.py's nmpc_corner_rrate_blend_enabled field comment.
+        self.corner_rrate_blend_enabled = bool(pm.nmpc_corner_rrate_blend_enabled)
+        self.corner_factor_k = _pick(pm.nmpc_corner_factor_k, pm.corner_factor_k)
+        self.rrate_steer_straight = _pick(pm.nmpc_rrate_steer_straight, pm.rrate_steer_straight)
+        self.rrate_steer_corner = _pick(pm.nmpc_rrate_steer_corner, pm.rrate_steer_corner)
+
         # ── Continuity memory (mirrors MPCController's) ─────────────────
         self._delta_act = 0.0
         self._a_act = 0.0
         self._u_prev = np.zeros(NU)
+        self._u_prev2 = np.zeros(NU)  # command two ticks ago, for the jerk anchor
         self._v_des_filtered: float | None = None
         self._U = np.zeros((self.N, NU))     # warm-start input trajectory
         self._have_warm_start = False
@@ -990,6 +1146,7 @@ class NMPCController:
         self._delta_act = 0.0
         self._a_act = 0.0
         self._u_prev = np.zeros(NU)
+        self._u_prev2 = np.zeros(NU)  # command two ticks ago, for the jerk anchor
         self._v_des_filtered = None
         self._U = np.zeros((self.N, NU))
         self._have_warm_start = False
@@ -1002,14 +1159,16 @@ class NMPCController:
     # ------------------------------------------------------------------
     def _build_qp(self) -> None:
         """
-        Allocate the condensed QP once: variables z = [dU (nu*N); slack (N)],
-        with the constraint rows
+        Allocate the condensed QP once: variables
+        z = [dU (nu*N); slack (N); slack_v (N)], with the constraint rows
 
             (1) box/trust region on dU                       nu*N rows
             (2) input slew rate |u_k - u_{k-1}| <= du_max     nu*N rows
             (3) e_y_k - slack_k <= +halfwidth                 N rows
             (4) e_y_k + slack_k >= -halfwidth                 N rows
             (5) slack >= 0                                    N rows
+            (6) v_x_k - slack_v_k <= v_max_k                  N rows
+            (7) slack_v >= 0                                  N rows
 
         Rows (3)-(5) and the slack variables are omitted entirely when
         nmpc_track_halfwidth <= 0. The pattern never changes after this, so
@@ -1024,12 +1183,25 @@ class NMPCController:
         per-tick — since it changes the QP's fixed sparsity pattern. When
         False, n_rows/nz and every array below are IDENTICAL to before this
         feature existed.
+
+        Speed-limit rows (6)-(7) (self.speed_limit_enabled, see
+        NMPCParams.nmpc_speed_limit_enabled): a SEPARATE one-sided soft bound
+        with its OWN slack_v (not sharing the track bound's slack, so the two
+        constraints can't offset each other's cost), one row per stage plus
+        one non-negativity row per stage. v_max_k is filled in per-tick from
+        PathReference.v_ref_at(s_k) + nmpc_speed_limit_margin in _solve_step;
+        when no speed-profile array is available at solve time the rows are
+        left inert (l=-inf, u=inf) rather than omitted, since (like the
+        friction-circle rows) the sparsity pattern is fixed once here, not
+        per-tick. Read ONCE here, at construction time, like _use_slack.
         """
         N = self.N
         n_du = NU * N
         self._use_slack = self.nmpc.nmpc_track_halfwidth > 0.0
         n_slack = N if self._use_slack else 0
-        nz = n_du + n_slack
+        self._use_vslack = self.speed_limit_enabled
+        n_vslack = N if self._use_vslack else 0
+        nz = n_du + n_slack + n_vslack
         n_fric = 2 * N if self.friction_circle_enabled else 0
 
         # First-difference operator E: diff_k = u_k - u_{k-1} (u_{-1} = u_prev).
@@ -1041,17 +1213,35 @@ class NMPCController:
         self._E = E
         self._Rr_flat = np.tile(self.r_rate, N)
         self._ErE = E.T @ (self._Rr_flat[:, None] * E)
+        # Second-difference operator for the steering-JERK penalty
+        # (rjerk_delta > 0). E2 = E @ E: applying the first-difference
+        # operator twice gives du_k - du_{k-1}, i.e. steering ACCELERATION.
+        # The plain rate cost charges by |du|, identical for a sustained ramp
+        # into a corner and for one leg of an oscillation, so it cannot damp
+        # hunting without also resisting turn-in. Measured live, reversals
+        # carry ~4.3x the |d2| of same-direction ramps vs only ~1.9x the
+        # |d1|. A steady ramp is therefore nearly free here; a wiggle is not.
+        # No OSQP sparsity change: p_mask[:n_du,:n_du] is already a dense
+        # upper triangle, so this adds no new nonzeros to the pattern.
+        self._E2 = E @ E
+        rj = np.tile(np.array([self.rjerk_delta, self.rjerk_a]), N)
+        self._E2rE2 = (self._E2.T @ (rj[:, None] * self._E2)
+                       if (self.rjerk_delta or self.rjerk_a) else None)
 
-        # P pattern: dense upper triangle over dU, plus the slack diagonal.
+        # P pattern: dense upper triangle over dU, plus the slack diagonals.
         p_mask = np.zeros((nz, nz), dtype=bool)
         p_mask[:n_du, :n_du] = np.triu(np.ones((n_du, n_du), dtype=bool))
         if n_slack:
-            idx = np.arange(n_du, nz)
+            idx = np.arange(n_du, n_du + n_slack)
+            p_mask[idx, idx] = True
+        if n_vslack:
+            idx = np.arange(n_du + n_slack, nz)
             p_mask[idx, idx] = True
         P, p_rows, p_cols = _csc_pattern(p_mask)
 
         # A pattern.
-        n_rows = 2 * n_du + (3 * N if self._use_slack else 0) + n_fric
+        n_rows = (2 * n_du + (3 * N if self._use_slack else 0)
+                  + n_fric + (2 * N if self._use_vslack else 0))
         a_mask = np.zeros((n_rows, nz), dtype=bool)
         a_mask[:n_du, :n_du] = np.eye(n_du, dtype=bool)
         a_mask[n_du:2 * n_du, :n_du] = E != 0.0
@@ -1068,6 +1258,14 @@ class NMPCController:
         if n_fric:
             rf0 = 2 * n_du + (3 * N if self._use_slack else 0)
             a_mask[rf0:rf0 + n_fric, :n_du] = True
+        if n_vslack:
+            rv0 = 2 * n_du + (3 * N if self._use_slack else 0) + n_fric
+            # Speed rows are dense in dU for the same reason the track rows
+            # are: stage k's v_x depends on every earlier input through S.
+            a_mask[rv0:rv0 + N, :n_du] = True
+            for k in range(N):
+                a_mask[rv0 + k, n_du + n_slack + k] = True           # -slack_v_k
+                a_mask[rv0 + N + k, n_du + n_slack + k] = True       # slack_v_k >= 0
         A, a_rows, a_cols = _csc_pattern(a_mask)
 
         q = np.zeros(nz)
@@ -1091,7 +1289,8 @@ class NMPCController:
             prob=prob, P=P, A=A,
             p_rows=p_rows, p_cols=p_cols,
             a_rows=a_rows, a_cols=a_cols,
-            n_du=n_du, n_slack=n_slack, n_fric=n_fric, nz=nz, n_rows=n_rows,
+            n_du=n_du, n_slack=n_slack, n_vslack=n_vslack, n_fric=n_fric,
+            nz=nz, n_rows=n_rows,
         )
 
     # ------------------------------------------------------------------
@@ -1197,19 +1396,25 @@ class NMPCController:
             C[:, :, j] = (Hp - H0) / _FD_EPS_X[j]
         return H0, C
 
-    def _cost(self, X, U, H):
+    def _cost(self, X, U, H, ref=None):
         """
         True (nonlinear) cost of a candidate trajectory — used only by the
         backtracking test, so it must match the QP's objective term for term:
         weighted output residuals with the terminal scale, input effort with
-        the accel/brake split, input rate against u_prev, and the soft-track
+        the accel/brake split, input rate against u_prev, the soft-track
         slack penalty at its optimal value for this trajectory (max(0, |e_y| -
-        halfwidth), which is what the QP's slack would be).
+        halfwidth), which is what the QP's slack would be), and (when
+        speed_limit_enabled) the analogous soft speed-limit slack penalty
+        (max(0, v_x - v_max(s)), the slack_v the QP would choose).
 
         H may carry NH_FRICTION extra (unweighted) columns when
         friction_circle_enabled -- sliced down to the original NH cost rows
         here so w (len NH) always broadcasts correctly and the objective
         itself never includes the friction rows, per the feature's spec.
+
+        ref is only required when self._use_vslack; omitted (None) is fine
+        for callers that never enable that flag, matching every other
+        experimental feature's opt-in-only signature footprint.
         """
         w = self.w_out
         H = H[:, :NH]
@@ -1220,13 +1425,35 @@ class NMPCController:
                     + self.r_a_accel * np.sum(np.maximum(a, 0.0) ** 2)
                     + self.r_a_brake * np.sum(np.minimum(a, 0.0) ** 2))
         du = np.vstack([U[0] - self._u_prev, np.diff(U, axis=0)])
-        rate = float(np.sum(self.r_rate * du ** 2))
+        # Score the rate term with self._Rr_flat -- the SAME per-stage weight
+        # vector the QP's Hessian (_ErE) is built from -- not the flat
+        # self.r_rate. Any mechanism that reshapes the rate weight (corner
+        # blend, anti-hunt, reversal penalty, stage ramp) writes _Rr_flat; if
+        # this used self.r_rate the backtracking line search would score a
+        # DIFFERENT objective from the one the QP minimised and could reject
+        # genuinely improving steps. Falls back to the flat tile if absent.
+        _rr = getattr(self, '_Rr_flat', None)
+        if _rr is None or _rr.shape[0] != du.size:
+            rate = float(np.sum(self.r_rate * du ** 2))
+        else:
+            rate = float(np.sum(_rr * du.reshape(-1) ** 2))
+        jerk = 0.0
+        if self._E2rE2 is not None:
+            # Same objective the QP minimises (see _solve_step's jerk block).
+            d2 = np.vstack([du[0] - (self._u_prev - self._u_prev2),
+                            np.diff(du, axis=0)])
+            jerk = float(np.sum(np.array([self.rjerk_delta, self.rjerk_a]) * d2 ** 2))
         slack = 0.0
         if self._use_slack:
             over = np.maximum(np.abs(X[1:, IDX_EY]) - self.nmpc.nmpc_track_halfwidth,
                               0.0)
             slack = float(self.nmpc.nmpc_slack_weight * np.sum(over ** 2))
-        return stage + eff + rate + slack
+        vslack = 0.0
+        if self._use_vslack and ref is not None and ref.v_target is not None:
+            v_max = ref.v_ref_at(X[1:, IDX_S]) + self.speed_limit_margin
+            over_v = np.maximum(X[1:, IDX_VX] - v_max, 0.0)
+            vslack = float(self.speed_limit_slack_weight * np.sum(over_v ** 2))
+        return stage + eff + rate + jerk + slack + vslack
 
     def _solve_step(self, X, U, ref, v_ref):
         """
@@ -1245,7 +1472,8 @@ class NMPCController:
         """
         N = self.N
         qp = self._qp
-        n_du, n_slack, nz, n_rows = qp['n_du'], qp['n_slack'], qp['nz'], qp['n_rows']
+        n_du, n_slack, n_vslack, nz, n_rows = (
+            qp['n_du'], qp['n_slack'], qp['n_vslack'], qp['nz'], qp['n_rows'])
 
         A_k, B_k = self._jacobians(X, U, ref)
         H, C = self._output_jacobians(X, ref, v_ref)
@@ -1282,14 +1510,29 @@ class NMPCController:
 
         Hess = G.T @ G + np.diag(ru_flat) + self._ErE
         grad = G.T @ g + ru_flat * u_flat + self._E.T @ (self._Rr_flat * e_rate)
+        if self._E2rE2 is not None:
+            # ||E2 u - d2_anchor||^2_Rj: contributes E2'RjE2 to the Hessian.
+            # The anchor carries the last TWO commands into step 0's second
+            # difference (as _u_prev does for the first difference) -- without
+            # it the term is blind to a reversal spanning the tick boundary,
+            # exactly what it exists to catch.
+            e_jerk = self._E2 @ u_flat
+            e_jerk[:NU] -= (2.0 * self._u_prev - self._u_prev2)
+            e_jerk[NU:2 * NU] += self._u_prev
+            rj = np.tile(np.array([self.rjerk_delta, self.rjerk_a]), N)
+            Hess = Hess + self._E2rE2
+            grad = grad + self._E2.T @ (rj * e_jerk)
 
         P_dense = np.zeros((nz, nz))
         P_dense[:n_du, :n_du] = 2.0 * Hess
         q = np.zeros(nz)
         q[:n_du] = 2.0 * grad
         if n_slack:
-            idx = np.arange(n_du, nz)
+            idx = np.arange(n_du, n_du + n_slack)
             P_dense[idx, idx] = 2.0 * self.nmpc.nmpc_slack_weight
+        if n_vslack:
+            idx = np.arange(n_du + n_slack, nz)
+            P_dense[idx, idx] = 2.0 * self.speed_limit_slack_weight
 
         A_dense = np.zeros((n_rows, nz))
         l = np.empty(n_rows)
@@ -1319,14 +1562,14 @@ class NMPCController:
             S_ey = S[1:, IDX_EY, :]              # (N, n_du)
             ey = X[1:, IDX_EY]
             A_dense[r0:r0 + N, :n_du] = S_ey
-            A_dense[r0:r0 + N, n_du:] = -np.eye(N)
+            A_dense[r0:r0 + N, n_du:n_du + n_slack] = -np.eye(N)
             l[r0:r0 + N] = -np.inf
             u[r0:r0 + N] = hw - ey
             A_dense[r0 + N:r0 + 2 * N, :n_du] = S_ey
-            A_dense[r0 + N:r0 + 2 * N, n_du:] = np.eye(N)
+            A_dense[r0 + N:r0 + 2 * N, n_du:n_du + n_slack] = np.eye(N)
             l[r0 + N:r0 + 2 * N] = -hw - ey
             u[r0 + N:r0 + 2 * N] = np.inf
-            A_dense[r0 + 2 * N:r0 + 3 * N, n_du:] = np.eye(N)
+            A_dense[r0 + 2 * N:r0 + 3 * N, n_du:n_du + n_slack] = np.eye(N)
             l[r0 + 2 * N:r0 + 3 * N] = 0.0
             u[r0 + 2 * N:r0 + 3 * N] = np.inf
 
@@ -1355,6 +1598,29 @@ class NMPCController:
             A_dense[rf0 + N:rf0 + 2 * N, :n_du] = dF_dU[:, 1, :]
             l[rf0 + N:rf0 + 2 * N] = -F_max - F0[:, 1]
             u[rf0 + N:rf0 + 2 * N] = F_max - F0[:, 1]
+
+        if n_vslack:
+            rv0 = 2 * n_du + (3 * N if n_slack else 0) + n_fric
+            S_vx = S[1:, IDX_VX, :]              # (N, n_du)
+            vx = X[1:, IDX_VX]
+            if ref.v_target is not None:
+                v_max = ref.v_ref_at(X[1:, IDX_S]) + self.speed_limit_margin
+            else:
+                # No profile supplied this tick (e.g. live-planner mode with
+                # no precomputed speed CSV) -- leave the rows inert rather
+                # than tightening around whatever v_max happened to be last,
+                # same "no-op when data is absent" contract as
+                # horizon_speed_profile_enabled's own ref.v_target gate.
+                v_max = np.full(N, np.inf)
+            # (6) v_x_k - slack_v_k <= v_max_k.
+            A_dense[rv0:rv0 + N, :n_du] = S_vx
+            A_dense[rv0:rv0 + N, n_du + n_slack:nz] = -np.eye(N)
+            l[rv0:rv0 + N] = -np.inf
+            u[rv0:rv0 + N] = v_max - vx
+            # (7) slack_v >= 0.
+            A_dense[rv0 + N:rv0 + 2 * N, n_du + n_slack:nz] = np.eye(N)
+            l[rv0 + N:rv0 + 2 * N] = 0.0
+            u[rv0 + N:rv0 + 2 * N] = np.inf
 
         qp['prob'].update(
             Px=P_dense[qp['p_rows'], qp['p_cols']],
@@ -1451,6 +1717,67 @@ class NMPCController:
             self._delta_act, self._a_act,
         ])
 
+        # ── Corner-blend / anti-hunt (EXPERIMENTAL, default off — see module
+        # docstring) — ALTERNATIVES, not composed: the corner-factor blend
+        # takes priority when both are enabled (skips anti-hunt entirely in
+        # that case). Same signals/functions as the LTV-QP path (imported
+        # verbatim from mpc_core, not reimplemented). Computed once per
+        # compute() call (this tick's measured state), and applied UNIFORMLY
+        # across the whole horizon for this tick's solve — not a function of
+        # horizon step, so neither schedules a future obligation the way the
+        # deleted lookahead family did. self._Rr_flat/self._ErE are
+        # ordinarily fixed at _build_qp() time; when both flags are off
+        # (default), neither is touched here, so behaviour is byte-identical
+        # to before either feature existed.
+        kappa_now = float(ref.kappa_at(np.array([s0]))[0])
+        m_rrate_antihunt = 1.0
+        # Always computed (not gated behind corner_rrate_blend_enabled) --
+        # this is a general current-curvature signal other mechanisms also
+        # key off via last_telemetry, independent of whether the R_rate
+        # weight-blend feature itself is active.
+        corner_frac = _corner_factor(kappa_now, self.corner_factor_k)
+        rrate_steer_corner_blend = float(self.r_rate[0])
+        # Tracks R_rate[0,0]'s running value through the if/elif AND the
+        # reversal-penalty composition below, so the reversal penalty (which
+        # applies regardless of which branch ran) boosts whatever value is
+        # actually current rather than always the pre-if/elif base -- the
+        # same silent-discard bug already found and fixed twice tonight in
+        # mpc_core.py's own corner-blend/anti-hunt composition.
+        rrate_steer_current = rrate_steer_corner_blend
+        if self.corner_rrate_blend_enabled:
+            rrate_steer_corner_blend = _blend(
+                self.rrate_steer_straight, self.rrate_steer_corner, corner_frac)
+            rrate_steer_current = rrate_steer_corner_blend
+        elif self.steer_rate_anti_hunt_enabled:
+            R2 = _steer_rate_anti_hunt(
+                kappa_now, e_y, np.diag(self.r_rate), True,
+                e_psi=e_psi, boost_max=self.anti_hunt_boost_max,
+            )
+            m_rrate_antihunt = float(R2[0, 0] / self.r_rate[0]) if self.r_rate[0] else 1.0
+            rrate_steer_current = float(R2[0, 0])
+
+        m_rrate_reversal = 1.0
+        if self.reversal_penalty_enabled:
+            R3 = _reversal_penalty_boost(
+                float(self._u_prev[0]), np.diag([rrate_steer_current, self.r_rate[1]]),
+                True, boost_max=self.reversal_penalty_boost_max, k=self.reversal_penalty_k,
+            )
+            m_rrate_reversal = (
+                float(R3[0, 0] / rrate_steer_current) if rrate_steer_current else 1.0)
+            rrate_steer_current = float(R3[0, 0])
+
+        if (self.corner_rrate_blend_enabled or self.steer_rate_anti_hunt_enabled
+                or self.reversal_penalty_enabled or self.rrate_stage_ramp_enabled
+                or self.rrate_zone_enabled):
+            r_rate_tick = np.array([rrate_steer_current, self.r_rate[1]])
+            Rr_flat = np.tile(r_rate_tick, self.N)
+            if self.rrate_stage_ramp_enabled:
+                Rr_flat = (Rr_flat.reshape(self.N, NU)
+                           * _rrate_stage_ramp(self.N, self.rrate_stage_near)[:, None]
+                           ).reshape(-1)
+            self._Rr_flat = Rr_flat
+            self._ErE = self._E.T @ (Rr_flat[:, None] * self._E)
+
         # ── Delay compensation (nonlinear rollforward) ──────────────────
         # Same trigger/depth logic as the LTV-QP path, but rolled forward
         # through the NONLINEAR model instead of predict_ahead()'s linear
@@ -1477,10 +1804,24 @@ class NMPCController:
         # ── Gauss-Newton SQP ───────────────────────────────────────────
         budget_s = self.nmpc.nmpc_solve_budget_ms * 1e-3
         X = self._rollout(x0, U, ref)
+
+        # Three-zone rate schedule (rrate_zone_enabled). Applied HERE, not in
+        # the block above, because it needs kappa across the PREDICTED horizon,
+        # which only exists once X has been rolled out.
+        m_rrate_zone = 1.0
+        if self.rrate_zone_enabled:
+            kap_h = ref.kappa_at(X[:, IDX_S])
+            m_rrate_zone = _rrate_zone_scale(
+                kappa_now, float(np.abs(kap_h).max()), self.corner_factor_k,
+                self.rrate_zone_boost_straight, self.rrate_zone_ease_approach,
+                self.rrate_zone_floor_corner)
+            self._Rr_flat = self._Rr_flat * np.tile(
+                np.array([m_rrate_zone, 1.0]), self.N)
+            self._ErE = self._E.T @ (self._Rr_flat[:, None] * self._E)
         H = _outputs(X, ref, self.plant, v_ref,
                      horizon_speed_profile_enabled=self.horizon_speed_profile_enabled,
                      friction_circle_enabled=self.friction_circle_enabled)
-        cost = self._cost(X, U, H)
+        cost = self._cost(X, U, H, ref)
         iters = 0
         status = 'warm-start-only'
         for _ in range(max(1, int(self.nmpc.nmpc_sqp_iters))):
@@ -1498,7 +1839,7 @@ class NMPCController:
                 H_try = _outputs(X_try, ref, self.plant, v_ref,
                                  horizon_speed_profile_enabled=self.horizon_speed_profile_enabled,
                                  friction_circle_enabled=self.friction_circle_enabled)
-                cost_try = self._cost(X_try, U_try, H_try)
+                cost_try = self._cost(X_try, U_try, H_try, ref)
                 # ONLY a genuine improvement is accepted. Accepting the
                 # smallest trial regardless (an earlier version of this loop
                 # did, "so a tick always makes progress") means a bad search
@@ -1535,6 +1876,7 @@ class NMPCController:
         exp_a = math.exp(-self.dt / self.plant.tau_a)
         self._delta_act = self._delta_act * exp_delta + u_opt[0] * (1.0 - exp_delta)
         self._a_act = self._a_act * exp_a + u_opt[1] * (1.0 - exp_a)
+        self._u_prev2 = self._u_prev.copy()
         self._u_prev = u_opt.copy()
 
         delta_cmd = float(np.clip(u_opt[0], -MAX_STEER_RAD, MAX_STEER_RAD))
@@ -1561,9 +1903,18 @@ class NMPCController:
             'e_y': float(e_y),
             'e_psi': float(e_psi),
             'e_v': float(car_speed - v_ref),
-            'kappa': float(ref.kappa_at(np.array([s0]))[0]),
+            'kappa': kappa_now,
             'base_idx': int(base_idx),
             'kappa_max_abs': float(np.abs(kap_horizon).max()),
+            'm_Rrate_antihunt': m_rrate_antihunt,
+            'm_Rrate_reversal': m_rrate_reversal,
+            'm_Rrate_zone': m_rrate_zone,
+            'corner_frac': corner_frac,
+            # The FINAL, fully-composed R_rate[0,0] actually used this tick
+            # -- same semantic as mpc_core.py's own Rrate_steer_corner_blend
+            # column (post corner-blend AND anti-hunt AND reversal-penalty),
+            # not just the corner-blend stage in isolation.
+            'Rrate_steer_corner_blend': rrate_steer_current,
             'pose_age_s': float(pose_age_s),
             'n_delay': int(n_delay),
             'solve_ms': float(solve_ms),
@@ -1591,6 +1942,14 @@ class NMPCController:
             # the FINAL accepted trajectory, see _outputs' docstring.
             self.last_telemetry['nmpc_fyf_max_abs'] = float(np.abs(H[:, NH]).max())
             self.last_telemetry['nmpc_fyr_max_abs'] = float(np.abs(H[:, NH + 1]).max())
+        if self.speed_limit_enabled and ref.v_target is not None:
+            # Worst predicted overspeed vs the profile at the FINAL accepted
+            # trajectory -- 0 means the soft bound was never active this
+            # tick, a positive value shows how much slack the QP actually
+            # needed (same diagnostic role as nmpc_pred_ey_max_abs above).
+            v_max_final = ref.v_ref_at(X[1:, IDX_S]) + self.speed_limit_margin
+            self.last_telemetry['nmpc_speed_limit_over_max'] = float(
+                np.maximum(X[1:, IDX_VX] - v_max_final, 0.0).max())
         return steering, throttle, brake
 
     def _path_reference(self, path) -> PathReference | None:

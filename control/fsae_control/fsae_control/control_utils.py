@@ -191,7 +191,7 @@ def tracking_error_speed_gate(e_y, e_psi,
     return float(np.clip(min(gy, gp), floor, 1.0))
 
 
-def curvature_speed(waypoints, v_max=15.0, v_min=1.5, a_lat_max=4.0,
+def curvature_speed(waypoints, v_max=15.0, v_min=1.5, a_lat_max=4.75,
                     scan_start=0.0, scan_end=24.0, step=2.0, safety=1.0):
     """
     Curvature-limited target speed over the next scan_end metres of the path.
@@ -370,7 +370,7 @@ def dynamic_speed_cap(waypoints, v_max=15.0, v_min=1.5,
     allows and the corner is close enough that it can no longer brake down
     to the profile's target in time." That mismatch is exactly what shows up
     as late, hard braking and steering saturation at corner entry — see
-    fsae_MPCTest/docs/planning_control_sync.md's speed-governor section.
+    fsae_MPCTest/`docs/reference/README.md`'s speed-governor section.
 
     This is a thin wrapper over curvature_speed() using its own (separate,
     typically tighter) a_lat_max/safety defaults — the oracle profile was

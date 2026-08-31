@@ -303,12 +303,86 @@ See `fsae_MPCTest/docs/planning_control_sync.md`'s "Three MPCC-inspired
 additions" and "Which settings affect which controller" sections for the
 full mechanism and field-by-field controller-scope map.
 
+## Control — chatter fix, anti-hunt, reversal penalty, standstill fix
+
+- `r_rate_delta` retuned `2.5 -> 52.5`, `r_rate_a` `2.25 -> 5.0` — the single
+  biggest lever found for steering chatter, halving it; see
+  `fsae_MPCTest/docs/tuning.md`'s tuning-order table.
+- `reversal_penalty_enabled` (default `true`): soft constraint against
+  steering reversals (tick-to-tick sign flip), approximated by boosting
+  `R_rate[0,0]` whenever last tick's steering was already near zero (a
+  reversal can't be detected directly inside a convex QP). Offline-validated
+  (~20% fewer reversals, negligible cost). `nmpc_reversal_penalty_enabled`
+  (NMPC's own independent copy) stays `false` — it regressed the composite
+  score offline.
+- `nmpc_steer_rate_anti_hunt_enabled` (default `false`, new field): applies
+  the LTV-QP's `steer_rate_anti_hunt` penalty to the NMPC too, reusing
+  `mpc_core._steer_rate_anti_hunt` verbatim. **Unvalidated** — no offline A/B
+  on a full lap or live test yet; ships off, available for future tuning.
+- Fixed: NMPC standstill hard steering via a speed-tracking-cost leak into
+  the steering channel — the speed-target rise limiter's state seeded as
+  `None` skipped rate-limiting on the very first control tick, letting
+  `v_desired` jump straight to the raw target from a standing start and
+  dominating the Gauss-Newton residual. Fixed by seeding the limiter from
+  the car's actual speed on first use. Distinct from the earlier
+  tyre-force-at-`v_x=0` standstill fix (found independently).
+- `LapProgressTracker.update()` gained an optional `car_speed` argument: the
+  lap-timer clock now starts on the first sample where the car is actually
+  moving (`>= 0.5 m/s`), not on the first control tick — the node logs from
+  before the GO signal and before the car physically moves, so the old
+  behaviour silently folded ~0.95s of standstill into every lap time.
+  `mpc_controller.py` and `stanley_controller.py` both updated to pass it.
+- Log filenames switched from a raw epoch stamp to `YYYYmmdd-HHMMSS`
+  (lexicographically sortable, human-readable in a directory listing).
+- A post-solve output-smoothing filter (EMA on the final steering command)
+  was added and then removed in this same pass: it never beat `r_rate_delta`
+  at reducing chatter and shipped default-off throughout, so removing it is
+  a no-op for anyone who never enabled it. See
+  `fsae_MPCTest/docs/reference/control_mechanisms.md`'s "Post-solve output
+  smoothing — removed" section.
+
+## Control — merged MPC controller nodes into one, folder tidy-up
+
+- `mpc_controller.py` and `mpc_controller_standalone.py` merged into a
+  single node, `control/fsae_control/fsae_control/mpc/mpc_controller.py`,
+  selected by a new `standalone_output` ROS2 parameter (default `true`)
+  instead of two separate launchable executables. `standalone_output=false`
+  reproduces the old `mpc` behaviour (steering only via `cmd_vel`,
+  `fsds_bridge` owns throttle/brake/GO-gating/cone-braking);
+  `standalone_output=true` reproduces the old `mpc_standalone` behaviour
+  (publishes `fs_msgs/ControlCommand` directly with the MPC's own
+  throttle/brake, owns GO-gating/cone-braking itself, `fsds_bridge` skipped).
+  Both code paths are otherwise unchanged — this is a selection-mechanism
+  change, not a control-logic change.
+- `mpc_core.py`, `mpc_params.py`, `nmpc_core.py`, `nmpc_params.py`, and the
+  merged `mpc_controller.py` moved into a new `mpc/` subpackage (with its
+  own `__init__.py`) so every MPC-related file lives in one folder,
+  separate from `control_utils.py`/`fsds_bridge.py`/`stanley_controller.py`/
+  `telemetry_logger.py`/`scoring.py`, which stayed at the top level as
+  shared infrastructure.
+- `control.launch.py`/`sim.launch.py`: `controller` is now `stanley | mpc`
+  (was `stanley | mpc | mpc_standalone`); a new `standalone_output` launch
+  arg (default `true`) selects the merged node's output mode, forwarded the
+  same way `use_nmpc` and the other MPC params already were.
+  `sim.launch.py`'s own `controller` default changed from `mpc_standalone`
+  to `mpc` (paired with `standalone_output` defaulting `true`, this
+  reproduces the exact same default behaviour as before).
+- `setup.py`: `mpc_controller` entry point now points at
+  `fsae_control.mpc.mpc_controller:main`; the separate
+  `mpc_controller_standalone` entry point is removed.
+- The `ControlLogger`/`build_config_lines` telemetry tag (`'mpc'` vs
+  `'mpc_standalone'`, driving the `mpc_control_*.csv` /
+  `mpc_standalone_control_*.csv` filename convention) is unchanged — it's
+  still conditional on `standalone_output`, so existing offline tooling
+  that parses those filenames needs no changes.
+
 ## Interface/config
 
 - `fsae_params.yaml`: `look_radius`/`plan_horizon`/`pose_rate`/`cone_rate`
   updated to match the values above.
 - `setup.py` (all four packages): `zip_safe=False` (works around a stale
   `colcon build` issue); new entry points for `mpc_controller_standalone`
-  and `cone_recorder`.
+  and `cone_recorder` (`mpc_controller_standalone` later removed — see
+  "Control — merged MPC controller nodes" above).
 - `centerline_planner.py`/`skidpad_planner.py`: updated to subscribe to
   `car_position` as `PoseStamped` instead of `Pose`.

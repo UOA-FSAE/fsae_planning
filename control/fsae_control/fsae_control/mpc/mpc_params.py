@@ -13,10 +13,10 @@ one dataclass, MPCParams. mpc_core.py accepts an MPCParams instance
 module-level constants or local list literals — see mpc_core.py's own
 docstring for how this is threaded through.
 
-mpc_controller.py / mpc_controller_standalone.py declare_parameters() every
-field of MPCParams (using DEFAULT_MPC_PARAMS as the ROS default), read the
-values back, and build a fresh MPCParams(...) to hand to MPCController — see
-those files for the ROS2 launch-parameter wiring. control.launch.py /
+mpc_controller.py declare_parameters() every field of MPCParams (using
+DEFAULT_MPC_PARAMS as the ROS default), reads the values back, and builds a
+fresh MPCParams(...) to hand to MPCController — see that file for the ROS2
+launch-parameter wiring. control.launch.py /
 sim.launch.py / fsae_params.yaml / launch_all.sh expose the same fields as
 launch-time overrides — see FIELDS below for the metadata that generates
 those launch args mechanically instead of by hand (35 near-identical
@@ -47,21 +47,21 @@ class MPCParams:
     q_e_y:   float = field(default=6.35, metadata={"unit": "1/m^2",   "desc": "lateral deviation from path centreline", "controller": "both"})
     q_e_yd:  float = field(default=0.5,  metadata={"unit": "1/(m/s)^2", "desc": "rate of change of lateral deviation", "controller": "both"})
     q_e_psi: float = field(default=1.65, metadata={"unit": "1/rad^2", "desc": "heading error relative to path tangent", "controller": "both"})
-    q_r:     float = field(default=1.0, metadata={"unit": "1/(rad/s)^2", "desc": "yaw rate (LTV-QP). Shared base value the NMPC also reads (see nmpc_q_epsi_dot below), but under the NMPC it weights heading-error RATE, not absolute yaw rate -- same slot, different regressor", "controller": "both"})
-    q_e_v:   float = field(default=5.40,  metadata={"unit": "1/(m/s)^2", "desc": "speed error: car_speed - desired_speed", "controller": "both"})
+    q_r:     float = field(default=1.20, metadata={"unit": "1/(rad/s)^2", "desc": "yaw rate (LTV-QP). Shared base value the NMPC also reads (see nmpc_q_epsi_dot below), but under the NMPC it weights heading-error RATE, not absolute yaw rate -- same slot, different regressor", "controller": "both"})
+    q_e_v:   float = field(default=5.5,  metadata={"unit": "1/(m/s)^2", "desc": "speed error: car_speed - desired_speed", "controller": "both"})
     # R_diag index -> input penalised (inputs u are [delta_cmd, a_cmd]):
     r_delta: float = field(default=1.35, metadata={"unit": "1/rad^2",     "desc": "steering command effort", "controller": "both"})
     # a_cmd>=0 (accel) and a_cmd<0 (brake) get independent effort weights
     # instead of one weight applied symmetrically to |a_cmd| -- a single
     # shared weight cannot be tuned for acceleration and braking
     # independently. See mpc_core.py's _build_qp/_solve_qp for the
-    # cp.pos/cp.neg split and planning_control_sync.md's "Accel/brake
+    # cp.pos/cp.neg split and `docs/reference/README.md`'s "Accel/brake
     # effort weight split" section for the diagnosis.
     r_a_accel: float = field(default=2.25, metadata={"unit": "1/(m/s^2)^2", "desc": "acceleration command effort, a_cmd >= 0", "controller": "both"})
     r_a_brake: float = field(default=0.5, metadata={"unit": "1/(m/s^2)^2", "desc": "acceleration command effort, a_cmd < 0 (braking)", "controller": "both"})
     # R_rate_diag index -> input RATE-OF-CHANGE penalised (tick-to-tick jerk):
-    r_rate_delta: float = field(default=2.8, metadata={"unit": "1/(rad/s)^2",     "desc": "steering rate of change", "controller": "both"})
-    r_rate_a:     float = field(default=2.25, metadata={"unit": "1/(m/s^3)^2",     "desc": "acceleration rate of change", "controller": "both"})
+    r_rate_delta: float = field(default=52.50, metadata={"unit": "1/(rad/s)^2",     "desc": "steering rate of change", "controller": "both"})
+    r_rate_a:     float = field(default=5.0, metadata={"unit": "1/(m/s^3)^2",     "desc": "acceleration rate of change", "controller": "both"})
     # Extra weight on the final predicted state x[:,N]. 1.0 = no-op, the
     # only value ever validated against the Q_diag/R_diag/R_rate_diag above.
     terminal_q_scale: float = field(default=1.0, metadata={"unit": "unitless", "desc": "extra weight on terminal predicted state", "controller": "both"})
@@ -89,6 +89,11 @@ class MPCParams:
 
     # ── Straight-line R_rate[0,0] (steering rate) anti-hunt boost ───────
     anti_hunt_boost_max: float = field(default=6.0, metadata={"unit": "unitless", "desc": "ceiling on the steer_rate_anti_hunt multiplier", "controller": "ltv_qp_only"})
+
+    # ── Soft steering-reversal penalty ──────────────────────────────────
+    reversal_penalty_enabled: bool = field(default=False, metadata={"unit": "bool", "desc": "EXPERIMENTAL, not yet validated: soft-constrain steering reversals by boosting R_rate[0,0] whenever LAST tick's steering was already close to zero (see mpc_core._reversal_penalty_boost's docstring for why a reversal can't be detected directly inside a convex QP and this approximates it). Composes multiplicatively with steer_rate_anti_hunt_enabled/the corner blend, does not replace them.", "controller": "ltv_qp_only"})
+    reversal_penalty_boost_max: float = field(default=4.0, metadata={"unit": "unitless", "desc": "ceiling on the reversal-penalty multiplier, applied when last tick's steering was exactly zero", "controller": "ltv_qp_only"})
+    reversal_penalty_k: float = field(default=8.0, metadata={"unit": "1/rad", "desc": "fade rate of the reversal-penalty boost as |last tick's steering| grows; 8.0 sets half-boost at ~7.2 deg", "controller": "ltv_qp_only"})
 
     # ── Current-state corner-factor scheduler ────────────────────────────
     # Replaces the whole deleted lookahead gain-scheduling family (see
@@ -204,14 +209,68 @@ class MPCParams:
     nmpc_r_rate_a: float = field(default=-1.0, metadata={"unit": "1/(m/s^2)^2", "desc": "override r_rate_a (-1 = inherit)", "controller": "nmpc_only"})
     nmpc_terminal_scale: float = field(default=-1.0, metadata={"unit": "unitless", "desc": "override terminal_q_scale (-1 = inherit)", "controller": "nmpc_only"})
 
+    # steer_rate_anti_hunt_enabled/anti_hunt_boost_max above are LTV-QP-only
+    # in nmpc_core.py's own docstring ("no adaptive gain schedule ... layering
+    # it on a curvature-aware model would double-count"), which is about the
+    # corner-factor/heading-error-asymmetry FAMILY (mechanisms that add
+    # anticipation the LTV-QP structurally lacks). Anti-hunt is narrower and
+    # points the other way -- it only ever makes steering-rate MORE expensive,
+    # and only when already centred/aligned/uncurving -- so it is offered here
+    # as an independent, separately-defaulted-False opt-in rather than folded
+    # into the LTV-QP's own flag, since the double-count concern above may or
+    # may not apply to it. UNVALIDATED for the NMPC: reuses the exact
+    # kappa/e_y/e_psi signal nmpc_core.py's module docstring already flags as
+    # partially redundant with the spline reference's own noise fix (see
+    # PathReference's docstring on why raw-tangent quantisation doesn't
+    # reach the NMPC the way it reaches the LTV-QP) -- offline A/B before
+    # enabling live.
+    nmpc_steer_rate_anti_hunt_enabled: bool = field(default=False, metadata={"unit": "bool", "desc": "EXPERIMENTAL: apply steer_rate_anti_hunt's extra R_rate[0,0] penalty (centred/aligned/uncurving) to the NMPC too, gain-scheduled per tick and applied uniformly across the horizon -- not a temporal filter, so it adds no lag. Independent of steer_rate_anti_hunt_enabled above. Default False, unvalidated", "controller": "nmpc_only"})
+    nmpc_anti_hunt_boost_max: float = field(default=-1.0, metadata={"unit": "unitless", "desc": "override anti_hunt_boost_max for the NMPC only (-1 = inherit). Only read when nmpc_steer_rate_anti_hunt_enabled is True", "controller": "nmpc_only"})
+
+    # Soft steering-reversal penalty, ported verbatim from mpc_core.py's
+    # _reversal_penalty_boost (imported, not reimplemented) -- unlike
+    # nmpc_corner_rrate_blend_enabled/nmpc_steer_rate_anti_hunt_enabled
+    # above, this composes with EITHER of those (not mutually exclusive):
+    # it's keyed on a different signal (last tick's actual steering, not
+    # curvature/e_y/e_psi), so there's no double-counting risk to guard
+    # against the way the LTV-QP's own module docstring reasons about the
+    # rest of the adaptive-gain family.
+    nmpc_reversal_penalty_enabled: bool = field(default=False, metadata={"unit": "bool", "desc": "EXPERIMENTAL: apply reversal_penalty_boost's extra R_rate[0,0] penalty (last tick's steering near zero) to the NMPC too, gain-scheduled per tick and applied uniformly across the horizon. Composes with nmpc_steer_rate_anti_hunt_enabled/nmpc_corner_rrate_blend_enabled, does not replace either. Default False, unvalidated", "controller": "nmpc_only"})
+    nmpc_reversal_penalty_boost_max: float = field(default=-1.0, metadata={"unit": "unitless", "desc": "override reversal_penalty_boost_max for the NMPC only (-1 = inherit). Only read when nmpc_reversal_penalty_enabled is True", "controller": "nmpc_only"})
+    nmpc_reversal_penalty_k: float = field(default=-1.0, metadata={"unit": "1/rad", "desc": "override reversal_penalty_k for the NMPC only (-1 = inherit). Only read when nmpc_reversal_penalty_enabled is True", "controller": "nmpc_only"})
+    nmpc_rrate_stage_ramp_enabled: bool = field(default=False, metadata={"unit": "bool", "desc": "EXPERIMENTAL: discount the steering-RATE cost at the NEAR horizon stages (linear ramp from nmpc_rrate_stage_near at stage 0 to 1.0 at the last stage) so a first turn-in input is cheap while a sustained oscillation still pays close to full price. Keyed on horizon POSITION, not measured state. OFFLINE-REJECTED as a fix for the shallow-corner jerk (moved slew-limited ticks 8.4%% -> 12-15%%, the wrong way) but it IS the only change found that clears the offline nmpc_offline_check DNF. Default False, unvalidated live", "controller": "nmpc_only"})
+    nmpc_rrate_stage_near: float = field(default=0.15, metadata={"unit": "unitless", "desc": "stage-0 multiplier for the steering-rate cost ramp; 1.0 is an exact no-op. Lower = cheaper to move the wheel at the near horizon stages. Only read when nmpc_rrate_stage_ramp_enabled is True", "controller": "nmpc_only"})
+    nmpc_rrate_zone_enabled: bool = field(default=False, metadata={"unit": "bool", "desc": "EXPERIMENTAL: continuous three-zone schedule on the steering-RATE cost -- boost on a true straight, ease on the approach to a corner the HORIZON predicts, floor through the corner. Smooth (no thresholds), degrades to the corner value on a continuously-winding road. MULTIPLIES r_rate_delta, unlike nmpc_corner_rrate_blend_enabled which overwrites it. Default False", "controller": "nmpc_only"})
+    nmpc_rrate_zone_boost_straight: float = field(default=2.0, metadata={"unit": "unitless", "desc": "x r_rate on a true straight (nothing now, nothing ahead)", "controller": "nmpc_only"})
+    nmpc_rrate_zone_ease_approach: float = field(default=0.35, metadata={"unit": "unitless", "desc": "x r_rate when a corner is AHEAD in the horizon but not here yet -- the turn-in release", "controller": "nmpc_only"})
+    nmpc_rrate_zone_floor_corner: float = field(default=0.15, metadata={"unit": "unitless", "desc": "x r_rate mid-corner", "controller": "nmpc_only"})
+    nmpc_rjerk_delta: float = field(default=0.0, metadata={"unit": "1/(rad/s^2)^2", "desc": "EXPERIMENTAL: steering-JERK weight, penalising the SECOND difference of the steering command (steering acceleration) rather than only the first. A steady ramp into a corner has near-zero second difference and is nearly free; an alternating wiggle is expensive -- measured live, reversals carry ~4.3x the |d2| of ramps vs only ~1.9x the |d1|. Intended to let r_rate_delta come back down. 0.0 disables the term entirely (no Hessian contribution)", "controller": "nmpc_only"})
+    nmpc_rjerk_a: float = field(default=0.0, metadata={"unit": "1/(m/s^4)^2", "desc": "acceleration-jerk weight, second difference of a_cmd. 0.0 disables", "controller": "nmpc_only"})
+
+    # Straight/corner R_rate[steer] blend, ported narrowly from mpc_core.py's
+    # corner_factor family -- current-curvature-only, linear _blend() between
+    # a straight and a corner endpoint (see _corner_factor/_blend in
+    # mpc_core.py, imported verbatim by nmpc_core.py, not reimplemented).
+    # Deliberately narrower than the LTV-QP's full family (which also blends
+    # Q[e_y]/Q[e_psi]/Q[r]/R[steer]) -- only R_rate[steer] is touched, to
+    # limit how much of the "no adaptive gain schedule for the NMPC"
+    # rationale in nmpc_core.py's module docstring this overrides. Meant as
+    # an ALTERNATIVE to nmpc_steer_rate_anti_hunt_enabled above, not a
+    # composition with it -- nmpc_core.py checks this flag first and skips
+    # anti-hunt entirely when it's on; run with anti-hunt OFF when using this.
+    nmpc_corner_rrate_blend_enabled: bool = field(default=False, metadata={"unit": "bool", "desc": "EXPERIMENTAL: blend R_rate[0,0] between nmpc_rrate_steer_straight/_corner by CURRENT curvature (mpc_core._corner_factor/_blend). Takes priority over nmpc_steer_rate_anti_hunt_enabled if both are set -- use one or the other, not both. Default False, unvalidated", "controller": "nmpc_only"})
+    nmpc_corner_factor_k: float = field(default=-1.0, metadata={"unit": "unitless", "desc": "override corner_factor_k for the NMPC only (-1 = inherit). Read by BOTH nmpc_corner_rrate_blend_enabled AND nmpc_rrate_zone_enabled. The zone needs _corner_factor to SATURATE for its ease/floor endpoints to be reachable, so scale this with the track max curvature (k ~= target/((1-target)*kappa_max)); the inherited LTV-QP 8.0 tops corner_frac out near 0.63 on a track whose tightest corner is |kappa|~0.2, which silently reduces the zone to a mild global rate boost", "controller": "nmpc_only"})
+    nmpc_rrate_steer_straight: float = field(default=-1.0, metadata={"unit": "1/(rad/s)^2", "desc": "override rrate_steer_straight for the NMPC only (-1 = inherit). Only read when nmpc_corner_rrate_blend_enabled is True", "controller": "nmpc_only"})
+    nmpc_rrate_steer_corner: float = field(default=-1.0, metadata={"unit": "1/(rad/s)^2", "desc": "override rrate_steer_corner for the NMPC only (-1 = inherit). Only read when nmpc_corner_rrate_blend_enabled is True", "controller": "nmpc_only"})
+
 
 DEFAULT_MPC_PARAMS = MPCParams()
 
 # (name, default, metadata) tuples for every field, in declaration order —
 # the single source the launch-arg generation (control.launch.py) and the
-# ROS2 declare_parameters() calls (mpc_controller.py / mpc_controller_standalone.py)
-# both build from, so the dataclass, the YAML defaults, and the launch args
-# can't silently drift against each other.
+# ROS2 declare_parameters() calls (mpc_controller.py) both build from, so the
+# dataclass, the YAML defaults, and the launch args can't silently drift
+# against each other.
 MPC_PARAM_FIELDS = tuple(
     (f.name, getattr(DEFAULT_MPC_PARAMS, f.name), f.metadata)
     for f in fields(MPCParams)
@@ -221,9 +280,9 @@ MPC_PARAM_FIELDS = tuple(
 def declare_mpc_params(node) -> None:
     """
     declare_parameters() every MPCParams field on `node`, defaulting to
-    DEFAULT_MPC_PARAMS. Shared by mpc_controller.py / mpc_controller_standalone.py
-    so neither has to hand-write 56 declare_parameters entries (and risk them
-    drifting from MPCParams' own defaults/names).
+    DEFAULT_MPC_PARAMS. Used by mpc_controller.py so it doesn't have to
+    hand-write 56 declare_parameters entries (and risk them drifting from
+    MPCParams' own defaults/names).
     """
     node.declare_parameters(
         namespace='',

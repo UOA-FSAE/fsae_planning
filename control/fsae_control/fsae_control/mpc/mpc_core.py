@@ -13,12 +13,12 @@ mpc_core.py — Live MPC Path-Tracking Controller for FSDS
 
 PURPOSE
 -------
-Provides MPCController, the single class both mpc_controller.py and
-mpc_controller_standalone.py use to turn a planner path + current vehicle
-state into steering/throttle/brake at 20 Hz (mpc_controller.py forwards only
-steering through the shared cmd_vel interface; mpc_controller_standalone.py
-uses the full (steering, throttle, brake) triple directly — see that file's
-own docstring for why). It is a self-contained, "live-solve" re-implementation
+Provides MPCController, the class mpc_controller.py uses to turn a planner
+path + current vehicle state into steering/throttle/brake at 20 Hz. That
+node's `standalone_output` parameter picks how the result is used:
+false forwards only steering through the shared cmd_vel interface;
+true uses the full (steering, throttle, brake) triple directly — see that
+file's own docstring for why. It is a self-contained, "live-solve" re-implementation
 of the same linear time-varying MPC formulated generically in optimiser.py /
 bicycle_model.py for the offline tuner and simulator (both in the
 fsae_MPCTest repo), designed for 100% numerical parity with that offline
@@ -70,10 +70,9 @@ controller.
 
 USED BY
 -------
-  mpc_controller.py and mpc_controller_standalone.py — each constructs its
-                    own MPCController(dt=0.05, N=35) in __init__ and calls
-                    .compute() every 20 Hz tick, .reset() on stale path /
-                    cone-brake fail-safes.
+  mpc_controller.py — constructs an MPCController(dt=0.05, N=35) in
+                    __init__ and calls .compute() every 20 Hz tick,
+                    .reset() on stale path / cone-brake fail-safes.
 """
 
 import math
@@ -84,7 +83,7 @@ import cvxpy as cp
 import numpy as np
 from scipy.linalg import expm
 
-from fsae_control.mpc_params import DEFAULT_MPC_PARAMS, MPCParams
+from fsae_control.mpc.mpc_params import DEFAULT_MPC_PARAMS, MPCParams
 
 # Maximum physical steering deflection.  25deg matches this stack's limit
 # (fsae_control.control_utils / fsds_bridge); upstream used 35deg.
@@ -161,7 +160,7 @@ MAX_BRAKE: float = 7.0
 # today's Q/R cost based on a corner not yet reached (approach/exit boosts,
 # demand normalisation, U-turn detector, straight-line adjustments, curvature
 # forcing, the precomputed CornerMap fast path — full list in
-# planning_control_sync.md's "Corner-factor scheduler rewrite" section)
+# `docs/reference/README.md`'s "Corner-factor scheduler rewrite" section)
 # because this MPC formulation already predicts state error at each future
 # horizon step; reweighting TODAY's near-zero cost based on a forward scan
 # doesn't change what the horizon predicts once the car gets there. Replaced
@@ -313,11 +312,65 @@ def _steer_rate_anti_hunt(
     """
     if not enabled:
         return R_rate_base
-    k_kappa, k_ey, k_epsi = 60.0, 30.0, 23.0
+    # Relaxed 2026-08-19 (halved from 60.0/30.0/23.0): the original constants
+    # faded the boost out too fast on genuinely gentle curves -- boost_kappa
+    # was already down to ~0.45 by |kappa|=0.02 (a ~50 m-radius bend), so
+    # R_rate[0,0] had mostly relaxed back toward baseline exactly where
+    # residual steering jitter was still visible. Halving each k_* doubles
+    # the |kappa|/|e_y|/|e_psi| each factor reaches before dropping to half
+    # its max contribution (kappa: ~0.017 -> ~0.033 1/m; e_y: ~3.3 -> ~6.7 cm;
+    # e_psi: ~2.5 -> ~5.0 deg). Applies to both controllers -- nmpc_core.py
+    # imports this function verbatim, not a separate copy.
+    k_kappa, k_ey, k_epsi = 30.0, 15.0, 11.5
     boost_kappa = 1.0 / (1.0 + k_kappa * abs(kappa))
     boost_ey    = 1.0 / (1.0 + k_ey * abs(e_y))
     boost_epsi  = 1.0 / (1.0 + k_epsi * abs(e_psi))
     scale = 1.0 + (boost_max - 1.0) * boost_kappa * boost_ey * boost_epsi
+    R = R_rate_base.copy()
+    R[0, 0] *= scale
+    return R
+
+
+def _reversal_penalty_boost(
+    u_prev_steer: float,
+    R_rate_base: np.ndarray,
+    enabled: bool,
+    boost_max: float = 4.0,
+    k: float = 8.0,
+) -> np.ndarray:
+    """
+    TEMPORARY/EXPERIMENTAL, NOT VALIDATED: soft constraint against steering
+    REVERSALS (a tick-to-tick sign flip), approximated inside the convex QP
+    by boosting R_rate[0,0] whenever LAST tick's steering command
+    (u_prev_steer, rad) was already close to zero -- the one state a
+    reversal must pass through, since delta_cmd is continuous. A reversal
+    can't be detected directly inside one solve (it depends on this tick's
+    OWN decision, the thing being optimised), so this penalises the
+    precondition instead: the closer steering already sits to zero, the
+    more it costs to change it further this tick, making a full sign flip
+    specifically (as opposed to a same-side ramp toward/away from zero)
+    disproportionately expensive relative to a swing of the same size made
+    from a large starting angle.
+
+    Same saturating-curve style as _steer_rate_anti_hunt (single input here,
+    not a product of several) so it fades continuously rather than snapping,
+    and composes the same way: applied multiplicatively on top of whatever
+    _adaptive_R_rate/_steer_rate_anti_hunt/the corner blend already produced,
+    never replacing them. enabled=False returns R_rate_base untouched.
+
+    k=8.0 (rad^-1) sets half-boost at ~7.2 deg of PREVIOUS steering (a
+    reversal starting from near-centre gets close to the full boost_max;
+    one starting from a large existing angle -- already unlikely to flip
+    sign in one 50ms tick without an equally large du -- is barely
+    affected). Deliberately keyed on u_prev, not the CURRENT solve's u[0,0]
+    (a QP variable): using the variable itself would make the cost
+    non-convex (a rational function of the decision), whereas u_prev is a
+    known constant by solve time, keeping this an ordinary quadratic term.
+    """
+    if not enabled:
+        return R_rate_base
+    boost_near_zero = 1.0 / (1.0 + k * abs(u_prev_steer))
+    scale = 1.0 + (boost_max - 1.0) * boost_near_zero
     R = R_rate_base.copy()
     R[0, 0] *= scale
     return R
@@ -437,9 +490,9 @@ class MPCController:
         ----------
         dt : float
             Control/prediction timestep (s). Must equal the calling node's
-            control timer period (0.05 s / 20 Hz in both mpc_controller.py
-            and mpc_controller_standalone.py) so the discretised model's
-            predictions align with real elapsed time.
+            control timer period (0.05 s / 20 Hz in mpc_controller.py) so
+            the discretised model's predictions align with real elapsed
+            time.
         N : int
             MPC horizon length in steps (35 -> 1.75 s lookahead at dt=0.05).
             Must match settings.N_HORIZON for tuned weights to transfer.
@@ -551,7 +604,7 @@ class MPCController:
         # per-step angle, so the physical meaning survives a change of dt.
         # 180 deg/s was set just under the plant's measured achievable
         # roadwheel rate (~200 deg/s, via system-ID) — see
-        # fsae_MPCTest/docs/planning_control_sync.md's "Slew-rate limit
+        # fsae_MPCTest/`docs/reference/README.md`'s "Slew-rate limit
         # (du_max)" section for the full history.
         #
         # Do not raise without re-measuring; a higher value previously
@@ -583,6 +636,12 @@ class MPCController:
         # standing no-settings.py-on-the-car rule; keep in sync with
         # fsae_MPCTest's copy.
         self.steer_rate_anti_hunt_enabled = self.params.steer_rate_anti_hunt_enabled
+
+        # _reversal_penalty_boost above. EXPERIMENTAL, not validated against
+        # a live log or VALIDATION_SUITE. Default off, inlined per the
+        # standing no-settings.py-on-the-car rule; keep in sync with
+        # fsae_MPCTest's copy.
+        self.reversal_penalty_enabled = self.params.reversal_penalty_enabled
 
         # ADAPTIVE_R_RATE_ENABLE_IN_CORNERS (settings.py, fsae_MPCTest) —
         # see _adaptive_R_rate's enable_in_corners param above (renamed from
@@ -732,7 +791,7 @@ class MPCController:
         # x) -- so r_a_accel==r_a_brake reproduces the old single-r_a cost
         # bit-for-bit. This lets braking be tuned independently from
         # acceleration without new QP variables or constraints: see
-        # planning_control_sync.md's "Accel/brake effort weight split".
+        # `docs/reference/control_mechanisms.md`'s "Accel/brake effort weight split".
         cost += cp.sum_squares(cp.multiply(sqrtR_param[0, 0], u[0, :]))
         cost += r_a_accel_param * cp.sum_squares(cp.pos(u[1, :]))
         cost += r_a_brake_param * cp.sum_squares(cp.neg(u[1, :]))
@@ -1143,9 +1202,8 @@ class MPCController:
         Guard: if the path has fewer than 2 points, immediately returns a
         neutral/mild-braking command (0.0, 0.0, 0.5) without touching the
         QP or any internal state — the calling node's own path-staleness
-        check is expected to normally catch this first
-        (mpc_controller_standalone.py's Phase 2, or mpc_controller.py's
-        equivalent stale-path guard).
+        check is expected to normally catch this first (mpc_controller.py's
+        Phase 2).
         """
         if len(path) < 2:
             return 0.0, 0.0, 0.5   
@@ -1244,6 +1302,15 @@ class MPCController:
         adapt["m_Rrate_antihunt"] = (
             float(R_rate_scaled[0, 0] / _rr_before_hunt) if _rr_before_hunt else 1.0
         )
+        _rr_before_reversal = float(R_rate_scaled[0, 0])
+        R_rate_scaled = _reversal_penalty_boost(
+            float(self._u_prev[0]), R_rate_scaled, self.reversal_penalty_enabled,
+            boost_max=self.params.reversal_penalty_boost_max,
+            k=self.params.reversal_penalty_k,
+        )
+        adapt["m_Rrate_reversal"] = (
+            float(R_rate_scaled[0, 0] / _rr_before_reversal) if _rr_before_reversal else 1.0
+        )
 
         # ── Current-state Q[0,0]/Q[2,2]/Q[3,3] and R_rate[0,0] blend ───────
         # Straight-line-blend, PER WEIGHT, between a "straight" endpoint and
@@ -1265,11 +1332,20 @@ class MPCController:
         adapt["Q_epsi_base"] = float(Q_base[2, 2])
         adapt["Q_r_base"]    = float(Q_base[3, 3])
 
+        # CAUTION: this line sets R_rate_scaled[0,0]'s BASE value (the
+        # current-curvature straight/corner schedule), so every multiplier
+        # computed above (m_Rrate_antihunt, m_Rrate_reversal, and any future
+        # one added before this point) must be explicitly reapplied here too
+        # -- an assignment that doesn't multiply in all of them silently
+        # discards whichever one it omits, even though that multiplier's own
+        # value is still correctly logged to adapt[...]. This exact class of
+        # bug has recurred more than once; do not add a new R_rate[0,0]
+        # multiplier without threading it through this line.
         R_rate_scaled = R_rate_scaled.copy()
         R_rate_scaled[0, 0] = _blend(
             self.params.rrate_steer_straight, self.params.rrate_steer_corner,
             corner_frac,
-        )
+        ) * adapt["m_Rrate_antihunt"] * adapt["m_Rrate_reversal"]
         adapt["Rrate_steer_corner_blend"] = float(R_rate_scaled[0, 0])
 
         R_scaled = R_scaled.copy()
