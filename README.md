@@ -9,6 +9,16 @@ parameter config. The planners developed and tuned here speak the exact interfac
 consumes, so they can move onto the real car with no I/O changes. The simulator-specific parts are
 confined to two thin bridge nodes that adapt FSDS ↔ the `/fsae/*` interface.
 
+<p align="center">
+  <img src="docs/planner-demo.webp"
+       alt="centerline_planner driving the FSDS simulator: the car follows the cone-wall centreline while the planner and Stanley controller log live"
+       width="960">
+</p>
+
+<p align="center">
+  <sub><code>centerline_planner</code> + Stanley on a trackdrive lap</sub>
+</p>
+
 ---
 
 ## Quick Start
