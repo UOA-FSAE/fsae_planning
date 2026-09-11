@@ -15,6 +15,7 @@ from scipy.interpolate import splev, splprep
 
 from fsae_planning.cone_sorting import (
     filter_cones_forward,
+    MAX_PAIR_DIST,
     pair_cones_nn,
     sort_cones_nn,
 )
@@ -146,13 +147,18 @@ def smooth_centreline(waypoints, n_out=None, smooth=None,
 
 
 def build_local_path(blue_cones, yellow_cones, car_pos, car_yaw,
-                     max_ahead=25.0, max_lateral=10.0):
+                     max_ahead=25.0, max_lateral=10.0, max_pair_dist=MAX_PAIR_DIST):
     """
     Simple fallback planner: NN-sort each boundary then pair midpoints.
 
     Only forward cones are used so the NN sort is monotonically forward and
     cannot zigzag back across the car.  car_pos is prepended as the near
     anchor so the spline starts at the car's current position.
+
+    max_pair_dist bounds how far apart a left/right cone pair may be to count
+    as a gate (see cone_sorting.pair_cones_nn) -- exposed so a caller can
+    align this fallback's width policy with the primary planner's gate-length
+    gate instead of always using the wide MAX_PAIR_DIST default.
 
     Returns a smoothed (N, 2) array or None if there are not enough cones.
     """
@@ -168,7 +174,7 @@ def build_local_path(blue_cones, yellow_cones, car_pos, car_yaw,
 
     blue_sorted   = sort_cones_nn(blue_fwd,   start=car_pos)
     yellow_sorted = sort_cones_nn(yellow_fwd, start=car_pos)
-    pairs = pair_cones_nn(blue_sorted, yellow_sorted)
+    pairs = pair_cones_nn(blue_sorted, yellow_sorted, max_dist=max_pair_dist)
 
     if not pairs:
         return None
@@ -268,12 +274,17 @@ def _resample_forward(path, car_pos, ds, n_samples):
     and a fresh one can be compared sample-for-sample.  Samples past the end of
     the path clamp to its last point.
 
-    Returns an (n_samples, 2) array, or None if the path is degenerate.
+    Returns (samples, total): an (n_samples, 2) array (positions past the
+    path's end clamp to its last point) and the path's real remaining arc
+    length (`total`, in metres, from the car's projection to the path's
+    actual endpoint) -- callers need `total` to tell a real sample from one
+    that only exists because it was clamped (see blend_paths' fresh-endpoint
+    guard). Returns (None, 0.0) if the path is degenerate.
     """
     path = np.asarray(path, dtype=np.float64)
     m = len(path)
     if m < 2:
-        return None
+        return None, 0.0
 
     # Nearest-segment projection of the car onto the path.
     best_seg, best_t, best_d2 = 0, 0.0, np.inf
@@ -294,13 +305,14 @@ def _resample_forward(path, car_pos, ds, n_samples):
     arc     = np.concatenate([[0.0], np.cumsum(seg)])
     total   = float(arc[-1])
     if total < 1e-6:
-        return None
+        return None, 0.0
 
     targets = np.minimum(np.arange(n_samples) * ds, total)
-    return np.column_stack([
+    samples = np.column_stack([
         np.interp(targets, arc, fwd_pts[:, 0]),
         np.interp(targets, arc, fwd_pts[:, 1]),
     ])
+    return samples, total
 
 
 def blend_paths(prev, new, car_pos, alpha=0.4, ds=0.5, horizon=15.0,
@@ -329,14 +341,22 @@ def blend_paths(prev, new, car_pos, alpha=0.4, ds=0.5, horizon=15.0,
 
     Returns the blended (K, 2) path.  Falls back to `new` unchanged when there is
     no usable previous path.
+
+    The blended output is truncated to the fresh (`new`) path's own validated
+    arc length. Without this, a short fresh path (its samples past its real
+    endpoint clamp and repeat the last point, see _resample_forward) still
+    gets averaged against a longer previous path's genuine further-out
+    samples, which pulls the blend PAST the point the fresh path -- the one
+    that was actually validated this tick -- was willing to vouch for, into
+    territory only the stale previous plan supports.
     """
     new = np.asarray(new, dtype=np.float64)
     if prev is None or len(new) < 2 or alpha >= 1.0:
         return new
 
     n = int(horizon / ds) + 1
-    r_new  = _resample_forward(new,  car_pos, ds, n)
-    r_prev = _resample_forward(prev, car_pos, ds, n)
+    r_new,  new_total  = _resample_forward(new,  car_pos, ds, n)
+    r_prev, _prev_total = _resample_forward(prev, car_pos, ds, n)
     if r_new is None or r_prev is None:
         return new
 
@@ -344,6 +364,14 @@ def blend_paths(prev, new, car_pos, alpha=0.4, ds=0.5, horizon=15.0,
         return r_new
 
     blended = (1.0 - alpha) * r_prev + alpha * r_new
+
+    # Never extend past the fresh path's own validated endpoint (+1 sample so
+    # the point AT new_total itself is kept, not dropped by a boundary
+    # rounding case).
+    n_keep = int(np.searchsorted(np.arange(n) * ds, new_total)) + 1
+    n_keep = max(2, min(n_keep, len(blended)))
+    blended = blended[:n_keep]
+
     # Drop trailing near-duplicate samples (path shorter than the horizon clamps
     # its tail to the last point).
     keep = np.concatenate([[True],

@@ -254,7 +254,7 @@ keyed by node name (ROS matches params by node name, so `name == executable == k
 | Node | Key params |
 |------|-----------|
 | `sim_perception` | `look_ahead` (25 m), `look_wide` (10 m), `min_ahead` (0.5 m), `look_radius` (25 m), `full_track` (false), `pose_rate` (20 Hz), `cone_rate` (10 Hz) |
-| `centerline_planner` | `smooth` (0.015), `look_radius` (25 m), `plan_horizon` (25 m), `path_blend` (0.4) |
+| `centerline_planner` | `smooth` (0.015), `look_radius` (25 m), `plan_horizon` (25 m), `path_blend` (0.4), `midpoint_method` (`delaunay`), `mid_min_gate` (1.2 m), `mid_max_gate` (6.5 m), plus input-staleness (`max_pose_age`, `max_track_age`, `max_track_skew`) and output-sanity (`max_point_jump`, `min_cone_clearance`, `min_usable_path_length`, `max_hold_deviation`) gates |
 | `skidpad_planner` | `v_start` (3 m/s), `ramp_accel` (0.25 m/s²), `v_cap` (25 m/s) |
 | `controller` | `v_max` (15 m/s), `v_min` (1.5 m/s), `stanley_gain` (1.0) |
 
@@ -297,12 +297,26 @@ even present, to build/drive `fsae_planning` on its own.
 
 The active planner (`build_path_walls` in
 [planning/fsae_planning/fsae_planning/boundary.py](planning/fsae_planning/fsae_planning/boundary.py))
-connects same-colour boundary cones into a wall mesh, then generates midpoints by anchoring on
-whichever boundary has more cones in view and matching each anchor cone to its single nearest
-unclaimed opposite-colour cone (within a bounded pairing distance) — an exclusive one-to-one match
-rather than pairing every cone within range, which avoids one cone on the sparser side fanning out
-into several conflicting midpoints on tight corners. Those midpoints are chained with a greedy walk
-that penalises steps crossing the wall mesh, then fit with a cubic spline. Boundary cones arrive
+Delaunay-triangulates every cone of both colours together and keeps the same-colour edges as a wall
+mesh — triangulating both colours at once is what structurally prevents a stray or mislabelled cone
+from linking a false wall segment straight across the track, which plain same-colour distance
+linking could not.
+
+Midpoints then come from one of two methods, selected by the `midpoint_method` param:
+
+- **`delaunay`** *(default)* — each *mixed* triangle (vertices split 2-1 by colour) contributes its
+  two cross-colour edges directly as a corridor "gate pair". This is wall-safe by construction (a
+  triangle's interior cannot reach any other triangle's edges), so chaining the gates needs no
+  per-step wall-crossing check or cost function at all. Gate edges outside `mid_min_gate` …
+  `mid_max_gate` are rejected as stray cones or bridged gaps. **`mid_max_gate` is track-specific** —
+  see the note in `fsae_params.yaml`; the upstream default is measured on the real stack's narrower
+  track and is too tight for this repo's simulator maps.
+- **`nn`** — the older exclusive nearest-neighbour matching: anchor on whichever boundary has more
+  cones in view and match each anchor cone to its single nearest unclaimed opposite-colour cone, then
+  chain with a greedy walk that penalises steps crossing the wall mesh. Kept for rollback and
+  side-by-side comparison.
+
+Either way the chain is fit with a cubic spline. Boundary cones arrive
 already colour-separated and in the global frame on `left_track` / `right_track`; the planner plans
 directly off each tick's latest cones with no accumulation across ticks (no persistent cone map —
 removed so a stale/misassociated cone can't linger in the path on a noisy real perception stack).

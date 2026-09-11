@@ -11,6 +11,11 @@
   <exec_depend>fsae_interfaces</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>ros2launch</exec_depend>
+  <!-- Directly imported by centerline_planner.py / skidpad_planner.py; was
+       previously only pulled in transitively via other packages' deps. -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>ackermann_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
 
   <depend>python3-numpy</depend>
   <depend>python3-matplotlib</depend>

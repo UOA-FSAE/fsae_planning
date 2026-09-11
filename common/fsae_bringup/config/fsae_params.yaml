@@ -50,6 +50,35 @@ sim_perception:
 # `path_blend` (0<a<=1): temporal EMA weight toward each freshly-planned path, so
 # successive paths ease between frames instead of jumping (which the controller
 # tracks as a jerk). 1.0 disables blending; smaller = smoother/laggier.
+# `midpoint_method`: 'delaunay' (default) turns each mixed triangle of a
+# Delaunay triangulation of both boundaries into a corridor gate pair --
+# wall-safe by construction, no per-step crossing check needed. 'nn' is the
+# older exclusive-nearest-neighbour midpoint matching, kept for rollback and
+# side-by-side comparison.
+# `mid_min_gate`/`mid_max_gate` (m): cross-colour gate length band the
+# 'delaunay' corridor accepts. Below the min is almost always a stray cone
+# next to a genuine one; above the max means the triangulation bridged a gap
+# with a missing intermediate cone.
+# mid_max_gate is 6.5 here, NOT boundary._WALL_MID_MAX_DELAUNAY's 5.0 default:
+# that default was measured on the real stack's track (cone-spacing p99 ~4.2 m)
+# and does not transfer to the simulator's wider-spaced maps. A mixed
+# triangle's gate edges include the DIAGONAL, ~hypot(track_width,
+# cone_spacing) -- on tracks/comp_test_map_3 (3.50 m wide, same-colour spacing
+# up to 4.94 m) those top out at 5.35 m, so 5.0 rejects 47% of all gates and
+# the corridor walk finds NO gates at all on 172/200 sampled poses, silently
+# falling through to build_local_path's naive nearest-cone pairing. 6.5 clears
+# the measured maximum with ~20% margin while staying under
+# boundary._WALL_MAX_DIST (7.0). Re-measure this for a track with different
+# cone spacing.
+# `max_pose_age`/`max_track_age`/`max_track_skew` (s): input staleness gates,
+# measured from local arrival time (Track.msg has no header, and
+# car_position's stamp is the upstream odom clock). A tick whose inputs fail
+# these plans nothing rather than mixing a stale boundary pair.
+# `max_point_jump`/`min_cone_clearance`/`min_usable_path_length` (m): output
+# sanity gates. A wall crossing or clearance violation truncates the path at
+# that point; a jump or a sub-minimum remaining length rejects it outright.
+# `max_hold_deviation` (m): how far the car may be from a HELD path before the
+# hold is dropped (localisation jump, or simply too much motion since).
 centerline_planner:
   ros__parameters:
     smooth: 0.015
@@ -57,6 +86,16 @@ centerline_planner:
     plan_horizon: 25.0
     path_blend: 0.4
     path_hold_timeout: 0.3   # s; republish the last known-good path this long before giving up
+    midpoint_method: 'delaunay'
+    mid_min_gate: 1.2
+    mid_max_gate: 6.5
+    max_pose_age: 0.15
+    max_track_age: 0.50
+    max_track_skew: 0.20
+    max_point_jump: 10.0
+    min_cone_clearance: 0.4
+    min_usable_path_length: 2.0
+    max_hold_deviation: 2.0
 skidpad_planner:
   ros__parameters:
     v_start: 3.0        # m/s — speed at the start of the ramp

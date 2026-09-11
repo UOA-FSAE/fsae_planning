@@ -1,24 +1,21 @@
 # Wall-barrier planner: false wall segments from mislabelled cones
 
-Status: **implemented on the real stack (`~/ros2_ws`) and confirmed working
-there against real cone tracks. Two of the three real-stack changes — the
-Delaunay wall builder and the `_gen_midpoints` minimum pair distance — have
-now also been ported into this repo (the simulator stack) and
-syntax/unit-sanity-checked here. The third (truncating `_sanitize`) has no
-equivalent to port — see "Porting into this repo" below. Not yet driven in
-the simulator itself.**
+Status: **superseded — all three real-stack changes are now in this repo.**
+See [CHANGES.md](CHANGES.md) for the full sync, which also brought across the
+later Delaunay *corridor* midpoint builder (`e533c55`) and the
+path-disappearing patch (`8751593`) that this document predates.
 
-This repo does not contain `wall_centerline_planner.py` (it's a
-real-stack-only node — see its own module docstring on the real stack for
-why: `PoseStamped`→`Pose` framing differences, input-staleness gating, an
-explicit-empty-trajectory fail-safe, none of which apply to the simulator's
-synchronous ground-truth perception) — and, as it turns out,
-`centerline_planner.py` here has no `_sanitize`-equivalent post-processing
-step at all; `_compute_path` publishes whatever `build_path_walls` returns
-directly. So there was nothing to port for that change. The `boundary.py`
-changes below apply to `build_path_walls` / the wall-mesh helpers, which
-this repo's `centerline_planner.py` also calls into — same root cause, same
-fix applies there, and both have been applied to this repo's `boundary.py`.
+This document is kept for the root-cause analysis below, which is still the
+clearest write-up of *why* the wall builder was changed.
+
+Two corrections to what this document originally said. First, the truncating
+`_sanitize` no longer has "no equivalent to port" — `centerline_planner.py`
+now has a full `_sanitize` of its own, along with input-staleness gating and
+the rest of the node hardening from upstream's `wall_centerline_planner.py`,
+folded into the existing node rather than added as a second one. Second, two
+of upstream's node behaviours genuinely are real-stack-only and were **not**
+ported: the explicit-empty-`PoseArray` fail-safe and the watchdog timer that
+exists to trigger it. CHANGES.md explains why they come as a set.
 
 ## Symptom
 
