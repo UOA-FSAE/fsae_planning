@@ -52,13 +52,14 @@ WHAT THIS CONTROLLER DELIBERATELY DOES NOT DO
   nodes need no branch) and IGNORED with a one-time log line — that profile is
   a workaround for the same missing curvature term this controller closes
   structurally.
-* No speed profile over the horizon BY DEFAULT. v_ref is the caller's
-  single, already low-passed desired_speed held constant across the
-  horizon, same as the LTV-QP gets — deliberately not addressing the
-  (separate) braking-lag problem here, so a live A/B isolates the
-  lateral-model change alone. NMPCParams.nmpc_horizon_speed_profile_enabled
-  (default False, EXPERIMENTAL) can opt into a per-stage lookup instead —
-  see PathReference.v_ref_at.
+* No speed profile over the horizon. v_ref is the caller's single, already
+  low-passed desired_speed held constant across the horizon, same as the
+  LTV-QP gets — deliberately not addressing the (separate) braking-lag
+  problem here, so a live A/B isolates the lateral-model change alone. A
+  per-stage speed profile lookup (both a cost-term version and a
+  constraint version) was tried and rejected on the car twice; see
+  `docs/logs/nmpc_speed_limit_investigation.md` and
+  `late_turn_in_investigation.md` Part 16 §16.7.
 
 EXPERIMENTAL ADDITIONS (all additive, all default to preserve the above
 exactly)
@@ -68,7 +69,6 @@ exactly)
   True) instead of the old dense-resample + moving-average +
   finite-difference pipeline — see PathReference's own docstring. The old
   path is kept (not deleted) and selectable via the flag for A/B comparison.
-* nmpc_horizon_speed_profile_enabled (default False): see PathReference.v_ref_at.
 * nmpc_friction_circle_enabled (default False): an ADDITIONAL hard
   |F_yf|/|F_yr| <= F_max QP constraint on top of (not instead of) the
   existing soft alat-ceiling saturation below — see NH_FRICTION and
@@ -182,11 +182,28 @@ class PathReference:
     """
 
     def __init__(self, path, dense_step=0.5, smooth_w=3, kappa_clip=0.5,
-                 spline_reference_enabled=True, path_v_xy=None, path_v=None):
+                 spline_reference_enabled=True):
         path = np.asarray(path, dtype=float)
-        self.path = path
         seg = np.diff(path, axis=0)
         seg_len = np.hypot(seg[:, 0], seg[:, 1])
+
+        # A live planner path can arrive padded with the last real point
+        # repeated to a fixed array length (seen live 2026-09-15, see
+        # nmpc_planner_only_corner_failure.md): those trailing zero-length
+        # segments look like valid flat geometry to everything below, so the
+        # horizon predicts the corner simply stopping. Drop them before any
+        # arc-length/kappa/psi_ref math runs, so the real end of data becomes
+        # this path's actual last point and the existing edge-hold behaviour
+        # in kappa_at/psi_ref_at (see their docstrings) takes over from there,
+        # holding the last REAL sample instead of a frozen duplicate one.
+        real_n = len(path)
+        while real_n > 2 and seg_len[real_n - 2] < 1e-6:
+            real_n -= 1
+        if real_n < len(path):
+            path = path[:real_n]
+            seg_len = seg_len[:real_n - 1]
+
+        self.path = path
         self.arc = np.concatenate([[0.0], np.cumsum(seg_len)])
         self.total = float(self.arc[-1]) if len(self.arc) else 0.0
 
@@ -270,25 +287,6 @@ class PathReference:
             self.s_psi = s_k
             self.psi_ref = psi_ref
 
-        # Speed-profile lookup (NMPCParams.nmpc_horizon_speed_profile_enabled).
-        # None (default) means "not available" -- v_ref_at falls back to the
-        # caller's scalar. Built from the speed profile's OWN (path_v_xy)
-        # points, NOT self.arc: the speed-profile array is a separate object
-        # from the path array handed to this constructor (confirmed at the
-        # mpc_controller.py call site -- self._static_path and
-        # self._speed_profile are loaded from two different CSVs), so its own
-        # cumulative arc length must be computed independently.
-        self.s_v = None
-        self.v_target = None
-        if path_v_xy is not None and path_v is not None:
-            pv_xy = np.asarray(path_v_xy, dtype=float)
-            pv = np.asarray(path_v, dtype=float)
-            if len(pv_xy) >= 2 and len(pv) == len(pv_xy):
-                seg_v = np.diff(pv_xy, axis=0)
-                seg_v_len = np.hypot(seg_v[:, 0], seg_v[:, 1])
-                self.s_v = np.concatenate([[0.0], np.cumsum(seg_v_len)])
-                self.v_target = pv
-
         # Signature used to decide whether a cached PathReference still
         # describes the array compute() was handed this tick. Cheap (no
         # full-array compare) and sufficient: the planner republishes a new
@@ -340,18 +338,6 @@ class PathReference:
         """
         return np.interp(s, self.s_kappa, self.kappa)
 
-    def v_ref_at(self, s):
-        """
-        Speed target v(s) from the precomputed per-lap speed profile, at
-        arc length(s) `s` (end-clamped, same convention as kappa_at). Only
-        meaningful when this PathReference was built with a speed-profile
-        array (see __init__'s path_v_xy/path_v) -- callers must check
-        `self.v_target is not None` before relying on this rather than the
-        scalar v_ref, exactly like nmpc_horizon_speed_profile_enabled's own
-        gating in NMPCController.
-        """
-        return np.interp(s, self.s_v, self.v_target)
-
     def kappa_scalar(self, s):
         """
         Single-point kappa(s), O(1) on the uniform curvature grid. Same values
@@ -378,6 +364,26 @@ class PathReference:
         Frenet state and the predicted one describe one identical reference.
         """
         return np.interp(s, self.s_psi, self.psi_ref)
+
+    def xy_at(self, s, e_y):
+        """
+        Cartesian (x, y) for arc length(s) `s` with perpendicular offset(s)
+        `e_y`, the exact inverse of project()'s e_y projection: the path
+        point at `s` (interpolated off the raw waypoints, matching arc/path
+        elsewhere in this class) offset by e_y along the LEFT normal of
+        psi_ref_at(s), so xy_at(*project(front_axle, yaw)[:2]) recovers
+        front_axle. Used to convert the NMPC's own Frenet-frame horizon
+        prediction (s, e_y per stage) into a plottable Cartesian trajectory
+        for live visualisation, see live_viz.py.
+        """
+        s = np.atleast_1d(np.asarray(s, dtype=float))
+        e_y = np.atleast_1d(np.asarray(e_y, dtype=float))
+        x_path = np.interp(s, self.arc, self.path[:, 0])
+        y_path = np.interp(s, self.arc, self.path[:, 1])
+        psi = self.psi_ref_at(s)
+        x = x_path - e_y * np.sin(psi)
+        y = y_path + e_y * np.cos(psi)
+        return x, y
 
     def project(self, front_axle, car_yaw):
         """
@@ -747,22 +753,14 @@ def _step(X, U, ref, p, dt, n_sub):
     return Xk
 
 
-def _outputs(X, ref, p, v_ref, horizon_speed_profile_enabled=False,
-             friction_circle_enabled=False):
+def _outputs(X, ref, p, v_ref, friction_circle_enabled=False):
     """
     Stage output h(x) = [e_y, e_y_dot, e_psi, e_psi_dot, v_x - v_ref],
     vectorised over stages. e_psi_dot = r - kappa(s)*s_dot is the
     heading-error RATE — see nmpc_params.py on why q_r weights this rather
     than absolute yaw rate.
 
-    v_ref is normally the caller's single scalar, broadcast to every stage
-    (unchanged default behaviour). When `horizon_speed_profile_enabled` is
-    True AND `ref` actually carries a speed-profile array (ref.v_target is
-    not None -- NMPCParams.nmpc_horizon_speed_profile_enabled), the target is
-    instead looked up per-stage at that stage's own PREDICTED arc length
-    ref.v_ref_at(X[:, IDX_S]) -- a state-keyed lookup, exactly like
-    kappa_at(s), NOT a value scheduled by horizon index. See
-    PathReference.v_ref_at's docstring.
+    v_ref is the caller's single scalar, broadcast to every stage.
 
     When `friction_circle_enabled` is True, TWO EXTRA rows (F_yf, F_yr, see
     NH_FRICTION) are appended, returning shape (M, NH + NH_FRICTION) instead
@@ -786,17 +784,13 @@ def _outputs(X, ref, p, v_ref, horizon_speed_profile_enabled=False,
     cos_ep = np.cos(e_psi)
     sin_ep = np.sin(e_psi)
     s_dot = (v_x * cos_ep - v_y * sin_ep) / denom
-    if horizon_speed_profile_enabled and ref.v_target is not None:
-        v_ref_stage = ref.v_ref_at(X[:, IDX_S])
-    else:
-        v_ref_stage = v_ref
     n_cols = NH + NH_FRICTION if friction_circle_enabled else NH
     H = np.empty((X.shape[0], n_cols))
     H[:, 0] = e_y
     H[:, 1] = v_x * sin_ep + v_y * cos_ep
     H[:, 2] = e_psi
     H[:, 3] = r - kap * s_dot
-    H[:, 4] = v_x - v_ref_stage
+    H[:, 4] = v_x - v_ref
     if friction_circle_enabled:
         F_yf, F_yr = _tyre_forces(X, p)
         H[:, NH] = F_yf
@@ -959,7 +953,6 @@ class NMPCController:
 
         # ── Experimental feature flags (see nmpc_params.py's comments) ───
         self.spline_reference_enabled = bool(nm0.nmpc_spline_reference_enabled)
-        self.horizon_speed_profile_enabled = bool(nm0.nmpc_horizon_speed_profile_enabled)
         self.friction_circle_enabled = bool(nm0.nmpc_friction_circle_enabled)
         if self.friction_circle_enabled:
             # F_max = m * ceiling(v_x) / 2 per axle: the measured ceiling law
@@ -973,9 +966,6 @@ class NMPCController:
             self._fmax_flat = 0.5 * self.plant.m * self.plant.alat_ceiling_flat
             self._fmax_slope = 0.5 * self.plant.m * self.plant.alat_ceiling_slope
             self._fmax_intercept = 0.5 * self.plant.m * self.plant.alat_ceiling_intercept
-        self.speed_limit_enabled = bool(nm0.nmpc_speed_limit_enabled)
-        self.speed_limit_margin = float(nm0.nmpc_speed_limit_margin)
-        self.speed_limit_slack_weight = float(nm0.nmpc_speed_limit_slack_weight)
 
         # ── Limits: identical to MPCController's ────────────────────────
         self.a_max = MAX_ACCEL
@@ -1057,6 +1047,16 @@ class NMPCController:
         self.rrate_steer_straight = _pick(pm.nmpc_rrate_steer_straight, pm.rrate_steer_straight)
         self.rrate_steer_corner = _pick(pm.nmpc_rrate_steer_corner, pm.rrate_steer_corner)
 
+        # Standstill steering damping -- see the field docstrings in
+        # nmpc_params.py for the mechanism, and _solve_step/_cost for where
+        # the stage-0 weight is actually applied.
+        self.standstill_steer_damp_enabled = bool(
+            self.nmpc.nmpc_standstill_steer_damp_enabled)
+        self.standstill_speed = float(self.nmpc.nmpc_standstill_speed)
+        self.standstill_fade_speed = float(self.nmpc.nmpc_standstill_fade_speed)
+        self.standstill_steer_r_scale = float(
+            self.nmpc.nmpc_standstill_steer_r_scale)
+
         # ── Continuity memory (mirrors MPCController's) ─────────────────
         self._delta_act = 0.0
         self._a_act = 0.0
@@ -1087,7 +1087,7 @@ class NMPCController:
         else:
             print(f'[nmpc_core] {msg}')
 
-    def set_static_path(self, path, path_v_xy=None, path_v=None) -> None:
+    def set_static_path(self, path) -> None:
         """
         Precompute the arc-length/curvature reference for a fixed path, once,
         at load time. Called by the owning node exactly where it calls
@@ -1096,12 +1096,6 @@ class NMPCController:
 
         path=None clears it (live-planner mode), in which case compute() builds
         a reference per tick from whatever path it is handed.
-
-        `path_v_xy`/`path_v` (optional, NMPCParams.nmpc_horizon_speed_profile_enabled):
-        the precomputed per-lap speed profile's own (x, y) points and target
-        speeds — a SEPARATE array from `path` (the node's self._static_path
-        and self._speed_profile are loaded from two different CSVs; see
-        PathReference.v_ref_at's docstring) — passed straight through.
         """
         if path is None or len(np.asarray(path)) < 3:
             self._static_ref = None
@@ -1113,7 +1107,6 @@ class NMPCController:
                 smooth_w=self.nmpc.nmpc_curvature_smooth_w,
                 kappa_clip=self.nmpc.nmpc_kappa_clip,
                 spline_reference_enabled=self.spline_reference_enabled,
-                path_v_xy=path_v_xy, path_v=path_v,
             )
             k = self._static_ref.kappa
             self._log(
@@ -1153,6 +1146,12 @@ class NMPCController:
         self._u_history.clear()
         self._pose_age_filtered = None
         self._n_delay = 0
+        # _ref/_ref_signature themselves already carry the "previous tick's
+        # kappa profile" _rate_limit_kappa needs, via _path_reference; clear
+        # them too so a reset doesn't rate-limit the NEXT path's kappa
+        # against a profile from before the reset.
+        self._ref = None
+        self._ref_signature = None
 
     # ------------------------------------------------------------------
     # QP subproblem (condensed, dense, fixed sparsity)
@@ -1160,15 +1159,13 @@ class NMPCController:
     def _build_qp(self) -> None:
         """
         Allocate the condensed QP once: variables
-        z = [dU (nu*N); slack (N); slack_v (N)], with the constraint rows
+        z = [dU (nu*N); slack (N)], with the constraint rows
 
             (1) box/trust region on dU                       nu*N rows
             (2) input slew rate |u_k - u_{k-1}| <= du_max     nu*N rows
             (3) e_y_k - slack_k <= +halfwidth                 N rows
             (4) e_y_k + slack_k >= -halfwidth                 N rows
             (5) slack >= 0                                    N rows
-            (6) v_x_k - slack_v_k <= v_max_k                  N rows
-            (7) slack_v >= 0                                  N rows
 
         Rows (3)-(5) and the slack variables are omitted entirely when
         nmpc_track_halfwidth <= 0. The pattern never changes after this, so
@@ -1183,25 +1180,12 @@ class NMPCController:
         per-tick — since it changes the QP's fixed sparsity pattern. When
         False, n_rows/nz and every array below are IDENTICAL to before this
         feature existed.
-
-        Speed-limit rows (6)-(7) (self.speed_limit_enabled, see
-        NMPCParams.nmpc_speed_limit_enabled): a SEPARATE one-sided soft bound
-        with its OWN slack_v (not sharing the track bound's slack, so the two
-        constraints can't offset each other's cost), one row per stage plus
-        one non-negativity row per stage. v_max_k is filled in per-tick from
-        PathReference.v_ref_at(s_k) + nmpc_speed_limit_margin in _solve_step;
-        when no speed-profile array is available at solve time the rows are
-        left inert (l=-inf, u=inf) rather than omitted, since (like the
-        friction-circle rows) the sparsity pattern is fixed once here, not
-        per-tick. Read ONCE here, at construction time, like _use_slack.
         """
         N = self.N
         n_du = NU * N
         self._use_slack = self.nmpc.nmpc_track_halfwidth > 0.0
         n_slack = N if self._use_slack else 0
-        self._use_vslack = self.speed_limit_enabled
-        n_vslack = N if self._use_vslack else 0
-        nz = n_du + n_slack + n_vslack
+        nz = n_du + n_slack
         n_fric = 2 * N if self.friction_circle_enabled else 0
 
         # First-difference operator E: diff_k = u_k - u_{k-1} (u_{-1} = u_prev).
@@ -1234,14 +1218,10 @@ class NMPCController:
         if n_slack:
             idx = np.arange(n_du, n_du + n_slack)
             p_mask[idx, idx] = True
-        if n_vslack:
-            idx = np.arange(n_du + n_slack, nz)
-            p_mask[idx, idx] = True
         P, p_rows, p_cols = _csc_pattern(p_mask)
 
         # A pattern.
-        n_rows = (2 * n_du + (3 * N if self._use_slack else 0)
-                  + n_fric + (2 * N if self._use_vslack else 0))
+        n_rows = 2 * n_du + (3 * N if self._use_slack else 0) + n_fric
         a_mask = np.zeros((n_rows, nz), dtype=bool)
         a_mask[:n_du, :n_du] = np.eye(n_du, dtype=bool)
         a_mask[n_du:2 * n_du, :n_du] = E != 0.0
@@ -1258,14 +1238,6 @@ class NMPCController:
         if n_fric:
             rf0 = 2 * n_du + (3 * N if self._use_slack else 0)
             a_mask[rf0:rf0 + n_fric, :n_du] = True
-        if n_vslack:
-            rv0 = 2 * n_du + (3 * N if self._use_slack else 0) + n_fric
-            # Speed rows are dense in dU for the same reason the track rows
-            # are: stage k's v_x depends on every earlier input through S.
-            a_mask[rv0:rv0 + N, :n_du] = True
-            for k in range(N):
-                a_mask[rv0 + k, n_du + n_slack + k] = True           # -slack_v_k
-                a_mask[rv0 + N + k, n_du + n_slack + k] = True       # slack_v_k >= 0
         A, a_rows, a_cols = _csc_pattern(a_mask)
 
         q = np.zeros(nz)
@@ -1289,7 +1261,7 @@ class NMPCController:
             prob=prob, P=P, A=A,
             p_rows=p_rows, p_cols=p_cols,
             a_rows=a_rows, a_cols=a_cols,
-            n_du=n_du, n_slack=n_slack, n_vslack=n_vslack, n_fric=n_fric,
+            n_du=n_du, n_slack=n_slack, n_fric=n_fric,
             nz=nz, n_rows=n_rows,
         )
 
@@ -1304,13 +1276,29 @@ class NMPCController:
         iteration that cannot be vectorised across stages — hence the scalar
         _step_scalar fast path (see its docstring: 1 ms here versus 17 ms
         through the vectorised form).
+
+        nmpc_rk_substeps is SPEED-GATED per stage, same technique as
+        nmpc_jac_substeps/nmpc_jac_gate_speed (see _jacobians). Measured
+        directly (infinitesimal perturbation propagated through this same
+        rollout, not just the sensitivity Jacobian, across all 8 states and
+        several control-sequence shapes): 2 substeps diverges (up to ~260x
+        growth) across roughly 2.25-3.75 m/s, but 3 is fully converged
+        (<=1.6x growth) everywhere tested in and above that band. The fast
+        value here is nmpc_rk_substeps_fast=3, not 2, specifically because 2
+        is the one count confirmed unstable. Gated per-stage on that stage's
+        OWN predicted v_x (unlike the Jacobian's single whole-horizon gate),
+        since this function builds X incrementally and a stage's speed can
+        cross the gate mid-horizon on a hard launch/brake.
         """
         N = self.N
         X = np.empty((N + 1, NX))
         X[0] = x0
         xk = [float(v) for v in x0]
-        p, dt, n_sub = self.plant, self.dt, self.nmpc.nmpc_rk_substeps
+        p, dt = self.plant, self.dt
         for k in range(N):
+            n_sub = self.nmpc.nmpc_rk_substeps
+            if xk[IDX_VX] >= self.nmpc.nmpc_rk_gate_speed:
+                n_sub = min(n_sub, self.nmpc.nmpc_rk_substeps_fast)
             xk = _step_scalar(xk, U[k], ref, p, dt, n_sub)
             X[k + 1] = xk
         return X
@@ -1345,19 +1333,52 @@ class NMPCController:
         each perturbation direction costs ONE batched one-step integration of
         all N stages rather than N scalar ones (10 batched steps total).
 
-        These use nmpc_jac_substeps (default 1) rather than the rollout's
-        nmpc_rk_substeps (default 2), which halves the cost of the dominant
-        term in a Gauss-Newton iteration. That is a deliberate, safe
-        asymmetry: A_k/B_k only supply the QP's STEP DIRECTION, they never
-        define the predicted trajectory (the rollout does, and it is exact to
-        RK4 x n_sub). A slightly coarser sensitivity costs at most a slightly
-        worse step, which the next iteration and the trust region absorb; the
-        prediction itself is unaffected.
+        The substep count is SPEED-GATED. A_k/B_k only supply the QP's STEP
+        DIRECTION and never the predicted trajectory, so a coarser sensitivity
+        costs at most a slightly worse step that the trust region absorbs. That
+        argument is sound about ACCURACY and wrong about STABILITY, which is
+        what bit when this was a flat 1: the (v_y, r) sub-dynamics stiffen as
+        1/v_x, so below roughly 3.5 m/s too few substeps make this integration
+        divergent rather than inaccurate, and a divergent A_k does not degrade
+        gracefully -- it compounds through the condensing loop and leaves a
+        Hessian whose only representable solution is exactly zero.
+
+        The instability is confined to LOW SPEED, so the fix does not have to
+        be. Measured max|A_k| against the converged (4-substep) value:
+
+            v_x    js=1      js=2      js=4
+            2.5    2.41e2    7.00e1    1.00
+            3.0    1.32e2    1.57e1    1.13
+            5.0    2.25e1    1.48      1.98
+            8.0    4.06      3.07      3.18
+            14.0   4.01      4.90      4.93
+            20.0   5.69      6.03      6.04
+
+        At and above ~8 m/s two substeps track the converged value closely with
+        no divergence, so nmpc_jac_substeps_fast is used there and the full
+        nmpc_jac_substeps only below the gate. js=1 is NOT a safe fast value
+        even at speed: it does not diverge, but it is badly inaccurate (1.30 vs
+        a converged 3.85 at 10 m/s).
+
+        An analytic Jacobian would NOT permit a lower count either. The
+        variational equation propagated through RK4 has the same stability
+        region as the nominal ODE (verified: both stay stable to lambda*h =
+        -2.785 and both diverge at -3.0), so the substep floor is a property of
+        RK4 sensitivity propagation, not of finite differencing.
+
+        The gate keys off the SLOWEST stage in the predicted horizon, not the
+        current speed, so it changes rarely -- a per-tick flip in Jacobian
+        fidelity would perturb the warm start and become its own disturbance.
+        Setting nmpc_jac_substeps_fast == nmpc_jac_substeps disables the gate
+        exactly.
         """
         N = self.N
         Xs = X[:N]
         p, dt = self.plant, self.dt
         n_sub = max(1, int(self.nmpc.nmpc_jac_substeps))
+        n_sub_fast = max(1, int(self.nmpc.nmpc_jac_substeps_fast))
+        if float(X[:, IDX_VX].min()) >= self.nmpc.nmpc_jac_gate_speed:
+            n_sub = min(n_sub, n_sub_fast)
         F0 = _step(Xs, U, ref, p, dt, n_sub)
         A = np.empty((N, NX, NX))
         B = np.empty((N, NX, NU))
@@ -1383,7 +1404,6 @@ class NMPCController:
         feature existed.
         """
         H0 = _outputs(X, ref, self.plant, v_ref,
-                      horizon_speed_profile_enabled=self.horizon_speed_profile_enabled,
                       friction_circle_enabled=self.friction_circle_enabled)
         n_rows = H0.shape[1]
         C = np.empty((X.shape[0], n_rows, NX))
@@ -1391,37 +1411,79 @@ class NMPCController:
             Xp = X.copy()
             Xp[:, j] += _FD_EPS_X[j]
             Hp = _outputs(Xp, ref, self.plant, v_ref,
-                         horizon_speed_profile_enabled=self.horizon_speed_profile_enabled,
                          friction_circle_enabled=self.friction_circle_enabled)
             C[:, :, j] = (Hp - H0) / _FD_EPS_X[j]
         return H0, C
 
-    def _cost(self, X, U, H, ref=None):
+    def _r_delta_stage0(self, X):
+        """
+        Stage 0's steering-effort weight for this tick: r_delta normally,
+        scaled up while the car is slow, FADED OUT over a speed band rather
+        than switched off at a threshold.
+
+        At v_x = 0 steering cannot move the car (r_kin = v_x*tan(d)/L = 0,
+        dynamic branch blended out), but the SQP minimises one cost summed
+        over the whole horizon, and the predicted v_x leaves zero by stage 1.
+        Nothing else in the objective distinguishes a stage that cannot act
+        from one that will act shortly, so without this the optimiser
+        pre-commits U[0] toward whatever helps the later stages and the car
+        launches already steering. Keyed on the MEASURED speed (X[0] is x0),
+        never a predicted one.
+
+        The multiplier is held at nmpc_standstill_steer_r_scale below
+        nmpc_standstill_speed, then ramped linearly to 1.0 (no damping) at
+        nmpc_standstill_fade_speed. A hard release instead of a fade puts the
+        full weight change into a single tick exactly when the car is most
+        sensitive: measured live, steering ran from -1.8 to -12.9 deg over
+        the six ticks immediately after the release, roughly -2 deg/tick
+        sustained, which is the launch excursion this damping exists to
+        prevent, reappearing a moment later. Setting fade_speed <= speed
+        restores the old hard cutoff.
+
+        Shared by _solve_step (which builds the QP) and _cost (which scores
+        backtracking trials) so the two cannot disagree -- scoring a
+        different objective from the one the QP minimised is exactly the
+        failure mode _cost's own _Rr_flat comment below warns about.
+        """
+        if not self.standstill_steer_damp_enabled:
+            return self.r_delta
+        v = float(X[0, IDX_VX])
+        lo, hi = self.standstill_speed, self.standstill_fade_speed
+        if v <= lo:
+            scale = self.standstill_steer_r_scale
+        elif v >= hi or hi <= lo:
+            scale = 1.0
+        else:
+            frac = (v - lo) / (hi - lo)
+            scale = self.standstill_steer_r_scale + (
+                1.0 - self.standstill_steer_r_scale) * frac
+        return self.r_delta * scale
+
+    def _cost(self, X, U, H):
         """
         True (nonlinear) cost of a candidate trajectory — used only by the
         backtracking test, so it must match the QP's objective term for term:
         weighted output residuals with the terminal scale, input effort with
-        the accel/brake split, input rate against u_prev, the soft-track
+        the accel/brake split, input rate against u_prev, and the soft-track
         slack penalty at its optimal value for this trajectory (max(0, |e_y| -
-        halfwidth), which is what the QP's slack would be), and (when
-        speed_limit_enabled) the analogous soft speed-limit slack penalty
-        (max(0, v_x - v_max(s)), the slack_v the QP would choose).
+        halfwidth), which is what the QP's slack would be).
 
         H may carry NH_FRICTION extra (unweighted) columns when
         friction_circle_enabled -- sliced down to the original NH cost rows
         here so w (len NH) always broadcasts correctly and the objective
         itself never includes the friction rows, per the feature's spec.
-
-        ref is only required when self._use_vslack; omitted (None) is fine
-        for callers that never enable that flag, matching every other
-        experimental feature's opt-in-only signature footprint.
         """
         w = self.w_out
         H = H[:, :NH]
         stage = float(np.sum(w * H[:-1] ** 2)) + float(
             self.terminal_scale * np.sum(w * H[-1] ** 2))
         a = U[:, 1]
+        # Stage 0's steering weight can differ from the rest (standstill
+        # damping) -- see _r_delta_stage0. Written as the flat term plus a
+        # stage-0 correction so the flag-off path is bit-identical to the
+        # original single-multiply expression.
         eff = float(self.r_delta * np.sum(U[:, 0] ** 2)
+                    + (self._r_delta_stage0(X) - self.r_delta) * U[0, 0] ** 2
                     + self.r_a_accel * np.sum(np.maximum(a, 0.0) ** 2)
                     + self.r_a_brake * np.sum(np.minimum(a, 0.0) ** 2))
         du = np.vstack([U[0] - self._u_prev, np.diff(U, axis=0)])
@@ -1448,12 +1510,7 @@ class NMPCController:
             over = np.maximum(np.abs(X[1:, IDX_EY]) - self.nmpc.nmpc_track_halfwidth,
                               0.0)
             slack = float(self.nmpc.nmpc_slack_weight * np.sum(over ** 2))
-        vslack = 0.0
-        if self._use_vslack and ref is not None and ref.v_target is not None:
-            v_max = ref.v_ref_at(X[1:, IDX_S]) + self.speed_limit_margin
-            over_v = np.maximum(X[1:, IDX_VX] - v_max, 0.0)
-            vslack = float(self.speed_limit_slack_weight * np.sum(over_v ** 2))
-        return stage + eff + rate + jerk + slack + vslack
+        return stage + eff + rate + jerk + slack
 
     def _solve_step(self, X, U, ref, v_ref):
         """
@@ -1472,8 +1529,8 @@ class NMPCController:
         """
         N = self.N
         qp = self._qp
-        n_du, n_slack, n_vslack, nz, n_rows = (
-            qp['n_du'], qp['n_slack'], qp['n_vslack'], qp['nz'], qp['n_rows'])
+        n_du, n_slack, nz, n_rows = (
+            qp['n_du'], qp['n_slack'], qp['nz'], qp['n_rows'])
 
         A_k, B_k = self._jacobians(X, U, ref)
         H, C = self._output_jacobians(X, ref, v_ref)
@@ -1500,6 +1557,10 @@ class NMPCController:
         # because the sign is known at linearisation time.
         ru = np.empty((N, NU))
         ru[:, 0] = self.r_delta
+        # Stage 0 only, and only while measurably stationary -- see
+        # _r_delta_stage0. _cost applies the same weight, so the line search
+        # scores the objective this QP actually minimises.
+        ru[0, 0] = self._r_delta_stage0(X)
         ru[:, 1] = np.where(U[:, 1] >= 0.0, self.r_a_accel, self.r_a_brake)
         ru_flat = ru.reshape(-1)
         u_flat = U.reshape(-1)
@@ -1530,9 +1591,6 @@ class NMPCController:
         if n_slack:
             idx = np.arange(n_du, n_du + n_slack)
             P_dense[idx, idx] = 2.0 * self.nmpc.nmpc_slack_weight
-        if n_vslack:
-            idx = np.arange(n_du + n_slack, nz)
-            P_dense[idx, idx] = 2.0 * self.speed_limit_slack_weight
 
         A_dense = np.zeros((n_rows, nz))
         l = np.empty(n_rows)
@@ -1598,29 +1656,6 @@ class NMPCController:
             A_dense[rf0 + N:rf0 + 2 * N, :n_du] = dF_dU[:, 1, :]
             l[rf0 + N:rf0 + 2 * N] = -F_max - F0[:, 1]
             u[rf0 + N:rf0 + 2 * N] = F_max - F0[:, 1]
-
-        if n_vslack:
-            rv0 = 2 * n_du + (3 * N if n_slack else 0) + n_fric
-            S_vx = S[1:, IDX_VX, :]              # (N, n_du)
-            vx = X[1:, IDX_VX]
-            if ref.v_target is not None:
-                v_max = ref.v_ref_at(X[1:, IDX_S]) + self.speed_limit_margin
-            else:
-                # No profile supplied this tick (e.g. live-planner mode with
-                # no precomputed speed CSV) -- leave the rows inert rather
-                # than tightening around whatever v_max happened to be last,
-                # same "no-op when data is absent" contract as
-                # horizon_speed_profile_enabled's own ref.v_target gate.
-                v_max = np.full(N, np.inf)
-            # (6) v_x_k - slack_v_k <= v_max_k.
-            A_dense[rv0:rv0 + N, :n_du] = S_vx
-            A_dense[rv0:rv0 + N, n_du + n_slack:nz] = -np.eye(N)
-            l[rv0:rv0 + N] = -np.inf
-            u[rv0:rv0 + N] = v_max - vx
-            # (7) slack_v >= 0.
-            A_dense[rv0 + N:rv0 + 2 * N, n_du + n_slack:nz] = np.eye(N)
-            l[rv0 + N:rv0 + 2 * N] = 0.0
-            u[rv0 + N:rv0 + 2 * N] = np.inf
 
         qp['prob'].update(
             Px=P_dense[qp['p_rows'], qp['p_cols']],
@@ -1697,7 +1732,12 @@ class NMPCController:
         t0 = time.perf_counter()
 
         # Same first-order target-speed filter as MPCController.compute().
-        alpha = 0.08
+        # Now a tunable launch param (nmpc_v_des_filter_alpha) rather than a
+        # hardcoded constant -- see that field's own docstring in
+        # nmpc_params.py for the mechanism and the 2026-09-15 live-tuning
+        # history (raising it has repeatedly made overall performance
+        # worse, not better; see planner_only_lap2_corner_spinout.md).
+        alpha = float(self.nmpc.nmpc_v_des_filter_alpha)
         if self._v_des_filtered is None:
             self._v_des_filtered = desired_speed
         self._v_des_filtered += alpha * (desired_speed - self._v_des_filtered)
@@ -1794,6 +1834,33 @@ class NMPCController:
         else:
             n_delay = 0
 
+        # ── Latency compensation (nonlinear rollforward, EXPERIMENTAL) ───
+        # Same mechanism as delay compensation above, but forward past "now"
+        # instead of backward from a stale pose: the solve about to run
+        # takes real wall-clock time, so u[0] does not land until roughly
+        # nmpc_latency_compensation_ms after x0 was measured. Rolled forward
+        # holding the LAST APPLIED command constant (self._u_prev), not a
+        # guessed future command, since the future command is exactly what
+        # this solve is trying to determine. See nmpc_params.py's field
+        # docstring for why this is off by default.
+        n_latency = 0
+        if self.nmpc.nmpc_latency_compensation_enabled:
+            cap = self.params.max_delay_compensation_steps
+            # math.floor(x + 0.5), not round(): Python's round() is
+            # round-half-to-even, so exactly 25 ms at dt=0.05 s (0.5 steps)
+            # rounds to 0, silently disabling this at its own default value
+            # -- caught live 2026-09-15 (n_latency logged 0 for an entire
+            # run at the 25 ms default).
+            n_latency = int(np.clip(
+                math.floor(self.nmpc.nmpc_latency_compensation_ms * 1e-3 / self.dt + 0.5),
+                0, cap))
+            if n_latency > 0:
+                xk = [float(v) for v in x0]
+                for _ in range(n_latency):
+                    xk = _step_scalar(xk, self._u_prev, ref, self.plant, self.dt,
+                                      self.nmpc.nmpc_rk_substeps)
+                x0 = np.array(xk)
+
         # ── Warm start: shift the previous solution one step ────────────
         if self._have_warm_start:
             U = np.vstack([self._U[1:], self._U[-1:]])
@@ -1819,9 +1886,8 @@ class NMPCController:
                 np.array([m_rrate_zone, 1.0]), self.N)
             self._ErE = self._E.T @ (self._Rr_flat[:, None] * self._E)
         H = _outputs(X, ref, self.plant, v_ref,
-                     horizon_speed_profile_enabled=self.horizon_speed_profile_enabled,
                      friction_circle_enabled=self.friction_circle_enabled)
-        cost = self._cost(X, U, H, ref)
+        cost = self._cost(X, U, H)
         iters = 0
         status = 'warm-start-only'
         for _ in range(max(1, int(self.nmpc.nmpc_sqp_iters))):
@@ -1837,9 +1903,8 @@ class NMPCController:
                 U_try = np.clip(U + step * dU, self.u_min, self.u_max)
                 X_try = self._rollout(x0, U_try, ref)
                 H_try = _outputs(X_try, ref, self.plant, v_ref,
-                                 horizon_speed_profile_enabled=self.horizon_speed_profile_enabled,
                                  friction_circle_enabled=self.friction_circle_enabled)
-                cost_try = self._cost(X_try, U_try, H_try, ref)
+                cost_try = self._cost(X_try, U_try, H_try)
                 # ONLY a genuine improvement is accepted. Accepting the
                 # smallest trial regardless (an earlier version of this loop
                 # did, "so a tick always makes progress") means a bad search
@@ -1917,6 +1982,7 @@ class NMPCController:
             'Rrate_steer_corner_blend': rrate_steer_current,
             'pose_age_s': float(pose_age_s),
             'n_delay': int(n_delay),
+            'n_latency': int(n_latency),
             'solve_ms': float(solve_ms),
             'car_speed': float(car_speed),
             'desired_speed': float(v_ref),
@@ -1936,20 +2002,18 @@ class NMPCController:
             'nmpc_pred_ey_end': float(X[-1, IDX_EY]),
             'nmpc_pred_epsi_end': float(X[-1, IDX_EPSI]),
             'nmpc_pred_ey_max_abs': float(np.abs(X[:, IDX_EY]).max()),
+            # Full predicted horizon in Cartesian (x, y), for live
+            # visualisation only (live_viz.py): not logged to CSV (that's
+            # what the scalar nmpc_pred_* summaries above are for), and
+            # cheap relative to the solve itself, one xy_at() call over N
+            # points already computed by the rollout.
+            'nmpc_pred_xy': ref.xy_at(X[:, IDX_S], X[:, IDX_EY]),
         }
         if self.friction_circle_enabled:
             # H's two extra (unweighted) rows -- realized per-axle force at
             # the FINAL accepted trajectory, see _outputs' docstring.
             self.last_telemetry['nmpc_fyf_max_abs'] = float(np.abs(H[:, NH]).max())
             self.last_telemetry['nmpc_fyr_max_abs'] = float(np.abs(H[:, NH + 1]).max())
-        if self.speed_limit_enabled and ref.v_target is not None:
-            # Worst predicted overspeed vs the profile at the FINAL accepted
-            # trajectory -- 0 means the soft bound was never active this
-            # tick, a positive value shows how much slack the QP actually
-            # needed (same diagnostic role as nmpc_pred_ey_max_abs above).
-            v_max_final = ref.v_ref_at(X[1:, IDX_S]) + self.speed_limit_margin
-            self.last_telemetry['nmpc_speed_limit_over_max'] = float(
-                np.maximum(X[1:, IDX_VX] - v_max_final, 0.0).max())
         return steering, throttle, brake
 
     def _path_reference(self, path) -> PathReference | None:
@@ -1969,6 +2033,7 @@ class NMPCController:
             return self._static_ref
         if self._ref is not None and self._ref_signature == sig:
             return self._ref
+        prev = self._ref
         try:
             self._ref = PathReference(
                 path,
@@ -1980,4 +2045,38 @@ class NMPCController:
         except (ValueError, IndexError):    # pragma: no cover - defensive
             return None
         self._ref_signature = sig
+        self._rate_limit_kappa(self._ref, prev)
         return self._ref
+
+    def _rate_limit_kappa(self, ref: PathReference, prev: PathReference | None) -> None:
+        """
+        Cap kappa(s)'s tick-to-tick change against the LAST rebuild's profile,
+        live-planner mode only (never called for a static/precomputed path,
+        see set_static_path()'s own branch in _path_reference).
+
+        Mirrors V_CURV_FALL_RATE (mpc_params.py/mpc_controller.py) but for
+        the curvature PROFILE the NMPC's whole horizon predicts against,
+        rather than a single scalar speed target. See
+        NMPCParams.nmpc_kappa_rate_max's docstring for why: a live-planner
+        path's re-resolved corner geometry can move an order of magnitude
+        faster tick to tick than a precomputed one, and that's exactly what
+        a rejected SQP step (which holds this tick's plan unchanged for
+        50 ms) is most exposed to.
+
+        Mutates `ref.kappa`/`ref._k_list` in place and re-derives every
+        cached field kappa_scalar's fast path reads, so this MUST run before
+        anything downstream (kappa_now, the SQP rollout, telemetry) touches
+        `ref`. `ref.psi_ref` is deliberately left untouched: it comes from
+        the same smoothed samples as kappa (see PathReference's own
+        docstring on why they must describe one reference), so rate-limiting
+        kappa alone without also touching psi_ref would desynchronise the
+        two and reintroduce the e_psi/e_psi_dot mismatch that motivated
+        computing them together in the first place.
+        """
+        rate = float(self.nmpc.nmpc_kappa_rate_max)
+        if rate <= 0.0 or prev is None:
+            return
+        max_step = rate * self.dt
+        prev_on_grid = np.interp(ref.s_kappa, prev.s_kappa, prev.kappa)
+        ref.kappa = np.clip(ref.kappa, prev_on_grid - max_step, prev_on_grid + max_step)
+        ref._k_list = [float(v) for v in np.atleast_1d(ref.kappa)]

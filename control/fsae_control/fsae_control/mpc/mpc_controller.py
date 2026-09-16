@@ -53,6 +53,10 @@ being selected by two separate launchable executables.
                                                                              (standalone_output=true only)
     out  /fsae/control/cmd_vel               ackermann_msgs/AckermannDriveStamped  (standalone_output=false)
     out  /fsds/control_command                fs_msgs/ControlCommand               (standalone_output=true)
+    out  /fsae/control/static_reference_path  geometry_msgs/PoseArray        one-shot, TRANSIENT_LOCAL (path_map_path
+                                                                             set only) — self._static_path, for
+                                                                             live_viz.py's debug display only, not
+                                                                             read by anything in the control loop
 
 CONTROL LOOP PHASES (see _control_step)
 ----------------------------------------------------------------------------
@@ -82,12 +86,12 @@ import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from ackermann_msgs.msg import AckermannDriveStamped
 from fs_msgs.msg import ControlCommand, GoSignal
 from fsae_interfaces.msg import ConeDetection
-from geometry_msgs.msg import PoseArray, PoseStamped
+from geometry_msgs.msg import Pose, PoseArray, PoseStamped
 from nav_msgs.msg import Odometry
 from rclpy.time import Time
 
@@ -118,6 +122,67 @@ PATH_TIMEOUT         = 0.5    # s — reset the MPC if no fresh trajectory withi
 # never rate-limited; delaying a genuine brake request is the failure this is
 # meant to prevent.
 SPEED_TARGET_RISE_RATE = 7.0
+
+# Max speed error (m/s) the rise limiter is allowed to open up before it stops
+# ramping and waits for the car. Mirrors sim/rollout_core.py's constant of the
+# same name — keep in sync.
+#
+# SPEED_TARGET_RISE_RATE alone assumes the car can accelerate at that rate. From
+# a standing start it cannot: the car does not break static friction for ~1 s,
+# so the target ramps to ~7 m/s while the car is still stationary and banks a
+# deficit it spends the next second chasing. The NMPC minimises one scalar cost
+# over the horizon, so a speed error that large swamps the lateral term and the
+# optimiser trades e_y away for speed it was never going to get — measured live
+# as a sideways excursion at launch that self-corrects once the car is rolling.
+#
+# Capping the DEFICIT rather than gating on measured speed is deliberate. A gate
+# of the form "hold the target while v_actual is near zero" deadlocks: no target
+# means no speed error, which means no throttle, which means the car never moves
+# and the gate never opens. Holding at v_actual + DEFICIT_MAX always leaves a
+# real speed error, so throttle still commands and the launch still happens; the
+# ramp resumes by itself as the car closes the gap.
+#
+# Not specific to launch: the same rule stops the target running away after a
+# spin or a heavy brake, for the same reason.
+SPEED_TARGET_DEFICIT_MAX = 2.5
+# Max rate (m/s^2) at which curvature_speed()'s OWN output (v_curv, the live
+# per-tick geometry-derived target, NOT the precomputed-track oracle lookup)
+# may fall, applied before the tracking-error gate. curvature_speed() is a
+# pure per-tick function with no memory of its own last output, and its
+# docstring already documents that the live planner path (re-fit every
+# frame) carries a few cm of lateral wiggle that survives its internal
+# denoising often enough to swing v_curv by 3-10 m/s in a single 50 ms tick
+# even on a straight or gentle bend (measured live 2026-09-15, see
+# planner_only_speed_target_oscillation.md) -- SPEED_TARGET_RISE_RATE does
+# not catch this, it only bounds the composed target's RISE, and this same
+# noise is the actual DROP.
+#
+# FIRST attempt (2026-09-15) sized this at A_BRAKE_PLAN (control_utils.py,
+# 5.0 m/s^2), reasoning that curvature_speed()'s own braking-distance
+# propagation already assumes that deceleration is enough to plan a genuine
+# corner's slowdown, so a cap at that rate should never bind on real
+# braking. That reasoning had a gap: it assumes the target had the full
+# scan-window distance to ramp down over, but the corner speed can firm up
+# to its true low value only once the car is already close (after the noisy
+# early-window estimate settles), leaving less runway than the planning
+# assumption presupposes. Measured live the same day: with the 5.0 cap in
+# place, the car entered the first corner at ~17 m/s and took 3+ seconds to
+# reach the ~2.5 m/s target, spinning out well before it got there
+# (e_psi -> -98 deg, stalled). 5.0 m/s^2 was capping GENUINE required
+# braking, not just noise.
+#
+# Sized instead at MAX_BRAKE (mpc_core.py, 7.0 m/s^2, matching
+# vehicle_physics.max_accel_brake): the car's actual achievable braking
+# deceleration, not a conservative planning-time assumption. This still
+# smooths a single noisy tick's collapse (which asks for far more than 7.0
+# m/s^2 worth of change) across a few ticks, but no longer throttles a
+# genuine hard-braking need down below what the car can physically do.
+V_CURV_FALL_RATE = 7.0
+# TEMPORARY: disables curvature_speed() in the live (no precomputed-profile)
+# branch below, falling back to a flat v_max instead. Set False to restore
+# live curvature-based speed. Does not affect the precomputed-profile branch
+# (map_path set) at all -- that path never calls curvature_speed().
+DISABLE_LIVE_CURVATURE_SPEED = False
 # Max rate (gate-units/s, gate in [floor, 1.0]) at which
 # tracking_error_speed_gate()'s output may change per tick, in EITHER
 # direction. Without this, a fast-growing e_y sweeping through the gate's
@@ -316,9 +381,64 @@ class MPCControllerNode(Node):
         else:
             self.pub_cmd = self.create_publisher(AckermannDriveStamped, '/fsae/control/cmd_vel', 10)
 
+        # NMPC's predicted horizon (Cartesian, from last_telemetry['nmpc_pred_xy'],
+        # see nmpc_core.py's xy_at()), for live_viz.py only -- not read by
+        # anything else in this stack, empty/absent whenever the LTV-QP path
+        # is in use (last_telemetry never has this key in that case).
+        self.pub_nmpc_pred_path = self.create_publisher(
+            PoseArray, '/fsae/control/nmpc_predicted_path', 10)
+
         self._path: np.ndarray = (
             self._static_path if self._static_path is not None else np.empty((0, 2))
         )
+
+        # live_viz.py had no way to show the ACTUAL reference being driven
+        # against in precomputed-path mode. THREE earlier attempts got this
+        # wrong before landing here. One and two tried publishing the static
+        # path onto /fsae/planning/selected_trajectory (the live planner's
+        # own topic) to fix live_viz.py's subscription to it: that topic's
+        # other publisher, centerline_planner.py, had no use_precomputed_path
+        # awareness and used to keep running/publishing regardless (no
+        # gating existed in sim.launch.py, unlike e.g. cone_recorder's
+        # IfCondition), so a one-shot publish only won a race against it for
+        # an instant, and publishing an ~1000-point PoseArray every 50 ms
+        # tick to try to keep winning measurably inflated solve_ms and
+        # caused a genuine live stall. Fixed the live-planner side of that
+        # at the source (sim.launch.py now gates planning.launch.py's
+        # inclusion on use_precomputed_path, so the planner never runs in
+        # this mode) -- but attempt three's one-shot-after-a-fixed-delay
+        # publish, still onto the SAME shared topic, STILL showed nothing
+        # live: launch_all.sh starts live_viz.py well before this node even
+        # exists (see its own "topics simply have no data yet" comment), so
+        # a plain VOLATILE publish is a genuine race against ROS2 discovery
+        # completing on live_viz.py's side with no guaranteed margin, timer
+        # delay or not -- confirmed live (a standalone repro showed the
+        # message correctly logged as sent by this node, but never observed
+        # by a subscriber that started earlier).
+        #
+        # Fixed properly with its OWN topic + TRANSIENT_LOCAL durability,
+        # not a bigger delay: /fsae/planning/selected_trajectory still also
+        # carries the LIVE planner's own (VOLATILE) output in non-
+        # precomputed mode, and a TRANSIENT_LOCAL subscriber cannot match a
+        # VOLATILE publisher under ROS2's QoS compatibility rules -- putting
+        # the static path there under TRANSIENT_LOCAL would have broken
+        # live-planner-mode viewing instead. A separate topic sidesteps that
+        # entirely. TRANSIENT_LOCAL removes the discovery-timing race
+        # itself: ROS2 guarantees a late-joining subscriber (also
+        # TRANSIENT_LOCAL, see live_viz.py's matching subscription)
+        # receives the publisher's last message regardless of when it
+        # connects. See planner_only_lap2_corner_spinout.md.
+        self._static_path_pub = None
+        if self._static_path is not None:
+            static_path_qos = QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
+            self._static_path_pub = self.create_publisher(
+                PoseArray, '/fsae/control/static_reference_path', static_path_qos)
+            self._publish_static_path_once()
         # Static path never goes stale (no topic to lose) — treated as
         # "always fresh" by never being touched by the staleness check below,
         # rather than by faking a stamp that keeps advancing on its own.
@@ -338,6 +458,11 @@ class MPCControllerNode(Node):
         # None = no history yet, so the first gate value passes through
         # unlimited (nothing to ramp from).
         self._gate_prev: float | None = None
+        # Previous tick's LIVE curvature_speed() output, for V_CURV_FALL_RATE
+        # below. Only used in that branch (never the precomputed-track oracle
+        # lookup); None = no history yet, so the first value passes through
+        # unlimited.
+        self._v_curv_prev: float | None = None
 
         dt = 1.0 / CONTROL_HZ
         # Controller selection. use_nmpc=False (default) constructs exactly
@@ -366,20 +491,7 @@ class MPCControllerNode(Node):
             # CornerMap -- without this call it would rebuild that on the
             # first tick instead (correct, just not free).
             if self._static_path is not None:
-                # self._speed_profile (path_X, path_Y, path_V), when loaded,
-                # is a SEPARATE array from self._static_path -- a different
-                # CSV load entirely (see load_speed_profile_csv vs
-                # load_path_profile_csv above) -- so it is passed through
-                # explicitly rather than assumed identical. No-op unless
-                # nmpc_horizon_speed_profile_enabled is also set.
-                if self._speed_profile is not None:
-                    sp_x, sp_y, sp_v = self._speed_profile
-                    self._mpc.set_static_path(
-                        self._static_path,
-                        path_v_xy=np.column_stack([sp_x, sp_y]), path_v=sp_v,
-                    )
-                else:
-                    self._mpc.set_static_path(self._static_path)
+                self._mpc.set_static_path(self._static_path)
         else:
             self._mpc = MPCController(dt=dt, N=35, params=mpc_params)
 
@@ -449,6 +561,21 @@ class MPCControllerNode(Node):
             [[p.position.x, p.position.y] for p in msg.poses], dtype=np.float64
         ) if msg.poses else np.empty((0, 2))
         self._path_stamp = self.get_clock().now()
+
+    def _publish_static_path_once(self) -> None:
+        """
+        One-shot: see the comment on _static_path_pub's construction for why
+        TRANSIENT_LOCAL durability (not timing) is what makes "once" safe
+        for a subscriber that connects later.
+        """
+        pose_array = PoseArray()
+        pose_array.header.stamp = self.get_clock().now().to_msg()
+        pose_array.header.frame_id = 'map'
+        for x, y in self._static_path:
+            pose = Pose()
+            pose.position.x, pose.position.y = float(x), float(y)
+            pose_array.poses.append(pose)
+        self._static_path_pub.publish(pose_array)
 
     def _odom_cb(self, msg: Odometry) -> None:
         # v.x/v.y are body-frame (sim_perception.py relays them unrotated
@@ -525,6 +652,7 @@ class MPCControllerNode(Node):
             self._delta_filt = None   # drop filter state with the MPC warm-start
             self._v_des_prev = None   # don't ramp from a pre-fail-safe target
             self._gate_prev = None    # ditto for the tracking-error speed gate
+            self._v_curv_prev = None  # ditto for the live curvature_speed() fall limiter
             if self._standalone_output:
                 # Explicit brake command — this node owns braking, unlike
                 # false mode below, which publishes nothing and relies on
@@ -568,6 +696,14 @@ class MPCControllerNode(Node):
                     safety=self._dynamic_cap_safety,
                 )
                 v_curv = min(v_curv, v_cap)
+        elif DISABLE_LIVE_CURVATURE_SPEED:
+            # TEMPORARY: curvature_speed() disabled per-user-request while its
+            # live-mode oscillation (see V_CURV_FALL_RATE's comment above,
+            # planner_only_speed_target_oscillation.md) is investigated. Flat
+            # v_max fallback, no braking-distance/corner awareness at all --
+            # do not drive an unmapped track fast with this on.
+            v_curv = self._v_max
+            self._v_curv_prev = v_curv
         else:
             path_ahead = self._path
             if len(path_ahead) > 2:
@@ -576,6 +712,18 @@ class MPCControllerNode(Node):
                     path_ahead = path_ahead[i_near:]
 
             v_curv = curvature_speed(path_ahead, v_max=self._v_max, v_min=self._v_min)
+
+            # curvature_speed() has no memory of its own last output and the
+            # live path is re-fit every tick, so a single noisy sample can
+            # swing v_curv down (never up, in this direction rises are what
+            # the corner needs) far faster than any real corner's own
+            # braking-distance curve would ask for -- see V_CURV_FALL_RATE's
+            # own comment. The precomputed-track oracle branch above does not
+            # need this: it is not re-derived from a noisy live path.
+            if self._v_curv_prev is not None:
+                max_fall = V_CURV_FALL_RATE / CONTROL_HZ
+                v_curv = max(v_curv, self._v_curv_prev - max_fall)
+            self._v_curv_prev = v_curv
 
         # Gate's own output is rate-limited (GATE_RATE_LIMIT) so its
         # tick-to-tick change is bounded — see that constant's own comment.
@@ -600,6 +748,15 @@ class MPCControllerNode(Node):
             self._v_des_prev = self._car_speed
         desired_speed = min(desired_speed,
                             self._v_des_prev + SPEED_TARGET_RISE_RATE / CONTROL_HZ)
+        # Stop ramping once the target has run this far ahead of the car; see
+        # SPEED_TARGET_DEFICIT_MAX. Never DROPS the target (max against the
+        # previous value), so a car that is merely slow does not get the target
+        # dragged down to meet it, and a genuine brake request still passes
+        # through the min() above untouched.
+        if desired_speed - self._car_speed > SPEED_TARGET_DEFICIT_MAX:
+            desired_speed = min(desired_speed,
+                                max(self._v_des_prev,
+                                    self._car_speed + SPEED_TARGET_DEFICIT_MAX))
         self._v_des_prev = desired_speed
 
         # Age of the pose the MPC is about to solve against — how long ago it
@@ -619,6 +776,18 @@ class MPCControllerNode(Node):
             car_speed=self._car_speed, desired_speed=desired_speed,
             car_yaw_rate=self._car_yaw_rate, pose_age_s=pose_age_s, car_vy=self._car_vy,
         )
+        pred_xy = self._mpc.last_telemetry.get('nmpc_pred_xy')
+        if pred_xy is not None:
+            pred_x, pred_y = pred_xy
+            pose_array = PoseArray()
+            pose_array.header.stamp = self.get_clock().now().to_msg()
+            pose_array.header.frame_id = 'map'
+            for x, y in zip(pred_x, pred_y):
+                pose = Pose()
+                pose.position.x, pose.position.y = float(x), float(y)
+                pose_array.poses.append(pose)
+            self.pub_nmpc_pred_path.publish(pose_array)
+
         if self._standalone_output:
             steering, throttle, brake = mpc_steering, mpc_throttle, mpc_brake
         else:
@@ -646,6 +815,7 @@ class MPCControllerNode(Node):
                     self._mpc.reset()
                     self._v_des_prev = None   # see the stale-path reset above
                     self._gate_prev = None
+                    self._v_curv_prev = None
                     self._cone_reset_done = True
                 self.get_logger().warn(
                     f'Cone proximity brake active ({self._cone_brake_duration:.2f} s).',

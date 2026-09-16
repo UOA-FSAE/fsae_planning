@@ -131,16 +131,12 @@ ADAPTIVE_COLUMNS = (
     'nmpc_pred_ey_end',        # predicted e_y at the end of the horizon (m)
     'nmpc_pred_epsi_end',      # predicted e_psi at the end of the horizon (rad)
     'nmpc_pred_ey_max_abs',    # peak predicted |e_y| anywhere in the horizon (m)
+    'n_latency',               # nmpc_latency_compensation_enabled's rollforward depth (0 when off)
     # nmpc_friction_circle_enabled only (empty otherwise, same convention as
     # every other column above); see `docs/reference/README.md`'s "Three
     # MPCC-inspired additions" section.
     'nmpc_fyf_max_abs',        # peak |front-axle lateral tyre force| anywhere in the horizon (N)
     'nmpc_fyr_max_abs',        # peak |rear-axle lateral tyre force| anywhere in the horizon (N)
-    # nmpc_speed_limit_enabled only (empty otherwise). CAUTION: a new
-    # feature-gated telemetry column needs adding to this tuple explicitly
-    # before it's live-tested, or last_telemetry silently drops it from the
-    # CSV -- this has happened more than once.
-    'nmpc_speed_limit_over_max',  # peak predicted v_x above v_max(s)+margin anywhere in the horizon (m/s); 0 = bound never active
 )
 
 
