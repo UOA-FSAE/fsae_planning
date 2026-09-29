@@ -1,21 +1,24 @@
 """
 Boundary detection: cone-wall mesh centreline planner.
 
-build_path_walls  — the planner.  Delaunay-triangulates every known cone and
-                    keeps the same-colour edges as a wall mesh (see
-                    build_wall_segments_delaunay); each MIXED triangle (one
-                    colour split 2-1) contributes its 2 cross-colour edges
-                    directly as a centreline "gate pair" (see
-                    _build_corridor_path), which is wall-safe by
+build_path_walls  — the planner.  Builds ONE track mesh per tick (see
+                    track_mesh.build_track_mesh: a Delaunay triangulation of
+                    every known cone, repaired so each colour's boundary line
+                    is an actual mesh edge) and reads everything off it: the
+                    same-colour edges are the wall mesh, and each MIXED
+                    triangle (one colour split 2-1) contributes its 2
+                    cross-colour edges directly as a centreline "gate pair"
+                    (see _build_corridor_path). Because walls and gates are
+                    edges of the same planar triangulation, a gate can never
+                    cross a wall, and chaining gates is wall-safe by
                     construction -- a triangle's interior can't reach any
-                    other triangle's edges, so no runtime wall-crossing
-                    check is needed to chain them. The chain is clamped to a
-                    fixed arc-length horizon and smoothed into a centreline.
+                    other triangle's edges, so no runtime wall-crossing check
+                    is needed. The chain is clamped to a fixed arc-length
+                    horizon and smoothed into a centreline.
 """
 import math
 
 import numpy as np
-from scipy.spatial import Delaunay
 
 from fsae_planning.cone_sorting import filter_cones_window
 from fsae_planning.path_utils import (
@@ -23,6 +26,7 @@ from fsae_planning.path_utils import (
     DEFAULT_SMOOTH_PER_PT,
     smooth_centreline,
 )
+from fsae_planning.track_mesh import build_track_mesh, TrackMesh
 
 # ---------------------------------------------------------------------------
 # Cone-wall barrier planner
@@ -184,6 +188,7 @@ def build_wall_segments_delaunay(
     blue: np.ndarray,
     yellow: np.ndarray,
     max_dist: float = _WALL_MAX_DIST,
+    mesh: TrackMesh | None = None,
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]], list[tuple[np.ndarray, np.ndarray]]]:
     """
     Build same-colour wall segments from a Delaunay triangulation of every
@@ -218,6 +223,12 @@ def build_wall_segments_delaunay(
     convex hull or in low-density regions, so any triangulation edge longer
     than max_dist is dropped regardless of colour.
 
+    The triangulation is track_mesh.build_track_mesh -- the SAME mesh
+    build_path_walls reads its corridor gates from, including the boundary
+    repair that restores a wall edge a neighbouring leg's cone would
+    otherwise knock out (see track_mesh's module docstring). Pass `mesh` to
+    reuse one already built this tick.
+
     Falls back to the old all-pairs build_wall_segments (run separately per
     colour) if the triangulation itself cannot run at all -- fewer than 3
     total cones, or a degenerate/near-collinear point set, both of which
@@ -227,42 +238,13 @@ def build_wall_segments_delaunay(
     Returns (blue_segs, yellow_segs), matching build_wall_segments' shape so
     callers don't need to know which method produced them.
     """
-    blue = np.asarray(blue, dtype=np.float64).reshape(-1, 2)
-    yellow = np.asarray(yellow, dtype=np.float64).reshape(-1, 2)
-    points = np.vstack([blue, yellow])
-    is_blue = np.concatenate([
-        np.ones(len(blue), dtype=bool),
-        np.zeros(len(yellow), dtype=bool),
-    ])
-
-    if len(points) < 3:
+    if mesh is None:
+        mesh = build_track_mesh(blue, yellow, max_dist=max_dist)
+    if mesh is None:
+        blue = np.asarray(blue, dtype=np.float64).reshape(-1, 2)
+        yellow = np.asarray(yellow, dtype=np.float64).reshape(-1, 2)
         return build_wall_segments(blue, max_dist), build_wall_segments(yellow, max_dist)
-
-    try:
-        tri = Delaunay(points)
-    except Exception:
-        # Degenerate input (e.g. near-collinear cones on a fresh straight) --
-        # triangulation unavailable this tick.
-        return build_wall_segments(blue, max_dist), build_wall_segments(yellow, max_dist)
-
-    edges = set()
-    for simplex in tri.simplices:
-        i, j, k = int(simplex[0]), int(simplex[1]), int(simplex[2])
-        edges.add((min(i, j), max(i, j)))
-        edges.add((min(j, k), max(j, k)))
-        edges.add((min(i, k), max(i, k)))
-
-    blue_segs: list = []
-    yellow_segs: list = []
-    for i, j in edges:
-        if is_blue[i] != is_blue[j]:
-            continue  # cross-colour edge -- centreline midpoints come from _gen_midpoints, not here
-        if float(np.linalg.norm(points[i] - points[j])) > max_dist:
-            continue  # hull / low-density triangulation artifact -- safety net
-        seg = (points[i], points[j])
-        (blue_segs if is_blue[i] else yellow_segs).append(seg)
-
-    return blue_segs, yellow_segs
+    return mesh.wall_segments(max_dist)
 
 
 def debug_triangulation_edges(
@@ -271,10 +253,11 @@ def debug_triangulation_edges(
     max_dist: float = _WALL_MAX_DIST,
     mid_min: float = _WALL_MID_MIN_DELAUNAY,
     mid_max: float = _WALL_MID_MAX_DELAUNAY,
+    mesh: TrackMesh | None = None,
 ) -> list[tuple[np.ndarray, np.ndarray, str]]:
     """
-    Return every edge of the same Delaunay triangulation
-    build_wall_segments_delaunay/_build_corridor_path compute, each tagged
+    Return every edge of the track mesh build_wall_segments_delaunay/
+    _build_corridor_path read from, each tagged
     with why it was kept or dropped. Debug/viz only -- not called by the
     planner's path building; it exists so a wall- or corridor-build problem
     can be inspected directly (was the edge never in the triangulation at
@@ -292,35 +275,24 @@ def debug_triangulation_edges(
                 that length check (an implausibly short/long gate, usually
                 from a missing intermediate cone or a stray/mislabelled one).
 
+    The edges are those of track_mesh.build_track_mesh, i.e. exactly the mesh
+    build_path_walls planned on, bridges included (a bridge is tagged 'wall'
+    like any other kept same-colour edge).
+
     Returns an empty list on degenerate input (fewer than 3 cones total, or a
     triangulation-raising point set) -- same conditions
     build_wall_segments_delaunay falls back on, but there's nothing
     meaningful to tag without a triangulation to draw from.
     """
-    blue = np.asarray(blue, dtype=np.float64).reshape(-1, 2)
-    yellow = np.asarray(yellow, dtype=np.float64).reshape(-1, 2)
-    points = np.vstack([blue, yellow])
-    is_blue = np.concatenate([
-        np.ones(len(blue), dtype=bool),
-        np.zeros(len(yellow), dtype=bool),
-    ])
-
-    if len(points) < 3:
+    if mesh is None:
+        mesh = build_track_mesh(blue, yellow, max_dist=max_dist)
+    if mesh is None:
         return []
+    points, is_blue = mesh.points, mesh.is_blue
 
-    try:
-        tri = Delaunay(points)
-    except Exception:
-        return []
-
-    edges = set()
     gate_ok: dict = {}
-    for simplex in tri.simplices:
+    for simplex in mesh.simplices:
         verts = (int(simplex[0]), int(simplex[1]), int(simplex[2]))
-        i, j, k = verts
-        for e in ((min(i, j), max(i, j)), (min(j, k), max(j, k)), (min(i, k), max(i, k))):
-            edges.add(e)
-
         cross_edges = _classify_simplex(verts, is_blue)
         if cross_edges is None:
             continue
@@ -330,7 +302,7 @@ def debug_triangulation_edges(
             gate_ok[e] = gate_ok.get(e, False) or ok
 
     tagged: list[tuple[np.ndarray, np.ndarray, str]] = []
-    for i, j in edges:
+    for i, j in mesh.edges():
         if is_blue[i] != is_blue[j]:
             tag = 'mid' if gate_ok.get((i, j), False) else 'cross'
         elif float(np.linalg.norm(points[i] - points[j])) > max_dist:
@@ -545,7 +517,7 @@ def _classify_simplex(
 def _build_corridor_graph(
     points: np.ndarray,
     is_blue: np.ndarray,
-    tri: Delaunay,
+    tri: TrackMesh,
     mid_min: float,
     mid_max: float,
 ) -> tuple[dict, dict, dict, list[tuple[np.ndarray, np.ndarray]]]:
@@ -602,7 +574,7 @@ def _build_corridor_graph(
 def _walk_corridor(
     car_pos: np.ndarray,
     car_yaw: float,
-    tri: Delaunay,
+    tri: TrackMesh,
     gate_mid: dict,
     simplex_gates: dict,
     gate_simplices: dict,
@@ -639,10 +611,12 @@ def _walk_corridor(
 
     Entering the graph:
       - If the car's position lies inside a mixed (accepted) triangle
-        (tri.find_simplex), the walk starts there and heads to whichever of
+        (tri.find_simplices), the walk starts there and heads to whichever of
         its 2 gates is better aligned with prev_dir/heading -- both options
         are provably wall-safe (car_pos and either gate's midpoint are both
-        within that same convex triangle).
+        within that same convex triangle). When the car sits on an edge
+        shared by two such triangles, the one with the better-aligned gate
+        wins.
       - Otherwise (car outside the corridor mesh entirely -- common at the
         very start of a run, before enough cones are behind/around the car)
         the walk falls back to the nearest gate roughly ahead, with a
@@ -666,15 +640,23 @@ def _walk_corridor(
     current_gate = None
     visited: set = set()
 
-    s0 = int(tri.find_simplex(car_pos))
-    if s0 in simplex_gates:
-        ga, gb = simplex_gates[s0]
-        da, db = gate_mid[ga] - car_pos, gate_mid[gb] - car_pos
-        na, nb = float(np.linalg.norm(da)), float(np.linalg.norm(db))
-        cos_a = float(da @ seed_dir) / na if na > 1e-6 else -2.0
-        cos_b = float(db @ seed_dir) / nb if nb > 1e-6 else -2.0
-        current_gate = ga if cos_a >= cos_b else gb
-        visited = {s0}
+    # A car exactly on a shared edge (e.g. centred on a gate's diagonal) lies
+    # in two triangles. Starting in the one behind it heads the walk
+    # backwards and yields a 1-point path, so try every containing triangle
+    # and keep the one whose better gate points most along seed_dir.
+    best = None   # (cos, simplex, gate)
+    for s0 in tri.find_simplices(car_pos):
+        if s0 not in simplex_gates:
+            continue
+        for g in simplex_gates[s0]:
+            dg = gate_mid[g] - car_pos
+            ng = float(np.linalg.norm(dg))
+            cos_g = float(dg @ seed_dir) / ng if ng > 1e-6 else -2.0
+            if best is None or cos_g > best[0]:
+                best = (cos_g, s0, g)
+    if best is not None:
+        current_gate = best[2]
+        visited = {best[1]}
     else:
         candidates = []
         for gate, mid in gate_mid.items():
@@ -777,6 +759,7 @@ def _build_corridor_path(
     mid_min: float = _WALL_MID_MIN_DELAUNAY,
     mid_max: float = _WALL_MID_MAX_DELAUNAY,
     max_arc_length: float = _WALL_PLAN_HORIZON,
+    mesh: TrackMesh | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Build a wall-safe-by-construction centreline chain from a Delaunay
@@ -797,6 +780,14 @@ def _build_corridor_path(
     inside the walk at all, and no perpendicularity heuristic needed to
     disambiguate competing candidates, because a mixed triangle's 2 gates
     aren't competing with anything: they're just used.
+
+    The triangulation is the shared track mesh (track_mesh.build_track_mesh;
+    pass `mesh` to reuse the one build_path_walls already built for the wall
+    mesh this tick). Its boundary repair matters here: where a neighbouring
+    leg's same-colour cone sits just behind a wall, plain Delaunay would make
+    gates reach past the wall to that cone (midpoints pulled towards the
+    other leg); the repaired mesh has the real wall edge, so the gates end on
+    the real wall cones instead.
 
     Triangulates the FULL unbounded blue_cones/yellow_cones (same point set
     build_wall_segments_delaunay uses), not a look_radius-windowed subset --
@@ -827,20 +818,12 @@ def _build_corridor_path(
     if len(blue) == 0 or len(yellow) == 0:
         return np.empty((0, 2), dtype=np.float64), np.empty((0, 2), dtype=np.float64)
 
-    points = np.vstack([blue, yellow])
-    is_blue = np.concatenate([
-        np.ones(len(blue), dtype=bool),
-        np.zeros(len(yellow), dtype=bool),
-    ])
-
-    if len(points) < 3:
+    if mesh is None:
+        mesh = build_track_mesh(blue, yellow)
+    if mesh is None:
+        # Too few cones, or a degenerate (e.g. near-collinear) point set.
         return np.empty((0, 2), dtype=np.float64), np.empty((0, 2), dtype=np.float64)
-
-    try:
-        tri = Delaunay(points)
-    except Exception:
-        # Degenerate input (e.g. near-collinear cones on a fresh straight).
-        return np.empty((0, 2), dtype=np.float64), np.empty((0, 2), dtype=np.float64)
+    points, is_blue, tri = mesh.points, mesh.is_blue, mesh
 
     gate_mid, simplex_gates, gate_simplices, wall_segs = _build_corridor_graph(
         points, is_blue, tri, mid_min, mid_max,
@@ -988,8 +971,10 @@ def build_path_walls(
     """
     Build a centreline using cone-wall segments as a path barrier.
 
-    Wall segments come from a Delaunay triangulation of every known cone,
-    filtered down to same-colour edges (see build_wall_segments_delaunay) --
+    Walls and (for 'delaunay') corridor gates are read off ONE track mesh
+    (track_mesh.build_track_mesh), so they are always consistent with each
+    other. Wall segments are its same-colour edges (see
+    build_wall_segments_delaunay) --
     NOT a car-relative window. A window bounded the old all-pairs linker's
     blast radius, but it never addressed the actual failure mode (a same-
     coloured cone linking straight across the track), and pairing it with the
@@ -1037,13 +1022,16 @@ def build_path_walls(
     yellow_segs : wall segments from yellow cones (for visualisation)
     midpoints   : (M, 2) all candidate midpoints  (for visualisation)
     """
-    blue_segs, yellow_segs = build_wall_segments_delaunay(blue_cones, yellow_cones)
+    # One mesh for walls AND corridor -- see track_mesh.build_track_mesh.
+    mesh = build_track_mesh(blue_cones, yellow_cones, max_dist=_WALL_MAX_DIST)
+    blue_segs, yellow_segs = build_wall_segments_delaunay(blue_cones, yellow_cones, mesh=mesh)
     all_segs = blue_segs + yellow_segs
 
     if midpoint_method == 'delaunay':
         ordered, midpoints = _build_corridor_path(
             blue_cones, yellow_cones, car_pos, car_yaw, prev_dir=prev_dir,
             mid_min=mid_min_gate, mid_max=mid_max_gate, max_arc_length=plan_horizon,
+            mesh=mesh,
         )
     else:
         # Radius (omni) OR forward box.  The radius keeps the cones around a bend

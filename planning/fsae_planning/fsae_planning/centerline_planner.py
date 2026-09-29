@@ -45,13 +45,16 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 
+from builtin_interfaces.msg import Duration
 from fsae_interfaces.msg import Track
-from geometry_msgs.msg import Pose, PoseArray, PoseStamped
-from std_msgs.msg import Empty
+from geometry_msgs.msg import Point, Pose, PoseArray, PoseStamped, Vector3
+from std_msgs.msg import ColorRGBA, Empty
+from visualization_msgs.msg import Marker, MarkerArray
 
 from fsae_planning.boundary import (
     build_path_walls,
     build_wall_segments_delaunay,
+    debug_triangulation_edges,
     segment_crosses_walls,
     _WALL_MAX_TURN_COS,
     _WALL_MID_MIN_DELAUNAY,
@@ -63,6 +66,17 @@ from fsae_planning.path_utils import (
     build_local_path,
     DEFAULT_SMOOTH_PER_PT,
 )
+
+# Colours/widths for the /fsae/planning/debug/triangulation edge tags (see
+# boundary.debug_triangulation_edges). Kept walls and accepted midpoint
+# segments stand out; the two dropped categories are dim so they read as
+# "context", not "the answer".
+_TRI_EDGE_STYLE = {
+    'wall':  (ColorRGBA(r=0.0, g=1.0, b=0.0, a=0.9), 0.06),
+    'mid':   (ColorRGBA(r=1.0, g=0.0, b=1.0, a=0.9), 0.06),
+    'long':  (ColorRGBA(r=1.0, g=0.6, b=0.0, a=0.5), 0.03),
+    'cross': (ColorRGBA(r=0.8, g=0.8, b=0.8, a=0.35), 0.02),
+}
 
 # _planning_loop runs synchronously inside the pose-subscription callback, on
 # rclpy's default SingleThreadedExecutor (see main()) -- there is no
@@ -320,6 +334,12 @@ class CenterlinePlanner(Node):
                 'midpoints':    self.create_publisher(PoseArray, '/fsae/planning/debug/midpoints', 10),
                 'blue_walls':   self.create_publisher(PoseArray, '/fsae/planning/debug/blue_walls', 10),
                 'yellow_walls': self.create_publisher(PoseArray, '/fsae/planning/debug/yellow_walls', 10),
+                # Every edge of the wall-build Delaunay triangulation, tagged
+                # with why it was kept or dropped -- see
+                # debug_triangulation_edges. A MarkerArray (not PoseArray
+                # pairs) so each tag gets its own colour in RViz and the
+                # dashboard's track view.
+                'triangulation': self.create_publisher(MarkerArray, '/fsae/planning/debug/triangulation', 10),
             }
             self.get_logger().info('debug_viz on — publishing /fsae/planning/debug/*')
 
@@ -820,13 +840,56 @@ class CenterlinePlanner(Node):
             msg.poses.append(pose)
         return msg
 
+    def _edges_marker(self, edges: list, marker_id: int, tag: str) -> Marker:
+        """
+        LINE_LIST marker for one triangulation-edge tag (see _TRI_EDGE_STYLE),
+        in the map frame like the other debug topics.
+        """
+        color, width = _TRI_EDGE_STYLE[tag]
+        marker = Marker()
+        marker.header.frame_id = 'map'
+        marker.header.stamp    = self.get_clock().now().to_msg()
+        marker.ns     = f'triangulation_{tag}'
+        marker.id     = marker_id
+        marker.type   = Marker.LINE_LIST
+        marker.action = Marker.ADD
+        marker.pose.orientation.w = 1.0
+        marker.scale  = Vector3(x=width, y=0.0, z=0.0)
+        marker.color  = color
+        # 1.5s, not the node's own tick rate -- RViz auto-clears this marker if
+        # it isn't refreshed within its lifetime, so a short value makes ANY
+        # brief publish gap (a slow tick, see _SLOW_TICK_WARN_SEC, or normal
+        # jitter near max_track_age) show as the triangulation vanishing
+        # outright. 1.5s rides out normal jitter while still auto-clearing if
+        # the node genuinely stops.
+        marker.lifetime = Duration(sec=1, nanosec=500_000_000)
+        for p1, p2 in edges:
+            marker.points.append(Point(x=float(p1[0]), y=float(p1[1]), z=0.0))
+            marker.points.append(Point(x=float(p2[0]), y=float(p2[1]), z=0.0))
+        return marker
+
     def _publish_debug(self) -> None:
         """
-        Publish the wall mesh and candidate midpoints.
+        Publish the wall mesh, candidate midpoints, and the full wall-build
+        triangulation (all off by default).
 
         Wall segments go out as a flat PoseArray of consecutive endpoint PAIRS
         (poses 0-1 are one segment, 2-3 the next, ...).  Reusing PoseArray keeps this
         patch free of new interface definitions and rebuilds of fsae_interfaces.
+
+        The triangulation publishes one LINE_LIST marker per edge tag
+        (wall/mid/long/cross, see boundary.debug_triangulation_edges) so a
+        wall- or midpoint-build problem can be inspected directly: an expected
+        wall edge missing from 'wall' but present as 'long' means max_dist
+        trimmed it; missing from all four means the triangulation itself never
+        connected those two cones (a different cone sits between them); a
+        cross-colour edge you expected as a midpoint showing up as 'cross'
+        instead of 'mid' means its mixed triangle failed the gate length check
+        -- see boundary._build_corridor_path. The gate band passed here is this
+        node's own mid_min_gate/mid_max_gate, so the tags match what
+        build_path_walls actually did this tick. Recomputes the triangulation
+        independently of the path-building call -- an acceptable duplicate cost
+        since this is debug-only and off by default.
         """
         if not self._dbg_pubs:
             return
@@ -834,6 +897,17 @@ class CenterlinePlanner(Node):
         for key, segs in (('blue_walls', self._blue_segs), ('yellow_walls', self._yellow_segs)):
             flat = [pt for seg in segs for pt in seg]
             self._dbg_pubs[key].publish(self._pose_array(flat))
+
+        tagged = debug_triangulation_edges(
+            self._blue_cones, self._yellow_cones,
+            mid_min=self._mid_min_gate,
+            mid_max=self._mid_max_gate,
+        )
+        markers = MarkerArray()
+        for i, tag in enumerate(('wall', 'mid', 'long', 'cross')):
+            edges = [(p1, p2) for p1, p2, t in tagged if t == tag]
+            markers.markers.append(self._edges_marker(edges, i, tag))
+        self._dbg_pubs['triangulation'].publish(markers)
 
 
 def main(args=None):
