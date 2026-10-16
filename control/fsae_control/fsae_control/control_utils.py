@@ -33,7 +33,7 @@ class StanleyController:
     """
     Stanley path-tracking steering controller (Thrun et al., DARPA 2005).
 
-    δ = θ_e + arctan(k_cte · e / (v + k_soft))
+    δ = θ_e + arctan(k_cte · e / (v + k_soft)) − k_d · ω
 
     θ_e — heading error: path tangent angle minus car yaw (rad).
           Positive when path turns left relative to the car.
@@ -42,10 +42,10 @@ class StanleyController:
           the RIGHT of the path.
     v   — car speed (m/s); k_soft prevents division by zero at standstill.
 
-    Sign convention (FSDS ENU: x forward, y left):
-      output > 0  → steer right
-      output < 0  → steer left
-      output ∈ [-1, 1]
+    Sign convention (ENU: x forward, y left):
+      output is the front-wheel steering ANGLE in radians, positive = left,
+      clipped to ±MAX_STEER_RAD. FSDS's normalised command (+1 = right) is
+      produced downstream by fsds_bridge, not here.
 
     Tuning:
       k_cte     — cross-track gain.  Higher values correct lateral error faster
@@ -53,7 +53,7 @@ class StanleyController:
       k_soft    — speed softening (m/s).  Set to ~walking speed so the CTE
                   term doesn't saturate the steering at low speeds.
       k_d       — yaw-rate damper gain.  Subtracts k_d·ω from the Stanley
-                  angle before normalising, opposing rapid heading changes.
+                  angle, opposing rapid heading changes.
                   This is the primary fix for left-right sway: the CTE term
                   alone has no memory of how fast the heading is already
                   changing, so it overshoots; k_d·ω counters each swing.
@@ -74,12 +74,18 @@ class StanleyController:
         self.k_d       = k_d
         self.wheelbase = wheelbase
         # Last tick's tracking error, in the SAME sign convention as
-        # mpc_core.py's last_telemetry (+ve = left/CCW) so both controllers'
-        # e_y/e_psi are directly comparable in telemetry_logger.py's CSV —
+        # lmpc/controller.py's last_telemetry (+ve = left/CCW) so both controllers'
+        # e_y/e_psi are directly comparable in telemetry/control_logger.py's CSV —
         # see compute()'s sign flip on `e` below. Exposed for ControlLogger;
         # not used internally by compute() itself.
         self.last_e_y: float = 0.0
         self.last_e_psi: float = 0.0
+        # Last tick's three additive terms of delta itself (radians, BEFORE
+        # the final clip), for debug telemetry only -- see live_viz/'s
+        # weighted-error panel for Stanley. Not used internally.
+        self.last_heading_term: float = 0.0   # theta_e
+        self.last_atan_term: float = 0.0      # atan2(k_cte*e, v+k_soft)
+        self.last_damping_term: float = 0.0   # -k_d*yaw_rate
 
     def compute(
         self,
@@ -90,7 +96,8 @@ class StanleyController:
         car_yaw_rate: float = 0.0,
     ) -> float:
         """
-        Return a steering command in [-1, 1].
+        Return the steering angle in radians (positive = left), clipped to
+        ±MAX_STEER_RAD.
 
         path         — (N, 2) array of waypoints in map frame (must have N ≥ 2)
         car_pos      — (2,) car position in map frame
@@ -131,7 +138,7 @@ class StanleyController:
         right_n = np.array([t[1], -t[0]])   # 90° CW rotation of tangent
         e = float(np.dot(fa - path[idx], right_n))
 
-        # Expose this tick's error in mpc_core.py's sign convention (+ve =
+        # Expose this tick's error in lmpc/controller.py's sign convention (+ve =
         # left/CCW) — e above is +ve RIGHT, the opposite — so a Stanley log
         # and an MPC log can be plotted on the same axis without a manual
         # sign flip. theta_e already matches (+ve = path turns left of car).
@@ -141,9 +148,10 @@ class StanleyController:
         # Stanley angle — positive = left turn (standard convention).  Damper
         # subtracts k_d·ω: when the car is already swinging left (ω > 0), this
         # reduces δ so the next tick steers less left, preventing overshoot.
-        delta = (theta_e
-                 + math.atan2(self.k_cte * e, car_speed + self.k_soft)
-                 - self.k_d * car_yaw_rate)
+        self.last_heading_term = theta_e
+        self.last_atan_term = math.atan2(self.k_cte * e, car_speed + self.k_soft)
+        self.last_damping_term = -self.k_d * car_yaw_rate
+        delta = self.last_heading_term + self.last_atan_term + self.last_damping_term
 
         # Return the steering ANGLE in radians (positive = left), clamped to the
         # physical limit.  FSDS normalisation (+1 = right) is done by fsds_bridge.
@@ -370,7 +378,7 @@ def dynamic_speed_cap(waypoints, v_max=15.0, v_min=1.5,
     allows and the corner is close enough that it can no longer brake down
     to the profile's target in time." That mismatch is exactly what shows up
     as late, hard braking and steering saturation at corner entry — see
-    fsae_MPCTest/`docs/reference/README.md`'s speed-governor section.
+    fsae_MPCTest/`docs/reference/control_mechanisms.md`'s "Dynamic speed cap" section.
 
     This is a thin wrapper over curvature_speed() using its own (separate,
     typically tighter) a_lat_max/safety defaults — the oracle profile was
@@ -493,7 +501,7 @@ def load_path_profile_csv(csv_path: str):
     already derives path heading from consecutive waypoints (atan2 of the
     segment direction, the same convention centerline_planner.py's published
     PoseArray uses), so the (n,2) array below is a direct substitute for the
-    live topic's path with no interface change to mpc_core.py.
+    live topic's path with no interface change to lmpc/controller.py.
 
     Parameters
     ----------
@@ -520,7 +528,7 @@ def load_path_heading_profile_csv(csv_path: str):
     MPCController.set_heading_profile() for how it's consumed.
 
     Separate from load_path_profile_csv (which returns only (x,y), an
-    (n,2) array used directly as `path` everywhere in mpc_core.py,
+    (n,2) array used directly as `path` everywhere in lmpc/controller.py,
     including CornerMap's curvature segmentation) so that call site's
     return shape never changes — this is an additive, opt-in lookup, not a
     replacement for the geometric path array.

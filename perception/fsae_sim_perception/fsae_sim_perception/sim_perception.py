@@ -38,7 +38,7 @@ at the control rate.
 Known limitation: this node is not a SLAM stand-in for accuracy, only for
 range. The pose it publishes is FSDS ground truth, copied verbatim: no noise,
 no drift, no estimation lag. The offline tuner models this gap explicitly via
-`SLAM_NOISE_ENABLED` in fsae_MPCTest/settings.py (default off, since FSDS has
+`SLAM_NOISE_ENABLED` in fsae_MPCTest/settings/ (default off, since FSDS has
 no such error).
 
 Speed/yaw-rate synchronisation: mpc_controller.py gets car_pos/car_yaw AND
@@ -192,7 +192,14 @@ class SimPerception(Node):
         # — see the module docstring's "Speed/yaw-rate synchronisation" note.
         v = msg.twist.twist.linear
         self._car_vx = v.x
-        self._car_vy = v.y
+        # The FSDS C++ bridge builds linear.y as vx_w*sin(yaw) - vy_w*cos(yaw),
+        # the negative of the left-positive body lateral velocity, so it reads
+        # right-positive while angular.z is CCW (left) positive. Both
+        # controllers assume v_y and r share the left-positive convention
+        # (NMPC slip angles use v_y + lf*r; LTV-QP's e_yd uses v_y), so flip
+        # it here. Raw /fsds/testing_only/odom consumers only use
+        # hypot(vx, vy) and are unaffected.
+        self._car_vy = -v.y
         self._car_yaw_rate = msg.twist.twist.angular.z
         self._odom_stamp = msg.header.stamp
         self._have_odom = True

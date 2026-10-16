@@ -2,7 +2,7 @@
 
 """
 nmpc_params.py — STRUCTURAL/SOLVER tunables for the NONLINEAR MPC
-path-tracking controller (nmpc_core.NMPCController). See
+path-tracking controller (nmpc.solver.NMPCController). See
 late_turn_in_investigation.md Part 16 for the research/decision record
 behind the formulation.
 
@@ -20,18 +20,18 @@ are.
 
 PARITY, NOW THAT AN OFFLINE NMPC EXISTS
 -----------------------------------------
-Before fsae_MPCTest's offline NMPC port (controller/nmpc_optimiser.py),
+Before fsae_MPCTest's offline NMPC port (controller/nmpc/),
 these structural fields had no offline counterpart, so CLAUDE.md's
 numeric-parity rule didn't apply to them. It does now: every field below
-has a matching settings.py NMPC_* constant (see that file's "Nonlinear MPC
-(NMPC)" section), kept numerically identical by hand — the same
+has a matching NMPC_* constant in the settings package
+(settings/nmpc.py), kept numerically identical by hand — the same
 discipline as Q_diag/R_diag/R_rate_diag always have been. Extend both
 sides together if either changes.
 
 ONE WEIGHT (now in mpc_params.py) DOES NOT TRANSFER WITH IDENTICAL
 MEANING: q_r / nmpc_q_epsi_dot. In the LTV-QP it weights absolute yaw rate
 `r`; in the Frenet NMPC it weights the heading-error RATE
-`r - kappa*s_dot` (see nmpc_core._outputs). Penalising absolute `r` in a
+`r - kappa*s_dot` (see nmpc.outputs._outputs). Penalising absolute `r` in a
 curvature-aware model would penalise the yaw rate the car MUST hold to
 follow a corner (r = kappa*v), i.e. it would fight cornering — which is
 the exact failure this controller exists to remove. Same number,
@@ -41,7 +41,7 @@ and mpc_params.py's own docstring for the field itself.
 PROVENANCE OF EVERY DEFAULT BELOW
 ---------------------------------
 No default here is a fresh guess. Each is either (a) copied from an existing
-validated value in mpc_core.py / control_utils.py (noted per field), or
+validated value in lmpc/controller.py / control_utils.py (noted per field), or
 (b) a solver/structural setting measured in Part 16 §16.7, or (c) an explicit
 guard whose value is chosen to be inert on this car's real operating range
 (also noted). Anything that is genuinely unvalidated says so in its `desc`.
@@ -61,8 +61,8 @@ class NMPCParams:
     # optimiser, so it is the most conservative default available.
     use_nmpc: bool = field(default=False, metadata={
         "unit": "bool",
-        "desc": "true -> use nmpc_core.NMPCController (Frenet-frame nonlinear MPC) "
-                "instead of mpc_core.MPCController (LTV-QP). Default false.",
+        "desc": "true -> use nmpc.solver.NMPCController (Frenet-frame nonlinear MPC) "
+                "instead of lmpc.controller.MPCController (LTV-QP). Default false.",
         "controller": "nmpc_only",
     })
 
@@ -289,17 +289,43 @@ class NMPCParams:
     })
 
     # ── Soft track constraint (mirrors MPCController's own) ─────────────
-    nmpc_track_halfwidth: float = field(default=3.5, metadata={
+    # 3.35 m, slightly inside the LTV-QP's +-3.5 m literal. Both the
+    # quadratic and linear slack read this bound (nmpc/solver.py's
+    # _cost()/_solve_step()). It is read unconditionally, not gated on
+    # nmpc_progress_enabled, so narrowing it for a progress-term experiment
+    # also tightens ordinary tracking, which measurably hurt tracking when
+    # tried at 3.0. Override it alongside NMPC_PROGRESS_ENABLED rather than
+    # changing this default.
+    nmpc_track_halfwidth: float = field(default=3.35, metadata={
         "unit": "m",
-        "desc": "soft |e_y| bound with slack, copied from _build_qp's existing "
-                "+-3.5 m literal. <=0 removes the constraint (and its slack "
-                "variables) entirely",
+        "desc": "soft |e_y| bound with slack (both quadratic and linear). "
+                "<=0 removes the constraint (and its slack variables) entirely",
         "controller": "nmpc_only",
     })
     nmpc_slack_weight: float = field(default=10000.0, metadata={
         "unit": "1/m^2",
         "desc": "penalty on the track-bound slack, copied from _build_qp's "
                 "existing W_slack = 10000.0",
+        "controller": "nmpc_only",
+    })
+    # Effectively inert without the progress reward (nothing else rewards
+    # violating the boundary, so slack stays 0 and this term adds nothing).
+    # Raise it to ~1000 alongside any progress-term experiment; it is
+    # necessary there, just not sufficient.
+    nmpc_slack_linear_weight: float = field(default=500.0, metadata={
+        "unit": "1/m",
+        "desc": "LINEAR track-bound slack penalty, additional to the "
+                "quadratic nmpc_slack_weight above. 0.0 disables it. "
+                "A purely quadratic penalty has ZERO gradient at "
+                "zero violation, so the first small boundary violation is "
+                "nearly free; that matters once nmpc_progress_enabled gives "
+                "the solver an unbounded incentive to find it (corner "
+                "cutting: s_dot rises as e_y moves to the inside of a bend, "
+                "a direct analytic incentive, not a tuning artifact). "
+                "Liniger's MPCC reference carries both a quadratic and a "
+                "linear track penalty for exactly this reason. Measured "
+                "offline: 1000.0 turns a q_progress=5 off-track DNF into a "
+                "completed lap",
         "controller": "nmpc_only",
     })
 
@@ -367,8 +393,8 @@ class NMPCParams:
     nmpc_alat_ceiling_enabled: bool = field(default=True, metadata={
         "unit": "bool",
         "desc": "include FSDS's measured sustained lateral-acceleration ceiling "
-                "(MPCParams.alat_ceiling_flat/_slope/_intercept, the same law "
-                "mpc_core._alat_ceiling_at uses) as a smooth saturation of the "
+                "(the _Plant.alat_ceiling_flat/_slope/_intercept constants in "
+                "nmpc/dynamics.py, the same law model/vehicle_physics uses) as a smooth saturation of the "
                 "prediction's tyre forces. True is correct for FSDS; set False "
                 "for real-vehicle work, mirroring "
                 "model/vehicle_physics.VehicleParams.alat_ceiling_enabled",
@@ -399,13 +425,85 @@ class NMPCParams:
                 "_f_scalar -- see CLAUDE.md's warning against touching that "
                 "mechanism, which this does not. F_max is derived from the "
                 "SAME measured ceiling law "
-                "(alat_ceiling_flat/_slope/_intercept) via "
+                "(_Plant.alat_ceiling_flat/_slope/_intercept) via "
                 "F_max = m * ceiling(v_x) / 2 per axle. Changes the QP's "
                 "fixed sparsity pattern, so it is read once at construction "
                 "time, not per-tick. When False, _build_qp/_outputs/"
                 "_output_jacobians/_solve_step produce IDENTICAL output "
                 "(including array shapes) to before this feature existed. "
                 "Default False: genuine experiment, not yet validated",
+        "controller": "nmpc_only",
+    })
+
+    # ── Progress term (EXPERIMENTAL, default off) ───────────────────────
+    # Lets the NMPC choose its own speed from an arc-length progress reward
+    # instead of tracking a speed profile. See
+    # fsae_MPCTest/docs/logs/nmpc_progress_term_investigation.md for the
+    # full design, the measured results, and why this revisits an idea
+    # late_turn_in_investigation.md §16.2 DEFERRED (on merit, explicitly
+    # "the right thing to try after tracking works") rather than rejected.
+    #
+    # STATUS: OFF. Turning it on by default was requested (2026-09-21) and
+    # attempted, then reverted the same day when the shipped configuration
+    # was measured end to end: it does not complete a lap at ANY setting
+    # tried, so enabling it would have driven the car off track on the first
+    # corner of every run.
+    #
+    # Measured on comp_test_map_3 at the current SPEED_TARGET_DEFICIT_MAX of
+    # 5.0, all with the linear track slack active:
+    #   q_progress 4.0  -> never launches at all (progress 0.000)
+    #   q_progress 5.0  -> off track at 9.9% of a lap
+    #   q_progress 6.0  -> off track at 9.8% of a lap
+    # Raising nmpc_slack_linear_weight 1000 -> 50000 changed nothing at any
+    # of those, so the boundary penalty is not the missing piece.
+    #
+    # The usable band NARROWED when SPEED_TARGET_DEFICIT_MAX went 2.5 -> 5.0:
+    # the higher speed cap hands the progress reward more headroom to spend,
+    # and it spends it into corners. Any future attempt has to be re-measured
+    # against the deficit value actually in force, not an older one.
+    #
+    # Tracking (this flag False) completes cleanly and scores 0.714 on the
+    # same map, so there is no configuration in which turning this on is
+    # currently the better choice.
+    nmpc_progress_enabled: bool = field(default=False, metadata={
+        "unit": "bool",
+        "desc": "true -> row 4 of h() switches from the two-sided "
+                "v_x - v_ref residual to a ONE-SIDED speed-CAP hinge (plus "
+                "a low-speed floor hinge sharing the same weight), and a "
+                "6th row rewards progress toward an unreachable arc-length "
+                "target (nmpc_q_progress in mpc_params.py). desired_speed "
+                "keeps acting as the CAP, so the precomputed profile stays "
+                "loaded and the scoring baseline (time_bonus, "
+                "LapProgressTracker) stays valid -- this is NOT full MPCC "
+                "with the speed reference removed. Changes the cost's row "
+                "count, so it is read once at construction time, not "
+                "per-tick. When False every array shape and numeric result "
+                "is IDENTICAL to before this feature existed",
+        "controller": "nmpc_only",
+    })
+    nmpc_progress_reach: float = field(default=3.0, metadata={
+        "unit": "-",
+        "desc": "s_target_N = X[0,s] + max(v_cap*N*dt*REACH, "
+                "0.5*a_max*(N*dt)^2*REACH); >1 keeps the target always out "
+                "of reach so minimising the residual is monotone-equivalent "
+                "to maximising s_N. The second (kinematic) term floors the "
+                "gap at launch, when v_cap is deliberately small "
+                "(SPEED_TARGET_DEFICIT_MAX) and the first term alone would "
+                "be reachable almost immediately -- measured offline to "
+                "stall the car indefinitely below the acceleration static "
+                "friction needs. 2.0 gives ~1.3x margin over the measured "
+                "minimum at the current weight set",
+        "controller": "nmpc_only",
+    })
+    nmpc_progress_v_min: float = field(default=3.0, metadata={
+        "unit": "m/s",
+        "desc": "low-speed floor in the same row/weight as the speed cap: "
+                "defence against the standstill trivial solution (v_x=0 "
+                "locally optimal), compounded by the known v_x=0 tyre-force "
+                "behaviour in this model. Liniger's MPCC reference uses a "
+                "hard Vx>=0.05 bound for the same reason; this car sits "
+                "higher off the mark than an RC car so the floor is larger. "
+                "Only read when nmpc_progress_enabled",
         "controller": "nmpc_only",
     })
 
@@ -503,10 +601,10 @@ class NMPCParams:
     # First-order low-pass on the incoming desired_speed before it reaches
     # the cost function (v_ref = v_ref + alpha*(desired_speed - v_ref) each
     # tick). Introduced 2026-06-29 (mirrors MPCController's own identical
-    # filter in mpc_core.py) to smooth the live planner's ~1 Hz cone-map
+    # filter in lmpc/controller.py) to smooth the live planner's ~1 Hz cone-map
     # target-speed jumps, so a single noisy planner update doesn't look like
     # a step-input speed error to the solver. Has NO offline analogue
-    # (rollout_core.py/nmpc_optimiser.py never filter the speed target), so
+    # (sim/rollout/ and controller/nmpc/ never filter the speed target), so
     # this has always been live-only and untested against the offline
     # weight sweeps.
     #

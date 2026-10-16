@@ -14,6 +14,7 @@ steering, GO gating) lives downstream in fsds_bridge, mirroring how the real car
 turns cmd_vel into CAN frames.  Speed feedback comes from the simulator odometry
 (the real car reads it from CAN); the steering pose comes from car_position.
 """
+import json
 import time
 
 import numpy as np
@@ -24,12 +25,13 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from ackermann_msgs.msg import AckermannDriveStamped
 from geometry_msgs.msg import PoseArray, PoseStamped
 from nav_msgs.msg import Odometry
+from std_msgs.msg import String
 
 from fsae_control.control_utils import (
     StanleyController, curvature_speed, load_path_profile_csv,
     load_speed_profile_csv, precomputed_speed_at, tracking_error_speed_gate,
 )
-from fsae_control.telemetry_logger import ControlLogger, LapProgressTracker, build_config_lines
+from fsae_control.telemetry import ControlLogger, LapProgressTracker, build_config_lines
 
 # Same three safeguards mpc_controller.py wraps around curvature_speed()'s
 # raw output, ported here after live testing showed Stanley stuttering (a
@@ -141,6 +143,27 @@ class StanleyControllerNode(Node):
         self.create_subscription(Odometry, '/fsds/testing_only/odom', self._odom_cb, sensor_qos)
 
         self.pub_cmd = self.create_publisher(AckermannDriveStamped, '/fsae/control/cmd_vel', 10)
+        # Debug-only: per-tick weighted breakdown of Stanley's own three
+        # additive terms, for live_viz/'s debug window. Also doubles as
+        # this project's only positive "Stanley is active" signal -- MPC
+        # and Stanley share the same ROS node name and, in cmd_vel mode,
+        # the same output topic, so live_viz/ cannot otherwise tell them
+        # apart (see mpc_controller.py's own /fsae/control/debug_weights).
+        self.pub_debug_stanley = self.create_publisher(
+            String, '/fsae/control/debug_stanley', 10)
+        # Per-lap score summary -- live_viz/'s lap panel. Same topic/QoS
+        # as mpc_controller.py's own publisher (see its comment for the
+        # RELIABLE rationale); no horizon accuracy here (Stanley has no
+        # predicted horizon at all — see HorizonAccuracyTracker's docstring),
+        # so pred_acc_pct is always None/n/a in this node's summaries.
+        self.pub_lap_summary = self.create_publisher(
+            String, '/fsae/control/lap_summary',
+            QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=10,
+            ),
+        )
 
         self._path: np.ndarray = (
             self._static_path if self._static_path is not None else np.empty((0, 2))
@@ -190,6 +213,42 @@ class StanleyControllerNode(Node):
         self._car_yaw = float(msg.pose.orientation.w)
         self._control_step()
 
+    def _publish_debug_stanley(self, steering: float) -> None:
+        """
+        Weighted-cost-style breakdown of Stanley's three additive terms
+        (heading error, cross-track atan2 correction, yaw-rate damping),
+        each as a share of the sum of their absolute values, plus the raw
+        values themselves. Debug-only, for live_viz/'s Stanley panel;
+        mirrors mpc_controller.py's _publish_debug_weights() in spirit but
+        Stanley has no cost weights to report, only its own control-law
+        terms, so "percentage" here means "share of total steering
+        magnitude", not "share of a QP cost".
+        """
+        heading = self._stanley.last_heading_term
+        atan = self._stanley.last_atan_term
+        damping = self._stanley.last_damping_term
+        terms = {
+            'heading_error': heading,
+            'atan_cross_track': atan,
+            'yaw_rate_damping': damping,
+        }
+        total_abs = sum(abs(v) for v in terms.values())
+        breakdown = {
+            name: {
+                'value': value,
+                'pct': (100.0 * abs(value) / total_abs) if total_abs > 0.0 else 0.0,
+            }
+            for name, value in terms.items()
+        }
+        msg = String()
+        msg.data = json.dumps({
+            'terms': breakdown,
+            'e_y': self._stanley.last_e_y,
+            'e_psi': self._stanley.last_e_psi,
+            'steering': steering,
+        })
+        self.pub_debug_stanley.publish(msg)
+
     # ------------------------------------------------------------------
     # Control step (triggered by car_position)
     # ------------------------------------------------------------------
@@ -211,6 +270,7 @@ class StanleyControllerNode(Node):
             self._path, self._car_pos, self._car_yaw,
             self._car_speed, self._car_yaw_rate,
         )
+        self._publish_debug_stanley(steering)
 
         now = time.perf_counter()
         dt = (now - self._last_tick_time) if self._last_tick_time is not None else None
@@ -269,16 +329,29 @@ class StanleyControllerNode(Node):
                 (self.get_clock().now() - self._path_stamp).nanoseconds * 1e-9
                 if self._path_stamp is not None else None
             )
+            lap_summary = None
+            if self._lap_tracker is not None:
+                lap = self._lap_tracker.update(self._car_pos, t, self._car_speed)
+                if lap is not None:
+                    # No horizon accuracy on Stanley -- no predicted
+                    # trajectory exists at all (see HorizonAccuracyTracker's
+                    # docstring), so pred_acc_pct/pred_err_m stay None and
+                    # every reader (live_viz/, plot_playback.py) shows n/a.
+                    lap_summary = self._telemetry.finish_lap(lap)
+                    lap_summary['lap_idx'] = lap['lap_idx']
+                    msg = String()
+                    msg.data = json.dumps(lap_summary)
+                    self.pub_lap_summary.publish(msg)
             self._telemetry.log_control(
                 t, self._car_pos[0], self._car_pos[1], self._car_yaw,
                 self._car_speed, speed, steering,
                 self._stanley.last_e_y, self._stanley.last_e_psi, self._car_yaw_rate,
                 path_age_s=path_age_s,
                 cmd_latency_ms=(time.perf_counter() - _t_loop0) * 1e3,
+                lap_idx=self._lap_tracker.lap_idx if self._lap_tracker is not None else None,
+                lap_summary=lap_summary,
             )
             self._telemetry.log_path(t, self._path)
-            if self._lap_tracker is not None:
-                self._lap_tracker.update(self._car_pos, t, self._car_speed)
 
         self.get_logger().info(
             f'cmd_vel: speed={speed:.2f} m/s  steer={steering:.3f} rad  '

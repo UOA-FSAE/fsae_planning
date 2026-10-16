@@ -1,78 +1,9 @@
-# Title: mpc_core.py
-
-# NOTE (fsae_control port): this is a near-verbatim copy of
-# fsae_MPCTest/"fsds simulator"/control_utils.py, kept byte-for-byte in the MPC
-# math so the offline-tuned weights (Q/R/R_rate) still transfer.  The ONLY
-# intentional change is MAX_STEER_RAD 35deg -> 25deg to match this stack's
-# physical steering limit (see fsae_control.control_utils.MAX_STEER_RAD and
-# fsds_bridge.MAX_STEER_RAD); the MPC now plans steering the car can actually
-# deliver.  If you re-sync from upstream, re-apply that one change.
-
 """
-mpc_core.py — Live MPC Path-Tracking Controller for FSDS
+fsae_control/lmpc/controller.py — MPCController
 
-PURPOSE
--------
-Provides MPCController, the class mpc_controller.py uses to turn a planner
-path + current vehicle state into steering/throttle/brake at 20 Hz. That
-node's `standalone_output` parameter picks how the result is used:
-false forwards only steering through the shared cmd_vel interface;
-true uses the full (steering, throttle, brake) triple directly — see that
-file's own docstring for why. It is a self-contained, "live-solve" re-implementation
-of the same linear time-varying MPC formulated generically in optimiser.py /
-bicycle_model.py for the offline tuner and simulator (both in the
-fsae_MPCTest repo), designed for 100% numerical parity with that offline
-pipeline so that weights tuned there transfer directly to the real/simulated
-vehicle.
-
-  States  x : [e_y, e_yd, e_psi, r, e_v, e_a, delta_act, a_act]   (8,)
-  Inputs  u : [delta_cmd (rad), a_cmd (m/s2)]                      (2,)
-
-HOW IT WORKS
-------------
-Each call to MPCController.compute() runs the full MPC pipeline:
-  1. Low-pass filter the incoming desired_speed (_v_des_filtered) to avoid
-     feeding step changes into the MPC's speed-error state.
-  2. _error_state() — project the vehicle's front axle onto the nearest
-     path segment to get Frenet-style tracking errors (e_y, e_psi, e_v) and
-     a short-lookahead curvature estimate (kappa), then assemble the 8-state
-     vector x0 (reusing the controller's own actuator-lag memory for the
-     delta_act/a_act entries, since those aren't directly measurable).
-  3. _discrete_model() — build the speed-blended kinematic/dynamic bicycle
-     model and ZOH-discretise it (mirrors bicycle_model.get_8state_discrete_model,
-     duplicated locally so the live controller has no simulation dependencies).
-  4. Gain-schedule R and R_rate via the module-level _adaptive_R_scaling /
-     _adaptive_R_rate helpers (mirrors model_utils.py's adaptive_R_scaling /
-     adaptive_R_rate — duplicated here for the same reason).
-  5. _solve_qp() — inject the above into a persistent, parameterised CVXPY
-     problem (built once in _build_qp, reused via warm-start) and solve with
-     OSQP, falling back to Clarabel, then to a full-brake command (holding
-     the last steering angle) if both solvers fail.
-  6. Integrate the actuator lag states exactly (ZOH, not Euler) so
-     delta_act/a_act stay consistent even though dt (0.05s) is comparable
-     to tau_a (0.02s).
-  7. Convert [delta_cmd, a_cmd] into FSDS's normalised
-     [steering, throttle, brake] command triple and populate
-     self.last_telemetry for the caller's telemetry logging.
-
-PARITY WITH THE OFFLINE PIPELINE
----------------------------------
-_adaptive_R_scaling/_adaptive_R_rate/_discrete_model here are intentionally
-near-identical duplicates of model_utils.py / bicycle_model.py, and
-_build_qp's cost/constraint formulation is a near-identical duplicate of
-optimiser.py's init_parameterized_mpc (same +/-3.5 m soft lane bound, same
-W_slack=10000, same step-0/subsequent rate-cost split), plus a hard
-per-step slew-rate constraint on [delta_cmd, a_cmd] (self.du_max) enforced
-in addition to the soft R_rate cost. Any change to the cost/constraint
-structure in one location should be mirrored in the other, or the weights
-tuned by offline_tuner.py will no longer transfer faithfully to the live
-controller.
-
-USED BY
--------
-  mpc_controller.py — constructs an MPCController(dt=0.05, N=35) in
-                    __init__ and calls .compute() every 20 Hz tick,
-                    .reset() on stale path / cone-brake fail-safes.
+Linear time-varying MPC for combined lateral and longitudinal path tracking:
+QP construction, discrete model, delay-compensated error state, solve and the
+per-tick `compute` entry point.
 """
 
 import math
@@ -84,391 +15,18 @@ import numpy as np
 from scipy.linalg import expm
 
 from fsae_control.mpc.mpc_params import DEFAULT_MPC_PARAMS, MPCParams
-
-# Maximum physical steering deflection.  25deg matches this stack's limit
-# (fsae_control.control_utils / fsds_bridge); upstream used 35deg.
-MAX_STEER_RAD: float = math.radians(25.0)
-MAX_ACCEL: float = 12.0
-MAX_BRAKE: float = 7.0
-
-# ── Reference-heading rate limit ─────────────────────────────────────────────
-# Mirrors fsae_MPCTest/sim/rollout_core.py's REF_HEADING_RATE_LIMIT_ENABLED /
-# REF_HEADING_RISE_RATE / _rate_limit_ref_psi — keep all three in sync.
-# Caps how fast the tracked reference heading (path_yaw in _error_state) may
-# change per tick, symmetric in both directions — unlike the speed-target
-# rise limiter, there is no "always safe" direction for a heading reference.
-# Disabled: holding the reference back during turn-in leaves a larger
-# heading deficit to claw back later, which makes steering saturation worse.
-# Re-test against a synthetic slalom path offline before re-enabling.
-# Moved to MPCParams.ref_heading_rate_limit_enabled /
-# .ref_heading_rise_rate_deg_s (mpc_params.py) — see those fields for the
-# current values.
-
-# ── Delay compensation ──────────────────────────────────────────────────────
-# Real delay (perception + planning + control + actuation latency) is
-# unknown and time-varying, unlike fsae_MPCTest's simulator-only fixed
-# DELAY_STEPS. compute() is instead told how OLD the pose it's solving
-# against is (pose_age_s, measured from the pose message's own timestamp —
-# see mpc_controller.py/_pose_cb) and converts that into a step count itself.
-# See predict_ahead() below for the same small-angle-clip rollforward
-# validated in fsae_MPCTest/sim/rollout_core.py.
-# The rollforward depth (n_delay) is capped at a small value because
-# predict_ahead() iterates the linear model n_delay times with NO
-# ground-truth correction, so pose noise compounds through every extra
-# matrix multiply and the QP faithfully tracks the resulting jitter into the
-# steering command. This is the same mechanism the DELAY_COMPENSATION_ENABLED
-# note below records (elevated reversal rate in high-n_delay windows): a
-# deep rollforward can turn measurement noise into steering thrash that
-# consumes the whole corner-approach phase (steer swinging +-5-10 deg per
-# tick at e_y/e_psi ~0), causing late turn-in and running wide -- a failure
-# no Q/R weight change can fix, because the command is already saturated by
-# noise before the corner starts.
-# Disabling compensation outright was tried and was WORSE (see
-# DELAY_COMPENSATION_ENABLED's RESULT note), so this caps rollforward DEPTH
-# instead: still compensates typical latency, but bounds the noise
-# compounding to a level measured to clearly improve peak/rms lateral error
-# and steering reversal rate over deeper caps, across a wide range of
-# measured pose_age_s.
-#
-# CAVEAT: this validates the n_delay -> reversal-rate mechanism, NOT the
-# separate (and unsupported) claim that pose latency explains a
-# sudden-corner regression -- a same-settings control run showed peak |e_y|
-# essentially unchanged across a wide pose_age swing. The real fix is still
-# stabilising pose_age_s upstream, not living on a truncated rollforward.
-# Moved to MPCParams.max_delay_compensation_steps (the cap: a bigger measured
-# age is clamped, not trusted blindly) and MPCParams.predict_epsi_clip (rad,
-# the small-angle bound used in predict_ahead) — see mpc_params.py for the
-# current values.
-
-# ── n_delay stabilisation ───────────────────────────────────────────────────
-# pose_age_s is noisy: control-loop jitter makes a raw round(pose_age_s / dt)
-# flip between adjacent step counts tick to tick. Each flip changes how many
-# commands predict_ahead() rolls x0 through, so x0 jumps discontinuously
-# between rollforward depths on consecutive solves — injecting step changes
-# into the state the QP sees at the control rate. Two guards, applied in
-# compute():
-#   1. Low-pass pose_age_s so a single late message can't move the step count.
-#   2. Hysteresis on the resulting integer: only change n_delay when the
-#      filtered estimate is clearly past the midpoint of the current bin, so
-#      an age hovering near a boundary doesn't dither.
-# Moved to MPCParams.pose_age_lp_alpha (per-tick low-pass on pose_age_s,
-# ~0.3 s settle at 20 Hz) and MPCParams.n_delay_hysteresis (steps of deadband
-# either side of a bin boundary) — see mpc_params.py for the current values.
-
-# ── Lookahead gain-scheduling family: removed ──────────────────────────────
-# Removed ~15 mechanisms that scanned forward along the path and reweighted
-# today's Q/R cost based on a corner not yet reached (approach/exit boosts,
-# demand normalisation, U-turn detector, straight-line adjustments, curvature
-# forcing, the precomputed CornerMap fast path — full list in
-# `docs/reference/README.md`'s "Corner-factor scheduler rewrite" section)
-# because this MPC formulation already predicts state error at each future
-# horizon step; reweighting TODAY's near-zero cost based on a forward scan
-# doesn't change what the horizon predicts once the car gets there. Replaced
-# by _corner_factor/_low_speed_corner_boost below (current-state only) plus
-# an independent heading-error-driven accel/brake asymmetry. Mirror any
-# change here into fsae_MPCTest/controller/model_utils.py per CLAUDE.md's
-# parity rule.
-
-
-def predict_ahead(
-    x0: np.ndarray,
-    Ad: np.ndarray,
-    Bd: np.ndarray,
-    pending_cmds,
-    epsi_clip: float = 0.5,
-) -> np.ndarray:
-    """
-    Roll the linear error-state model forward through commands already
-    issued but not yet reflected in the measured pose, so the MPC solves
-    against the state it will actually face instead of a stale x0.
-
-    pending_cmds must be ordered oldest-first (the order they were issued).
-    Mirrors fsae_MPCTest/sim/rollout_core.py's predict_ahead() exactly,
-    including the e_psi clip — see that function's docstring for why the
-    clip is needed (the e_psi -> e_y_dot coupling in Ad is only valid for
-    small angles, and this rollforward has no per-step ground-truth
-    correction the way the closed-loop MPC horizon does).
-
-    epsi_clip (rad, ~28.6 deg at the default) is that small-angle bound; the
-    default matches MPCParams.predict_epsi_clip, which MPCController passes
-    explicitly.
-    """
-    x_p = x0.copy()
-    for u in pending_cmds:
-        x_p[2] = np.clip(x_p[2], -epsi_clip, epsi_clip)
-        x_p = Ad @ x_p + Bd @ u
-    return x_p
-
-# ---------------------------------------------------------------------------
-# Adaptive gain helpers
-# ---------------------------------------------------------------------------
-
-def _adaptive_R_scaling(vx: float, R_base: np.ndarray) -> np.ndarray:
-    """
-    Speed-dependent steering cost with a saturating (Michaelis-Menten) scale.
-    steer_scale = 1 + (1.5 * vx) / (6.0 + vx)
-
-    accel_scale is disabled (fixed at 1.0): a speed-dependent accel_scale
-    (e.g. 1 + 0.05*vx) makes R[1,1] rise with speed exactly where
-    corner-entry braking needs to be strongest, and relax again as the car
-    decelerates mid-approach even though heading error/curvature are still
-    climbing -- fighting the braking R_diag[1] tuning is trying to loosen.
-    R[1,1] is governed by R_diag[1] alone, independent of vx.
-    """
-    vx = max(vx, 0.5)
-    steer_scale = 1.0 + (1.5 * vx) / (6.0 + vx)
-    accel_scale = 1.0
-    R = R_base.copy()
-    R[0, 0] *= steer_scale
-    R[1, 1] *= accel_scale
-    return R
-
-
-def _adaptive_R_rate(
-    kappa: float,
-    R_rate_base: np.ndarray,
-    enable_in_corners: bool = True,
-    during_floor: float = 0.625,
-) -> np.ndarray:
-    """
-    Curvature-dependent steering-jerk softening: relaxes the steering
-    rate-of-change cost in sharp corners (floor during_floor, default
-    MPCParams.adaptive_r_rate_during_floor), driven by CURRENT-position
-    kappa, so the controller isn't over-penalised for the extra steering
-    rate a tight corner demands. Mirrors model_utils.adaptive_R_rate in
-    fsae_MPCTest — keep both floors in sync manually.
-
-    enable_in_corners: TEMPORARY/EXPERIMENTAL, NOT VALIDATED -- re-verify
-    before relying on the False branch below. True
-    (default) preserves the softening above -- R_rate reduction stays
-    active in corners. False uses a kappa_straight=0.03 "cornering" cutoff:
-    once |kappa| exceeds it, softening is switched off and R_rate[0,0] gets
-    the full, unscaled baseline cost instead -- deliberately undoing the
-    softening this function exists to provide. (Renamed from
-    disable_in_corners, whose True/False polarity was inverted from what
-    the name suggested.)
-
-    during_floor is kept relatively shallow (not deeper): a deeper floor
-    lets steering oscillate through zero several times per second
-    mid-corner (e.g. +25 -> -20 -> +14 -> -9 deg across ~0.3s) while
-    e_y/e_psi stay small -- classic under-damped steering-rate hunt, not a
-    tracking-error problem. The fix is less softening of the rate cost
-    while actually turning, not more lateral/heading authority -- do not
-    deepen this floor without re-checking for that oscillation.
-
-    Only the current-position during-floor is implemented; there is no
-    forward-scan entering-floor.
-    """
-    kappa_straight = 0.03
-    if not enable_in_corners and abs(kappa) > kappa_straight:
-        scale = 1.0
-    else:
-        scale = max(during_floor, 1.0 / (1.0 + 3.0 * abs(kappa)))
-    R = R_rate_base.copy()
-    R[0, 0] *= scale
-    return R
-
-
-def _steer_rate_anti_hunt(
-    kappa: float,
-    e_y: float,
-    R_rate_base: np.ndarray,
-    enabled: bool,
-    e_psi: float = 0.0,
-    boost_max: float = 6.0,
-) -> np.ndarray:
-    """
-    TEMPORARY/EXPERIMENTAL, NOT VALIDATED: heavily penalise steering
-    rate-of-change on top of _adaptive_R_rate's existing curvature softening,
-    strongest when the car is centred (|e_y| small), well-aligned (|e_psi|
-    small), AND not currently curving (kappa small). Mirrors
-    model_utils.steer_rate_anti_hunt in fsae_MPCTest -- keep both constants
-    in sync. enabled=False returns R_rate_base untouched.
-
-    Continuous, not a hard AND-gated threshold: a discontinuous step would
-    risk the same QP-solver-iteration-spike problem the
-    enable_in_corners/kappa_straight history above already found from
-    threshold cutoffs on curvature, so straight-line hunting is instead
-    penalised more strongly via a higher continuous ceiling.
-    boost_kappa, boost_ey, and boost_epsi each saturate independently
-    toward 1.0 as their input shrinks toward 0 (same saturating-curve style
-    as _adaptive_R_rate's own floor); their product is the applied scale,
-    so the full boost_max (default MPCParams.anti_hunt_boost_max) only
-    applies when all three are near their "straight, centred, and aligned"
-    ideal, and it fades smoothly -- never snaps -- as any one of them
-    grows.
-
-    e_psi (radians, NOT the degrees used in telemetry/logging -- same units
-    _error_state's x0[2]/e_psi already use internally) is included because
-    without it, a car that enters a straight MISALIGNED (large |e_psi|,
-    small |e_y| -- e.g. just exited a corner still pointed the wrong way)
-    would get the full straight-line boost anyway, since kappa/e_y alone
-    can't distinguish "straight and correctly aligned" from "straight but
-    needs to yaw back into line" -- making exactly the correction it needs
-    artificially expensive. k_epsi=23.0 sets half-fade at ~2.5 deg of e_psi.
-
-    boost_kappa/boost_ey/boost_epsi are current-state signals only (no
-    forward-scan term).
-    """
-    if not enabled:
-        return R_rate_base
-    # Relaxed 2026-08-19 (halved from 60.0/30.0/23.0): the original constants
-    # faded the boost out too fast on genuinely gentle curves -- boost_kappa
-    # was already down to ~0.45 by |kappa|=0.02 (a ~50 m-radius bend), so
-    # R_rate[0,0] had mostly relaxed back toward baseline exactly where
-    # residual steering jitter was still visible. Halving each k_* doubles
-    # the |kappa|/|e_y|/|e_psi| each factor reaches before dropping to half
-    # its max contribution (kappa: ~0.017 -> ~0.033 1/m; e_y: ~3.3 -> ~6.7 cm;
-    # e_psi: ~2.5 -> ~5.0 deg). Applies to both controllers -- nmpc_core.py
-    # imports this function verbatim, not a separate copy.
-    k_kappa, k_ey, k_epsi = 30.0, 15.0, 11.5
-    boost_kappa = 1.0 / (1.0 + k_kappa * abs(kappa))
-    boost_ey    = 1.0 / (1.0 + k_ey * abs(e_y))
-    boost_epsi  = 1.0 / (1.0 + k_epsi * abs(e_psi))
-    scale = 1.0 + (boost_max - 1.0) * boost_kappa * boost_ey * boost_epsi
-    R = R_rate_base.copy()
-    R[0, 0] *= scale
-    return R
-
-
-def _reversal_penalty_boost(
-    u_prev_steer: float,
-    R_rate_base: np.ndarray,
-    enabled: bool,
-    boost_max: float = 4.0,
-    k: float = 8.0,
-) -> np.ndarray:
-    """
-    TEMPORARY/EXPERIMENTAL, NOT VALIDATED: soft constraint against steering
-    REVERSALS (a tick-to-tick sign flip), approximated inside the convex QP
-    by boosting R_rate[0,0] whenever LAST tick's steering command
-    (u_prev_steer, rad) was already close to zero -- the one state a
-    reversal must pass through, since delta_cmd is continuous. A reversal
-    can't be detected directly inside one solve (it depends on this tick's
-    OWN decision, the thing being optimised), so this penalises the
-    precondition instead: the closer steering already sits to zero, the
-    more it costs to change it further this tick, making a full sign flip
-    specifically (as opposed to a same-side ramp toward/away from zero)
-    disproportionately expensive relative to a swing of the same size made
-    from a large starting angle.
-
-    Same saturating-curve style as _steer_rate_anti_hunt (single input here,
-    not a product of several) so it fades continuously rather than snapping,
-    and composes the same way: applied multiplicatively on top of whatever
-    _adaptive_R_rate/_steer_rate_anti_hunt/the corner blend already produced,
-    never replacing them. enabled=False returns R_rate_base untouched.
-
-    k=8.0 (rad^-1) sets half-boost at ~7.2 deg of PREVIOUS steering (a
-    reversal starting from near-centre gets close to the full boost_max;
-    one starting from a large existing angle -- already unlikely to flip
-    sign in one 50ms tick without an equally large du -- is barely
-    affected). Deliberately keyed on u_prev, not the CURRENT solve's u[0,0]
-    (a QP variable): using the variable itself would make the cost
-    non-convex (a rational function of the decision), whereas u_prev is a
-    known constant by solve time, keeping this an ordinary quadratic term.
-    """
-    if not enabled:
-        return R_rate_base
-    boost_near_zero = 1.0 / (1.0 + k * abs(u_prev_steer))
-    scale = 1.0 + (boost_max - 1.0) * boost_near_zero
-    R = R_rate_base.copy()
-    R[0, 0] *= scale
-    return R
-
-
-def _adaptive_Q_scaling(
-    e_y: float, Q_base: np.ndarray, enabled: bool,
-) -> np.ndarray:
-    """
-    Soften the lateral-error cost Q[0,0] when already close to the
-    centreline, to reduce small-error hunting/chatter. Mirrors
-    model_utils.adaptive_Q_scaling in fsae_MPCTest — see that function's
-    docstring for the full mechanism and why this is disabled by default.
-    enabled=False returns Q_base untouched.
-
-    Only the current-state ey_lo/ey_hi/floor softening on CURRENT |e_y|
-    below is implemented; there is no forward-scan relaxation term.
-    """
-    if not enabled:
-        return Q_base
-    ey_lo, ey_hi, floor = 0.05, 0.3, 0.5
-    ey_abs = abs(e_y)
-    if ey_abs >= ey_hi:
-        scale = 1.0
-    elif ey_abs <= ey_lo:
-        scale = floor
-    else:
-        scale = floor + (1.0 - floor) * (ey_abs - ey_lo) / (ey_hi - ey_lo)
-    Q = Q_base.copy()
-    Q[0, 0] *= scale
-    return Q
-
-
-def _curvature(path: np.ndarray, idx: int) -> float:
-    """
-    Estimate signed path curvature (1/m) at waypoint idx via finite-difference.
-    """
-    if idx <= 0 or idx >= len(path) - 1:
-        return 0.0
-    s_prev = path[idx]     - path[idx - 1]
-    s_next = path[idx + 1] - path[idx]
-    yaw_p  = math.atan2(s_prev[1], s_prev[0])
-    yaw_n  = math.atan2(s_next[1], s_next[0])
-    dpsi   = math.atan2(math.sin(yaw_n - yaw_p), math.cos(yaw_n - yaw_p))
-    ds     = (np.linalg.norm(s_prev) + np.linalg.norm(s_next)) * 0.5
-    return dpsi / ds if ds > 1e-6 else 0.0
-
-
-def _corner_factor(kappa: float, k: float) -> float:
-    """
-    0 (straight) -> 1 (full corner), a single continuous saturating curve
-    of the CURRENT |kappa| (the ~1m-preview curvature _error_state already
-    computes every tick, same signal _adaptive_R_rate/_steer_rate_anti_hunt
-    use). Deliberately the SAME functional shape for both rising (entry)
-    and falling (exit) curvature -- no separate decay-distance timer, no
-    hysteresis state: this is a pure function of the current instantaneous
-    signal, replacing the whole deleted lookahead approach/exit-boost
-    family (see the module comment near the top of this file). k is
-    MPCParams.corner_factor_k, the curve's sharpness.
-    """
-    return 1.0 - 1.0 / (1.0 + k * abs(kappa))
-
-
-def _blend(straight_val: float, corner_val: float, corner_frac: float) -> float:
-    """
-    Simple linear interpolation from straight_val (corner_frac=0) to
-    corner_val (corner_frac=1). Shared helper for every current-state
-    Q/R_rate weight schedule in compute() -- see _corner_factor/
-    _low_speed_corner_boost for how corner_frac itself is built.
-    """
-    return straight_val + (corner_val - straight_val) * corner_frac
-
-
-def _low_speed_corner_boost(
-    car_speed: float, corner_factor: float,
-    v_half: float, max_extra: float,
-) -> float:
-    """
-    Extra push in the SAME direction as corner_factor's "full corner"
-    endpoint (i.e. an ADDITIONAL fraction, not a separate blend), active
-    ONLY when corner_factor > 0 AND speed is low -- multiplicatively gated
-    on corner_factor so this is an exact no-op on a straight regardless of
-    speed. This is what makes it safe where the deleted
-    _low_speed_steer_rate_boost was NOT: that function fired on low speed
-    ALONE, with no curvature/lookahead signal to distinguish wanted
-    low-speed turn-in from unwanted post-exit wobble, and live testing
-    found it taxed both indistinguishably. Gating on corner_factor instead
-    of a forward scan keeps this current-state: it only ever pushes harder
-    on a corner the car is ALREADY turning through, never anticipates one.
-
-    car_speed=0 gives the full max_extra (scaled by corner_factor); the
-    boost falls off toward 0 as speed rises past v_half (the speed at
-    which half of max_extra remains), same saturating-curve style used
-    throughout this file.
-    """
-    v = max(abs(car_speed), 0.0)
-    speed_frac = v_half / (v_half + v) if v_half > 0.0 else 0.0
-    return corner_factor * max_extra * speed_frac
+from fsae_control.lmpc.constants import MAX_ACCEL, MAX_BRAKE, MAX_STEER_RAD
+from fsae_control.lmpc.adaptive_gains import (
+    _adaptive_Q_scaling,
+    _adaptive_R_scaling,
+    _blend,
+    _corner_factor,
+    _curvature,
+    _low_speed_corner_boost,
+    _reversal_penalty_boost,
+    _steer_rate_anti_hunt,
+)
+from fsae_control.lmpc.predict import predict_ahead
 
 
 # ---------------------------------------------------------------------------
@@ -520,13 +78,16 @@ class MPCController:
 
         # ── Vehicle geometry & dynamics  ─────
         # FSDS-matched values. Mass 255 kg is confirmed from the sim
-        # (docs/vehicle_model.md). The true lf/lr, Iz and Cf/Cr are NOT in the
+        # (docs/reference/vehicle_physics.md). The true lf/lr, Iz and Cf/Cr are NOT in the
         # FSDS repo (they live in git-LFS .uasset binaries), so these are chosen
         # from physical reasoning rather than read off:
-        #   - lf < lr (CoG biased toward the front axle) makes the bicycle model
-        #     UNDERSTEER (understeer gradient K_us > 0), i.e. stable at every
-        #     speed — a needless oversteer stability risk otherwise, on a car
-        #     whose real balance we can't measure.
+        #   - lf < lr puts the CoG toward the front axle. That alone does not
+        #     set the balance: Cf/Cr below come from per-corner load, so the
+        #     heavier front also gets the stiffer tyres (Cf/Cr ~= 1.49 against
+        #     lr/lf ~= 1.21), and the linear model is mildly OVERSTEER
+        #     (K_us ~= -5.5e-4 rad/(m/s^2), critical speed ~53 m/s). That is
+        #     far above any speed the car reaches, so the model is stable in
+        #     practice; do not read lf < lr as a guarantee of understeer.
         #   - Iz ~= m*lf*lr (~152) is the standard yaw-inertia estimate.
         # Wheelbase L = lf + lr = 1.55 m is an estimate for a FS car (the FSDS
         # collision box is 1.80 m long — an upper bound on car length, not the
@@ -551,7 +112,7 @@ class MPCController:
         self.nu = 2
 
         # Values live in mpc_params.py (MPCParams.q_*/r_*/r_rate_*); keep them
-        # numerically identical to fsae_MPCTest/settings.py's
+        # numerically identical to fsae_MPCTest/settings/lmpc.py's
         # Q_diag/R_diag/R_rate_diag and the same three lists in
         # fsds_simulator's copy of this file (see CLAUDE.md's parity rule).
         #
@@ -610,61 +171,44 @@ class MPCController:
         # per-step angle, so the physical meaning survives a change of dt.
         # 180 deg/s was set just under the plant's measured achievable
         # roadwheel rate (~200 deg/s, via system-ID) — see
-        # fsae_MPCTest/`docs/reference/README.md`'s "Slew-rate limit
-        # (du_max)" section for the full history.
+        # fsae_MPCTest/`docs/reference/control_mechanisms.md`'s "Slew-rate limit
+        # `du_max`" section for the full history.
         #
         # Do not raise without re-measuring; a higher value previously
         # regressed smoothness metrics. UNMEASURED either way -- the sync
         # doc explicitly says to refine this "via system-ID on the running
         # sim", not by picking a number; re-measure properly before
         # trusting either value long-term, and update both sides (this file
-        # + fsae_MPCTest's controller/optimiser.py / vehicle_physics.py
+        # + fsae_MPCTest's controller/lmpc/build.py / model/vehicle_physics/
         # du_max) together per that doc's parity rule.
         MAX_STEER_RATE_RAD_S: float = math.radians(180.0)
         self.du_max = np.array([MAX_STEER_RATE_RAD_S * self.dt, 0.6])
 
-        # TERMINAL_Q_SCALE (settings.py, fsae_MPCTest) — extra weight on the
+        # TERMINAL_Q_SCALE (settings/, fsae_MPCTest) — extra weight on the
         # final predicted state x[:,N], on top of the uniform per-step weight
         # it already gets. 1.0 = no-op, matching every weight set tuned
         # against this controller so far. Inlined here per the standing
-        # no-settings.py-on-the-car rule (now via MPCParams.terminal_q_scale
+        # no-settings-on-the-car rule (now via MPCParams.terminal_q_scale
         # in mpc_params.py); must be kept numerically identical to
         # fsae_MPCTest's copy.
         self.terminal_scale = self.params.terminal_q_scale
 
-        # ADAPTIVE_Q_SCALING_ENABLED (settings.py, fsae_MPCTest) — see
+        # ADAPTIVE_Q_SCALING_ENABLED (settings/, fsae_MPCTest) — see
         # _adaptive_Q_scaling above. Gated by MPCParams.adaptive_q_scaling_enabled.
         self.adaptive_q_scaling_enabled = self.params.adaptive_q_scaling_enabled
 
-        # STEER_RATE_ANTI_HUNT_ENABLED (settings.py, fsae_MPCTest) — see
+        # STEER_RATE_ANTI_HUNT_ENABLED (settings/, fsae_MPCTest) — see
         # _steer_rate_anti_hunt above. Experimental, not validated against
         # a live log or VALIDATION_SUITE. Default off, inlined per the
-        # standing no-settings.py-on-the-car rule; keep in sync with
+        # standing no-settings-on-the-car rule; keep in sync with
         # fsae_MPCTest's copy.
         self.steer_rate_anti_hunt_enabled = self.params.steer_rate_anti_hunt_enabled
 
         # _reversal_penalty_boost above. EXPERIMENTAL, not validated against
         # a live log or VALIDATION_SUITE. Default off, inlined per the
-        # standing no-settings.py-on-the-car rule; keep in sync with
+        # standing no-settings-on-the-car rule; keep in sync with
         # fsae_MPCTest's copy.
         self.reversal_penalty_enabled = self.params.reversal_penalty_enabled
-
-        # ADAPTIVE_R_RATE_ENABLE_IN_CORNERS (settings.py, fsae_MPCTest) —
-        # see _adaptive_R_rate's enable_in_corners param above (renamed from
-        # disable_in_corners, whose polarity was inverted from what the name
-        # suggested). True (default) keeps R_rate reduction ACTIVE in
-        # corners via the continuous curve (no threshold, no discontinuity).
-        # False uses the kappa_straight cutoff to switch softening off past
-        # it, restoring full baseline R_rate[0,0] -- raising kappa_straight
-        # causes severe lag specifically in corners: the discontinuous
-        # R_rate[0,0] jump at the kappa_straight crossing likely spikes QP
-        # solver iterations / invalidates warm-starts every tick near the
-        # threshold. Do not switch this to False without addressing that.
-        # Inlined per the standing no-settings.py-on-the-car rule; keep in
-        # sync with fsae_MPCTest's copy.
-        self.adaptive_r_rate_enable_in_corners = (
-            self.params.adaptive_r_rate_enable_in_corners
-        )
 
         # DELAY_COMPENSATION_ENABLED — TEMPORARY/EXPERIMENTAL, NOT VALIDATED.
         # Master switch for _update_n_delay()/predict_ahead() (see both
@@ -723,6 +267,13 @@ class MPCController:
         self._u_history: deque = deque(
             maxlen=self.params.max_delay_compensation_steps
         )
+        # [delta_act, a_act] as they stood just BEFORE each _u_history entry
+        # was applied, row-aligned with _u_history. The delay rollforward
+        # starts from the entry matching its oldest pending command; see
+        # compute().
+        self._act_history: deque = deque(
+            maxlen=self.params.max_delay_compensation_steps
+        )
 
         # Solved objective value (cp.Problem.value) and step-0 slack from the
         # most recent QP solve, for last_telemetry's total_cost/slack only --
@@ -744,7 +295,7 @@ class MPCController:
     def _build_qp(self) -> None:
         """
         Constructs the CVXPY problem using parameters. Built once to maximize 20Hz throughput.
-        Matches optimiser.py exactly, including soft track boundaries.
+        Matches controller/lmpc/build.py exactly, including soft track boundaries.
         """
         nx, nu, N = self.nx, self.nu, self.N
 
@@ -789,7 +340,7 @@ class MPCController:
                 du_hard >= -self.du_max[:, None],
             ]
 
-        # Cost Formulation (Exact match to optimiser.py)
+        # Cost Formulation (Exact match to controller/lmpc/build.py)
         cost  = cp.sum(cp.sum_squares(cp.multiply(sqrtQ_param, x)))
         # Terminal cost: extra weight on x[:,N] only. self.terminal_scale=1.0
         # makes this a no-op (see __init__ for the full explanation).
@@ -949,7 +500,7 @@ class MPCController:
             path_yaw = float(self._heading_profile[base_idx])
 
         # ── Reference-heading rate limit (ref_heading_rate_limit_enabled) ──
-        # Mirrors fsae_MPCTest/sim/rollout_core.py's planner branch exactly:
+        # Mirrors fsae_MPCTest/sim/rollout/core.py's planner branch exactly:
         # only e_psi is recomputed from the limited reference; e_y above is
         # left untouched (matches the offline choice not to also limit
         # lateral tracking). See the module-level comment about the
@@ -973,7 +524,7 @@ class MPCController:
         # Heading error wrapped to [-pi, pi]
         e_psi = math.atan2(math.sin(car_yaw - path_yaw), math.cos(car_yaw - path_yaw))
         # Matches vehicle_physics.py's plant_to_tracking_error /
-        # rollout_core.py's identical inline formula: e_y_dot needs both
+        # rollout/core.py's identical inline formula: e_y_dot needs both
         # body-frame velocity components, not just forward speed — omitting
         # car_vy silently drops this term whenever the car has real sideslip
         # (car_vy defaults to 0.0 for callers that don't measure it).
@@ -1124,17 +675,24 @@ class MPCController:
         qp["weighted_u_prev"].value = sqrtRr * self._u_prev
 
         # ── Primary solve: OSQP ──────
-        qp["prob"].solve(
-            solver=cp.OSQP,
-            verbose=False,
-            warm_start=True,
-            eps_abs=1e-5,
-            eps_rel=1e-5,
-            max_iter=8000,
-        )
-
-        status = qp["prob"].status
-        u_val  = qp["u"][:, 0].value
+        # CVXPY raises SolverError (rather than returning a status) when
+        # OSQP itself errors. Catch it so that case still reaches the
+        # Clarabel fallback and the hold-steer/full-brake fail-safe below
+        # instead of escaping compute() and the control step.
+        try:
+            qp["prob"].solve(
+                solver=cp.OSQP,
+                verbose=False,
+                warm_start=True,
+                eps_abs=1e-5,
+                eps_rel=1e-5,
+                max_iter=8000,
+            )
+            status = qp["prob"].status
+            u_val  = qp["u"][:, 0].value
+        except cp.error.SolverError as exc:
+            print(f"[MPC] Warning: OSQP raised {exc!r}; trying Clarabel.")
+            status, u_val = None, None
 
         if status == cp.OPTIMAL_INACCURATE and u_val is not None:
             print("[MPC] Warning: OSQP OPTIMAL_INACCURATE — Proceeding with viable solution.")
@@ -1179,7 +737,7 @@ class MPCController:
         Horizon-summed per-term cost, reproducing _build_qp's cost
         expression (see that method's "Cost Formulation" block) in plain
         numpy from the just-solved qp's variable/parameter .value's, term by
-        term instead of as one scalar. Debug-only (live_viz.py's horizon
+        term instead of as one scalar. Debug-only (live_viz/'s horizon
         panel): called once per successful solve, never affects the QP
         itself. Keep in sync with _build_qp() by hand if that cost
         expression ever changes.
@@ -1245,15 +803,17 @@ class MPCController:
         path : np.ndarray, shape (n, 2)
             Planner centreline waypoints [x, y] in the global frame.
         car_pos : np.ndarray, shape (2,)
-            Vehicle rear-axle-reference position [x, y] (global frame);
-            front axle position is derived inside _error_state via self.lf.
+            Vehicle reference position [x, y] (global frame), treated as the
+            CoG: _error_state adds self.lf (CoG to front axle) to reach the
+            front axle. Which body point FSDS odometry actually reports is
+            not established; Stanley assumes the rear axle (1.5 m offset).
         car_yaw : float
             Vehicle heading (rad, global frame).
         car_speed : float
             Vehicle forward (body-frame vx) speed (m/s); see _odom_cb note on
             how this is measured upstream. Used for the plant discretisation
             and gain scheduling, which are both parameterised on forward
-            speed alone — see rollout_core.py's identical vx_true usage.
+            speed alone — see rollout/core.py's identical vx_true usage.
         desired_speed : float
             Planner's requested speed (m/s); low-pass filtered internally.
         car_yaw_rate : float, optional
@@ -1261,7 +821,7 @@ class MPCController:
         car_vy : float, optional
             Body-frame lateral velocity (m/s), defaults to 0.0. Used only in
             _error_state's e_yd = vx*sin(e_psi) + vy*cos(e_psi) (matches
-            vehicle_physics.py's plant_to_tracking_error / rollout_core.py's
+            vehicle_physics.py's plant_to_tracking_error / rollout/core.py's
             identical inline formula exactly). Callers that only have a
             speed magnitude (no separate vx/vy) should leave this at 0.0
             rather than passing the magnitude here.
@@ -1320,6 +880,16 @@ class MPCController:
             n_delay = self._update_n_delay(pose_age_s)
             if n_delay > 0 and len(self._u_history) > 0:
                 pending_cmds = list(self._u_history)[-n_delay:]
+                # x0[6:8] is the actuator estimate for NOW, but the pose is
+                # n_delay ticks old and the pending commands are the ones
+                # issued since. Start the actuator states from where they
+                # stood when the oldest pending command was issued, so the
+                # rollforward brings them back to now instead of n_delay
+                # ticks past it (which would also drive the lateral states
+                # with a too-advanced steering angle).
+                if len(self._act_history) >= len(pending_cmds):
+                    x0 = x0.copy()
+                    x0[6:8] = self._act_history[-len(pending_cmds)]
                 x0 = predict_ahead(
                     x0, Ad, Bd, pending_cmds,
                     epsi_clip=self.params.predict_epsi_clip,
@@ -1340,8 +910,8 @@ class MPCController:
         # Replaces the deleted lookahead gain-scheduling family (see the
         # module comment near the top of this file): 0 (straight) -> 1 (full
         # corner), a single continuous saturating curve of the CURRENT
-        # ~1m-preview curvature `kappa` -- the same signal _adaptive_R_rate/
-        # _steer_rate_anti_hunt already use. No forward scan, no separate
+        # ~1m-preview curvature `kappa` -- the same signal
+        # _steer_rate_anti_hunt already uses. No forward scan, no separate
         # decay-distance timer/hysteresis state: entry and exit are
         # symmetric, driven purely by how `kappa` itself rises and falls.
         corner_factor = _corner_factor(kappa, self.params.corner_factor_k)
@@ -1368,14 +938,12 @@ class MPCController:
         R_scaled = _adaptive_R_scaling(car_speed, self.R)
         adapt["m_R_speed"] = float(R_scaled[0, 0] / self.R[0, 0]) if self.R[0, 0] else 1.0
 
-        R_rate_scaled = _adaptive_R_rate(
-            kappa, self.R_rate,
-            enable_in_corners=self.adaptive_r_rate_enable_in_corners,
-            during_floor=self.params.adaptive_r_rate_during_floor,
-        )
-        adapt["m_Rrate_corner"] = (
-            float(R_rate_scaled[0, 0] / self.R_rate[0, 0]) if self.R_rate[0, 0] else 1.0
-        )
+        # R_rate_scaled[0,0]'s base value is set below by the corner-factor
+        # blend, so it starts as a plain copy here (the removed
+        # adaptive_R_rate current-curvature floor used to scale it first,
+        # but that scale was always overwritten by the blend before it
+        # could reach the QP, see docs/reference/retired_mechanisms.md).
+        R_rate_scaled = self.R_rate.copy()
         _rr_before_hunt = float(R_rate_scaled[0, 0])
         R_rate_scaled = _steer_rate_anti_hunt(
             kappa, x0[0], R_rate_scaled, self.steer_rate_anti_hunt_enabled,
@@ -1474,7 +1042,7 @@ class MPCController:
 
         # Wall-clock the QP so the log can distinguish "the solver is slow"
         # from "the pipeline upstream of us is slow" — see solve_ms in
-        # telemetry_logger's column reference.
+        # telemetry's column reference.
         _t_solve0 = time.perf_counter()
         u_prev_for_rate = self._u_prev.copy()
         u_opt = self._solve_qp(
@@ -1483,6 +1051,7 @@ class MPCController:
         )
         solve_ms = (time.perf_counter() - _t_solve0) * 1e3
         self._u_history.append(u_opt.copy())
+        self._act_history.append(np.array([self._delta_act, self._a_act]))
 
         # Actual step-0 rate-of-change the QP's R_rate term penalised this
         # tick (u_opt vs the previous command), for last_telemetry only.
@@ -1541,7 +1110,7 @@ class MPCController:
             # branch, which never calls .solve() again after that point).
             "total_cost":    self._last_solver_cost,
             # Per-term horizon-summed cost breakdown, debug-only (see
-            # _compute_cost_breakdown). Same key/shape nmpc_core.py produces
+            # _compute_cost_breakdown). Same key/shape nmpc/solver.py produces
             # so mpc_controller.py can read one uniform structure regardless
             # of which solver is active.
             "cost_breakdown": self._last_cost_breakdown,
@@ -1560,5 +1129,6 @@ class MPCController:
         self._v_des_filtered  = None
         self._ref_psi_prev    = None
         self._u_history.clear()
+        self._act_history.clear()
         self._pose_age_filtered = None
         self._n_delay           = 0
