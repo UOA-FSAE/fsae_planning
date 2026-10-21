@@ -13,6 +13,8 @@ Interface (matches the fsae_autonomous car stack):
 
     in   /fsae/slam/left_track    fsae_interfaces/Track     blue (left) boundary, global frame
     in   /fsae/slam/right_track   fsae_interfaces/Track     yellow (right) boundary, global frame
+    in   /fsae/slam/big_orange_track    fsae_interfaces/Track  start/finish line, global frame
+    in   /fsae/slam/small_orange_track  fsae_interfaces/Track  accel braking zone (clearance only)
     in   /fsae/slam/car_position  geometry_msgs/PoseStamped x,y in position; yaw in orientation.w
     out  /fsae/planning/selected_trajectory  geometry_msgs/PoseArray   centreline waypoints
 
@@ -52,6 +54,7 @@ from std_msgs.msg import ColorRGBA, Empty
 from visualization_msgs.msg import Marker, MarkerArray
 
 from fsae_planning.boundary import (
+    assign_orange_sides,
     build_path_walls,
     build_wall_segments_delaunay,
     debug_triangulation_edges,
@@ -59,6 +62,7 @@ from fsae_planning.boundary import (
     _WALL_MAX_TURN_COS,
     _WALL_MID_MIN_DELAUNAY,
     _WALL_MID_MAX_DELAUNAY,
+    _START_LINE_MAX_WIDTH,
 )
 from fsae_planning.cone_sorting import MAX_PAIR_DIST
 from fsae_planning.path_utils import (
@@ -76,6 +80,7 @@ _TRI_EDGE_STYLE = {
     'mid':   (ColorRGBA(r=1.0, g=0.0, b=1.0, a=0.9), 0.06),
     'long':  (ColorRGBA(r=1.0, g=0.6, b=0.0, a=0.5), 0.03),
     'cross': (ColorRGBA(r=0.8, g=0.8, b=0.8, a=0.35), 0.02),
+    'start': (ColorRGBA(r=1.0, g=0.45, b=0.0, a=1.0), 0.10),
 }
 
 # _planning_loop runs synchronously inside the pose-subscription callback, on
@@ -217,6 +222,15 @@ class CenterlinePlanner(Node):
         # instead of always using the wide cone_sorting.MAX_PAIR_DIST default.
         self.declare_parameter('fallback_max_pair_dist', MAX_PAIR_DIST)
 
+        # Orange cones. use_orange is the rollback switch: false ignores both
+        # orange topics entirely (the pre-orange behaviour). Big orange pairs
+        # at most start_line_max_width apart (min is mid_min_gate) are given a
+        # side and close the wall gap at the start line -- see
+        # boundary.assign_orange_sides. Unpaired big orange and all small
+        # orange cones only join the min_cone_clearance set.
+        self.declare_parameter('use_orange', True)
+        self.declare_parameter('start_line_max_width', _START_LINE_MAX_WIDTH)
+
         # -- input staleness gates. Ported from the real stack, where a
         # camera/SLAM pipeline can stall or drop frames. The simulator's
         # perception is synchronous ground truth so these rarely fire here,
@@ -268,6 +282,9 @@ class CenterlinePlanner(Node):
         self._mid_max_gate       = self.get_parameter('mid_max_gate').get_parameter_value().double_value
         self._fallback_max_pair_dist = \
             self.get_parameter('fallback_max_pair_dist').get_parameter_value().double_value
+        self._use_orange = self.get_parameter('use_orange').get_parameter_value().bool_value
+        self._start_line_max_width = \
+            self.get_parameter('start_line_max_width').get_parameter_value().double_value
         self._max_pose_age       = self.get_parameter('max_pose_age').get_parameter_value().double_value
         self._max_track_age      = self.get_parameter('max_track_age').get_parameter_value().double_value
         self._max_track_skew     = self.get_parameter('max_track_skew').get_parameter_value().double_value
@@ -294,6 +311,7 @@ class CenterlinePlanner(Node):
             ('path_hold_timeout', self._path_hold_timeout),
             ('plan_horizon', self._plan_horizon),
             ('look_radius', self._look_radius),
+            ('start_line_max_width', self._start_line_max_width),
         ):
             if not (math.isfinite(val) and val > 0.0):
                 raise ValueError(f'{name} must be a finite positive number, got {val!r}')
@@ -312,6 +330,8 @@ class CenterlinePlanner(Node):
         self.create_subscription(Track, '/fsae/slam/left_track',  self._left_cb,  10)
         self.create_subscription(Track, '/fsae/slam/right_track', self._right_cb, 10)
         self.create_subscription(PoseStamped, '/fsae/slam/car_position', self._pose_cb, 10)
+        self.create_subscription(Track, '/fsae/slam/big_orange_track',   self._big_orange_cb,   10)
+        self.create_subscription(Track, '/fsae/slam/small_orange_track', self._small_orange_cb, 10)
 
         # Debug hook: the planner has no cone memory of its own (see _compute_path),
         # but blend_paths() still eases between the last published path and each
@@ -351,6 +371,12 @@ class CenterlinePlanner(Node):
         # /fsae/slam/*_track publishes right now.
         self._blue_cones:   np.ndarray = np.empty((0, 2))
         self._yellow_cones: np.ndarray = np.empty((0, 2))
+        self._big_orange:   np.ndarray = np.empty((0, 2))
+        self._small_orange: np.ndarray = np.empty((0, 2))
+        # Orange cones used this tick (see _orange_inputs), cached so _sanitize
+        # checks clearance against the same set the path was built from.
+        self._orange_tick:    np.ndarray | None = None
+        self._clearance_extra: np.ndarray = np.empty((0, 2))
         self._car_pos   = np.zeros(2)
         self._car_yaw   = 0.0
         self._have_pose = False
@@ -367,6 +393,8 @@ class CenterlinePlanner(Node):
         # above for why arrival time and not message stamps.
         self._left_track_time = None
         self._right_track_time = None
+        self._big_orange_time = None
+        self._small_orange_time = None
         self._pose_time = None
 
         self.get_logger().info(f'{node_name} ready — waiting for car_position.')
@@ -382,6 +410,14 @@ class CenterlinePlanner(Node):
     def _right_cb(self, msg: Track) -> None:
         self._yellow_cones = cones_to_array(msg.cones, self.get_logger(), 'right_track')
         self._right_track_time = self.get_clock().now()
+
+    def _big_orange_cb(self, msg: Track) -> None:
+        self._big_orange = cones_to_array(msg.cones, self.get_logger(), 'big_orange_track')
+        self._big_orange_time = self.get_clock().now()
+
+    def _small_orange_cb(self, msg: Track) -> None:
+        self._small_orange = cones_to_array(msg.cones, self.get_logger(), 'small_orange_track')
+        self._small_orange_time = self.get_clock().now()
 
     def _pose_cb(self, msg: PoseStamped) -> None:
         # x,y in position; yaw (rad) is stuffed into orientation.w (upstream
@@ -405,6 +441,10 @@ class CenterlinePlanner(Node):
         """Drop blend/path state (debug/testing only)."""
         self._blue_cones   = np.empty((0, 2))
         self._yellow_cones = np.empty((0, 2))
+        self._big_orange   = np.empty((0, 2))
+        self._small_orange = np.empty((0, 2))
+        self._orange_tick  = None
+        self._clearance_extra = np.empty((0, 2))
         self._centreline   = None
         self._prev_centreline = None
         self._last_valid_centreline = None
@@ -421,11 +461,36 @@ class CenterlinePlanner(Node):
         self._pose_time = None
         self._left_track_time = None
         self._right_track_time = None
+        self._big_orange_time = None
+        self._small_orange_time = None
         self.get_logger().info('planner state reset by external request')
 
     # ------------------------------------------------------------------
     # Input staleness
     # ------------------------------------------------------------------
+
+    def _orange_inputs(self) -> tuple[np.ndarray | None, np.ndarray]:
+        """
+        (big_orange for the mesh, extra cones for the clearance check).
+
+        Orange is deliberately NOT part of _inputs_fresh: no orange cone in
+        view is the normal case for most of a lap. A topic older than
+        max_track_age just counts as empty. With use_orange false this returns
+        (None, empty) -- exactly the pre-orange behaviour.
+        """
+        empty = np.empty((0, 2))
+        if not self._use_orange:
+            return None, empty
+        now = self.get_clock().now()
+
+        def fresh(arr: np.ndarray, t) -> np.ndarray:
+            if t is None or (now - t).nanoseconds * 1e-9 > self._max_track_age:
+                return empty
+            return arr
+
+        big = fresh(self._big_orange, self._big_orange_time)
+        small = fresh(self._small_orange, self._small_orange_time)
+        return big, np.vstack([big, small])
 
     def _inputs_fresh(self) -> bool:
         now = self.get_clock().now()
@@ -527,9 +592,8 @@ class CenterlinePlanner(Node):
                     break
 
         if self._min_cone_clearance > 0.0:
-            cones = np.vstack([self._blue_cones, self._yellow_cones]) \
-                if (len(self._blue_cones) + len(self._yellow_cones)) > 0 else None
-            if cones is not None and len(cones) > 0:
+            cones = np.vstack([self._blue_cones, self._yellow_cones, self._clearance_extra])
+            if len(cones) > 0:
                 d = np.linalg.norm(pts[:, None, :] - cones[None, :, :], axis=2)
                 too_close = np.where(d.min(axis=1) < self._min_cone_clearance)[0]
                 if len(too_close) > 0:
@@ -590,6 +654,7 @@ class CenterlinePlanner(Node):
         self._prev_path_dir = None
 
     def _run_planning_tick(self) -> None:
+        self._orange_tick, self._clearance_extra = self._orange_inputs()
         if self._inputs_fresh():
             self._compute_path()
             if not self._inputs_fresh():
@@ -746,6 +811,8 @@ class CenterlinePlanner(Node):
                     midpoint_method=self._midpoint_method,
                     mid_min_gate=self._mid_min_gate,
                     mid_max_gate=self._mid_max_gate,
+                    orange_cones=self._orange_tick,
+                    start_line_max_width=self._start_line_max_width,
                 )
             dt = time.perf_counter() - t0
             if dt > _SLOW_TICK_WARN_SEC:
@@ -761,8 +828,20 @@ class CenterlinePlanner(Node):
                 f'Wall-barrier planner failed ({exc!r}), falling back to simple pairing',
                 throttle_duration_sec=5.0,
             )
+            # Same orange side assignment as the primary build, so the
+            # fallback sees the start-line gap closed too. Guarded on its own:
+            # if it is what raised, plan from blue/yellow alone.
+            blue, yellow = self._blue_cones, self._yellow_cones
+            if self._orange_tick is not None:
+                try:
+                    blue, yellow, _ = assign_orange_sides(
+                        blue, yellow, self._orange_tick,
+                        min_w=self._mid_min_gate, max_w=self._start_line_max_width,
+                    )
+                except Exception:
+                    blue, yellow = self._blue_cones, self._yellow_cones
             self._centreline = build_local_path(
-                self._blue_cones, self._yellow_cones,
+                blue, yellow,
                 self._car_pos, self._car_yaw,
                 max_pair_dist=self._fallback_max_pair_dist,
             )
@@ -775,9 +854,7 @@ class CenterlinePlanner(Node):
             # against), accepting a fallback plan under weaker scrutiny than
             # the primary planner instead of equivalent validation.
             try:
-                self._blue_segs, self._yellow_segs = build_wall_segments_delaunay(
-                    self._blue_cones, self._yellow_cones,
-                )
+                self._blue_segs, self._yellow_segs = build_wall_segments_delaunay(blue, yellow)
             except Exception:
                 self._blue_segs, self._yellow_segs = [], []
             self._midpoints = np.empty((0, 2))
@@ -878,7 +955,7 @@ class CenterlinePlanner(Node):
         patch free of new interface definitions and rebuilds of fsae_interfaces.
 
         The triangulation publishes one LINE_LIST marker per edge tag
-        (wall/mid/long/cross, see boundary.debug_triangulation_edges) so a
+        (wall/mid/long/cross/start, see boundary.debug_triangulation_edges) so a
         wall- or midpoint-build problem can be inspected directly: an expected
         wall edge missing from 'wall' but present as 'long' means max_dist
         trimmed it; missing from all four means the triangulation itself never
@@ -902,9 +979,11 @@ class CenterlinePlanner(Node):
             self._blue_cones, self._yellow_cones,
             mid_min=self._mid_min_gate,
             mid_max=self._mid_max_gate,
+            orange_cones=self._orange_tick,
+            start_line_max_width=self._start_line_max_width,
         )
         markers = MarkerArray()
-        for i, tag in enumerate(('wall', 'mid', 'long', 'cross')):
+        for i, tag in enumerate(('wall', 'mid', 'long', 'cross', 'start')):
             edges = [(p1, p2) for p1, p2, t in tagged if t == tag]
             markers.markers.append(self._edges_marker(edges, i, tag))
         self._dbg_pubs['triangulation'].publish(markers)

@@ -112,6 +112,30 @@ _WALL_MAX_TURN_COS  = -0.5
 # saturation and a spin-out.
 _WALL_PLAN_HORIZON  = 25.0
 
+# Start/finish-line orange cones (see assign_orange_sides).
+# _START_LINE_MAX_WIDTH: widest orange pair accepted as one start-line gate.
+# Measured on all 7 FSDS v2.2.0 trackdrive maps: the gate is 4 big orange cones,
+# 2 per side 1.30 m apart along the track, 3.45 m across (4.34 m on
+# CompetitionMap2); the across-gate diagonal is 3.69 m (4.53 m). Closest-first
+# pairing takes the straight-across pairs before any diagonal, so 5.0 m covers
+# every measured width with margin while staying well under a second gate's
+# reach. (The real SLAM's start_line_max_width of 8.0 m is a lap-counting bound,
+# not a pairing one.)
+_START_LINE_MAX_WIDTH = 5.0
+# Radius (m) around a candidate pair's midpoint whose blue/yellow cones decide
+# which orange cone sits on which side.
+_START_SIDE_RADIUS = 8.0
+# An orange cone this close (m) to a blue/yellow cone is treated as a stray: the
+# real camera labels unknown objects big_orange, and a stray next to a real cone
+# would otherwise pair into a gate too short to accept. The closest genuine FSDS
+# gate cone sits 0.62 m from its neighbouring yellow.
+_ORANGE_STRAY_DIST = 0.5
+# Fraction of each colour's nearby cones that must lie on that colour's end of
+# the pair. A genuine gate puts every boundary cone on its own side (~1.0); two
+# orange cones on the SAME side of the track see each colour split ~50/50
+# along their axis and are rejected.
+_START_SIDE_MIN_FRAC = 0.75
+
 
 def build_wall_segments(
     cones: np.ndarray,
@@ -247,6 +271,128 @@ def build_wall_segments_delaunay(
     return mesh.wall_segments(max_dist)
 
 
+def _gate_sides(
+    o1: np.ndarray,
+    o2: np.ndarray,
+    blue: np.ndarray,
+    yellow: np.ndarray,
+    radius: float,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """
+    Decide which end of the orange pair o1-o2 is the blue side. Returns
+    (blue_end, yellow_end), or None if the nearby boundary cones don't put the
+    two colours clearly at opposite ends.
+
+    Uses only the cones' positions along the o1->o2 axis -- never the car's
+    heading -- so a gate classifies the same way from either direction.
+    """
+    mid = (o1 + o2) * 0.5
+    w = float(np.linalg.norm(o2 - o1))
+    u = (o2 - o1) / w
+    near_b = blue[np.linalg.norm(blue - mid, axis=1) <= radius]
+    near_y = yellow[np.linalg.norm(yellow - mid, axis=1) <= radius]
+    if len(near_b) == 0 or len(near_y) == 0:
+        return None
+    tb = (near_b - mid) @ u
+    ty = (near_y - mid) @ u
+    margin = 0.25 * w
+    mb, my = float(tb.mean()), float(ty.mean())
+    if (mb <= -margin and my >= margin
+            and np.mean(tb < 0.0) >= _START_SIDE_MIN_FRAC
+            and np.mean(ty > 0.0) >= _START_SIDE_MIN_FRAC):
+        return o1, o2
+    if (mb >= margin and my <= -margin
+            and np.mean(tb > 0.0) >= _START_SIDE_MIN_FRAC
+            and np.mean(ty < 0.0) >= _START_SIDE_MIN_FRAC):
+        return o2, o1
+    return None
+
+
+def assign_orange_sides(
+    blue: np.ndarray,
+    yellow: np.ndarray,
+    orange: np.ndarray | None,
+    min_w: float = _WALL_MID_MIN_DELAUNAY,
+    max_w: float = _START_LINE_MAX_WIDTH,
+    radius: float = _START_SIDE_RADIUS,
+) -> tuple[np.ndarray, np.ndarray, list[tuple[np.ndarray, np.ndarray]]]:
+    """
+    Give each start-line (big) orange cone a side so the track mesh can use it.
+
+    Orange cones mark the start/finish line, so the boundary walls have a gap
+    there. Left out of the mesh, the cross-track diagonals across that gap are
+    longer than mid_max_gate, their triangles are rejected, and the corridor
+    walk dead-ends at the start line. Appending each orange cone to the colour
+    of the side it stands on closes the gap with ordinary wall edges and turns
+    the orange-orange edge into an ordinary cross-colour gate -- track_mesh
+    needs no special case.
+
+      1. Drop strays: any orange cone within _ORANGE_STRAY_DIST of a blue/
+         yellow cone.
+      2. Pair closest-first. A pair is two cones min_w..max_w apart whose
+         sides _gate_sides can tell apart; each cone is used once. The side
+         test is part of acceptance, so two same-side gate cones (1.30 m apart
+         in FSDS, inside min_w..max_w) are rejected without using up either
+         cone, and the straight-across pairs are found next.
+      3. Append each pair's blue-end cone to blue and its yellow-end cone to
+         yellow.
+
+    Unpaired orange cones stay out of the mesh (callers should still keep
+    them in their clearance checks). Pass big orange only -- small orange
+    cones (accel braking zone) don't mark a line.
+
+    Returns (blue_aug, yellow_aug, start_pairs), start_pairs being a list of
+    (blue_end, yellow_end) points. With orange None/empty, or no pair found,
+    blue/yellow come back unchanged and start_pairs is empty.
+    """
+    blue = np.asarray(blue, dtype=np.float64).reshape(-1, 2)
+    yellow = np.asarray(yellow, dtype=np.float64).reshape(-1, 2)
+    if orange is None:
+        return blue, yellow, []
+    orange = np.asarray(orange, dtype=np.float64).reshape(-1, 2)
+    if len(orange) < 2 or len(blue) == 0 or len(yellow) == 0:
+        return blue, yellow, []
+
+    others = np.vstack([blue, yellow])
+    clear = np.linalg.norm(orange[:, None, :] - others[None, :, :], axis=2).min(axis=1)
+    orange = orange[clear >= _ORANGE_STRAY_DIST]
+
+    n = len(orange)
+    cands = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = float(np.linalg.norm(orange[i] - orange[j]))
+            if min_w <= d <= max_w:
+                cands.append((d, i, j))
+    cands.sort()
+
+    used: set = set()
+    pairs: list[tuple[np.ndarray, np.ndarray]] = []
+    for _, i, j in cands:
+        if i in used or j in used:
+            continue
+        sides = _gate_sides(orange[i], orange[j], blue, yellow, radius)
+        if sides is None:
+            continue
+        used.update((i, j))
+        pairs.append(sides)
+
+    if not pairs:
+        return blue, yellow, []
+    blue_aug = np.vstack([blue, np.array([p[0] for p in pairs])])
+    yellow_aug = np.vstack([yellow, np.array([p[1] for p in pairs])])
+    return blue_aug, yellow_aug, pairs
+
+
+def _is_start_edge(p1, p2, start_pairs) -> bool:
+    for a, b in start_pairs:
+        if np.allclose(p1, a) and np.allclose(p2, b):
+            return True
+        if np.allclose(p1, b) and np.allclose(p2, a):
+            return True
+    return False
+
+
 def debug_triangulation_edges(
     blue: np.ndarray,
     yellow: np.ndarray,
@@ -254,6 +400,8 @@ def debug_triangulation_edges(
     mid_min: float = _WALL_MID_MIN_DELAUNAY,
     mid_max: float = _WALL_MID_MAX_DELAUNAY,
     mesh: TrackMesh | None = None,
+    orange_cones: np.ndarray | None = None,
+    start_line_max_width: float = _START_LINE_MAX_WIDTH,
 ) -> list[tuple[np.ndarray, np.ndarray, str]]:
     """
     Return every edge of the track mesh build_wall_segments_delaunay/
@@ -274,16 +422,25 @@ def debug_triangulation_edges(
       'cross' — cross colour, but every mixed triangle it belongs to failed
                 that length check (an implausibly short/long gate, usually
                 from a missing intermediate cone or a stray/mislabelled one).
+      'start' — the orange-orange edge of a start-line pair (see
+                assign_orange_sides); only with orange_cones given.
 
     The edges are those of track_mesh.build_track_mesh, i.e. exactly the mesh
     build_path_walls planned on, bridges included (a bridge is tagged 'wall'
-    like any other kept same-colour edge).
+    like any other kept same-colour edge). orange_cones/start_line_max_width
+    must match what build_path_walls was given for that to hold; a passed-in
+    `mesh` must already include the assigned orange cones.
 
     Returns an empty list on degenerate input (fewer than 3 cones total, or a
     triangulation-raising point set) -- same conditions
     build_wall_segments_delaunay falls back on, but there's nothing
     meaningful to tag without a triangulation to draw from.
     """
+    start_pairs: list = []
+    if orange_cones is not None:
+        blue, yellow, start_pairs = assign_orange_sides(
+            blue, yellow, orange_cones, min_w=mid_min, max_w=start_line_max_width,
+        )
     if mesh is None:
         mesh = build_track_mesh(blue, yellow, max_dist=max_dist)
     if mesh is None:
@@ -304,7 +461,10 @@ def debug_triangulation_edges(
     tagged: list[tuple[np.ndarray, np.ndarray, str]] = []
     for i, j in mesh.edges():
         if is_blue[i] != is_blue[j]:
-            tag = 'mid' if gate_ok.get((i, j), False) else 'cross'
+            if start_pairs and _is_start_edge(points[i], points[j], start_pairs):
+                tag = 'start'
+            else:
+                tag = 'mid' if gate_ok.get((i, j), False) else 'cross'
         elif float(np.linalg.norm(points[i] - points[j])) > max_dist:
             tag = 'long'
         else:
@@ -964,6 +1124,8 @@ def build_path_walls(
     midpoint_method: str = 'delaunay',
     mid_min_gate: float = _WALL_MID_MIN_DELAUNAY,
     mid_max_gate: float = _WALL_MID_MAX_DELAUNAY,
+    orange_cones: np.ndarray | None = None,
+    start_line_max_width: float = _START_LINE_MAX_WIDTH,
 ) -> tuple[np.ndarray | None,
            list[tuple[np.ndarray, np.ndarray]],
            list[tuple[np.ndarray, np.ndarray]],
@@ -1015,6 +1177,12 @@ def build_path_walls(
     mid_max_gate even though its true cross-track width does not (a straight
     3 m-wide corridor with cones spaced 5 m apart has ~5.83 m diagonals).
 
+    orange_cones: big orange (start/finish line) cones, or None. Paired ones
+    are given a side by assign_orange_sides and join blue/yellow for every
+    method and the fallback, closing the wall gap at the start line. None (or
+    no pair found) leaves the output identical to not passing it.
+    start_line_max_width bounds the pair width; the min is mid_min_gate.
+
     Returns
     -------
     centreline  : (N, 2) smoothed path, or None on failure
@@ -1022,6 +1190,12 @@ def build_path_walls(
     yellow_segs : wall segments from yellow cones (for visualisation)
     midpoints   : (M, 2) all candidate midpoints  (for visualisation)
     """
+    if orange_cones is not None:
+        blue_cones, yellow_cones, _ = assign_orange_sides(
+            blue_cones, yellow_cones, orange_cones,
+            min_w=mid_min_gate, max_w=start_line_max_width,
+        )
+
     # One mesh for walls AND corridor -- see track_mesh.build_track_mesh.
     mesh = build_track_mesh(blue_cones, yellow_cones, max_dist=_WALL_MAX_DIST)
     blue_segs, yellow_segs = build_wall_segments_delaunay(blue_cones, yellow_cones, mesh=mesh)
