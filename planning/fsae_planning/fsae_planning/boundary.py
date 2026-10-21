@@ -112,6 +112,12 @@ _WALL_MAX_TURN_COS  = -0.5
 # saturation and a spin-out.
 _WALL_PLAN_HORIZON  = 25.0
 
+# _walk_corridor: a first gate midpoint closer than this (m) to the car is too
+# close for car -> gate to give a direction; the walk seeds its turn check
+# from prev_dir/heading instead and leaves that point out of the path (same
+# for a first midpoint behind the car).
+_WALK_NEAR_ENTRY = 0.5
+
 # Start/finish-line orange cones (see assign_orange_sides).
 # _START_LINE_MAX_WIDTH: widest orange pair accepted as one start-line gate.
 # Measured on all 7 FSDS v2.2.0 trackdrive maps: the gate is 4 big orange cones,
@@ -872,8 +878,17 @@ def _walk_corridor(
     path = [gate_mid[current_gate]]
     step = path[0] - car_pos
     n = float(np.linalg.norm(step))
-    cur_dir = step / n if n > 1e-6 else seed_dir
-    arc_len = n   # cumulative car -> path[-1] distance -- the walk's real stopping metric
+    # The first gate's midpoint can be right at the car or behind it: the car
+    # is still behind a diagonal gate's line but already past its midpoint.
+    # Seeding cur_dir from that car -> gate vector (tiny, or pointing back)
+    # failed the very next turn check and gave a 1-point path. Use the travel
+    # direction instead, and drop that point once the walk has gone past it
+    # (see the end of this function).
+    skip_entry = n < _WALK_NEAR_ENTRY or float(step @ seed_dir) < 0.0
+    cur_dir = seed_dir if skip_entry else step / n
+    # cumulative car -> path[-1] distance -- the walk's real stopping metric.
+    # A skipped entry point doesn't count, so the walk can't stop short.
+    arc_len = 0.0 if skip_entry else n
 
     if arc_len >= max_arc_length:
         return np.array(path, dtype=np.float64)
@@ -907,6 +922,8 @@ def _walk_corridor(
         if arc_len >= max_arc_length:
             break
 
+    if skip_entry and len(path) > 1:
+        path = path[1:]
     return np.array(path, dtype=np.float64)
 
 
