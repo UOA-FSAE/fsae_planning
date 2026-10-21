@@ -19,6 +19,8 @@ def generate_launch_description():
     planner = LaunchConfiguration('planner')
     look_radius = LaunchConfiguration('look_radius')
     plan_horizon = LaunchConfiguration('plan_horizon')
+    debug_viz = LaunchConfiguration('debug_viz')
+    use_orange = LaunchConfiguration('use_orange')
 
     run_centerline = IfCondition(
         PythonExpression(["'", planner, "' == 'centerline_planner'"])
@@ -50,6 +52,16 @@ def generate_launch_description():
             'plan_horizon', default_value='25.0',
             description='m -- arc-length horizon the published centreline is clamped to '
                         '(overrides fsae_params.yaml centerline_planner.plan_horizon)'),
+        DeclareLaunchArgument(
+            'debug_viz', default_value='false',
+            description='centerline_planner only -- publish /fsae/planning/debug/* '
+                        '(midpoints, wall mesh, Delaunay triangulation). Read once at '
+                        'startup, so it must be set here rather than via ros2 param set.'),
+        DeclareLaunchArgument(
+            'use_orange', default_value='true',
+            description='centerline_planner only -- plan with the big orange start-line '
+                        'cones (overrides fsae_params.yaml centerline_planner.use_orange; '
+                        'false is the rollback). Read once at startup.'),
         Node(
             package='fsae_planning',
             executable=planner,
@@ -58,6 +70,8 @@ def generate_launch_description():
             parameters=[config, {
                 'look_radius': look_radius,
                 'plan_horizon': plan_horizon,
+                'debug_viz': debug_viz,
+                'use_orange': use_orange,
             }],
             condition=run_centerline,
         ),

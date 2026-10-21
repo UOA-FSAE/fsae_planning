@@ -45,6 +45,8 @@ def generate_launch_description():
     use_precomputed_path = LaunchConfiguration('use_precomputed_path')
     look_radius = LaunchConfiguration('look_radius')
     plan_horizon = LaunchConfiguration('plan_horizon')
+    debug_viz = LaunchConfiguration('debug_viz')
+    use_orange = LaunchConfiguration('use_orange')
     v_max = LaunchConfiguration('v_max')
     v_min = LaunchConfiguration('v_min')
     stanley_gain = LaunchConfiguration('stanley_gain')
@@ -148,6 +150,16 @@ def generate_launch_description():
             description="Passed through to planning.launch.py — see that file's "
                         "plan_horizon description (centerline_planner only)."),
         DeclareLaunchArgument(
+            'debug_viz', default_value='false',
+            description="Passed through to planning.launch.py -- publish the "
+                        "planner's /fsae/planning/debug/* topics, including the "
+                        "Delaunay triangulation (centerline_planner only)."),
+        DeclareLaunchArgument(
+            'use_orange', default_value='true',
+            description="Passed through to planning.launch.py -- plan with the big "
+                        "orange start-line cones (centerline_planner only; false is "
+                        "the rollback)."),
+        DeclareLaunchArgument(
             'v_max', default_value='15.0',
             description='m/s -- top speed on straights (overrides fsae_params.yaml controller.v_max)'),
         DeclareLaunchArgument(
@@ -174,6 +186,8 @@ def generate_launch_description():
             'planner': planner,
             'look_radius': look_radius,
             'plan_horizon': plan_horizon,
+            'debug_viz': debug_viz,
+            'use_orange': use_orange,
         }),
         include('control.launch.py',    {
             'planner': planner,

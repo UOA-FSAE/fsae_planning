@@ -79,6 +79,10 @@ sim_perception:
 # that point; a jump or a sub-minimum remaining length rejects it outright.
 # `max_hold_deviation` (m): how far the car may be from a HELD path before the
 # hold is dropped (localisation jump, or simply too much motion since).
+# `use_orange`: plan with the big orange start/finish cones (rollback switch;
+# false ignores both orange topics). `start_line_max_width` (m): widest orange
+# pair accepted as a start-line gate -- the FSDS gate is 3.45 m across (4.34 m
+# on CompetitionMap2), see boundary._START_LINE_MAX_WIDTH.
 centerline_planner:
   ros__parameters:
     smooth: 0.015
@@ -96,6 +100,8 @@ centerline_planner:
     min_cone_clearance: 0.4
     min_usable_path_length: 2.0
     max_hold_deviation: 2.0
+    use_orange: true
+    start_line_max_width: 5.0
 skidpad_planner:
   ros__parameters:
     v_start: 3.0        # m/s — speed at the start of the ramp
