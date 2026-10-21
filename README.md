@@ -299,14 +299,14 @@ drift against each other). Override any of them the same way as
 `v_max`/`v_min` above, e.g.:
 
 ```
-ros2 launch fsae_bringup sim.launch.py q_e_y:=6.5 adaptive_r_rate_during_floor:=0.55
+ros2 launch fsae_bringup sim.launch.py q_e_y:=6.5 corner_factor_k:=6.0
 ```
 
 `ros2/launch_all.sh` also exposes a small shortlist of the most commonly
 retuned fields (`MPC_Q_E_Y`, `MPC_Q_E_PSI`, `MPC_R_DELTA`,
-`MPC_ADAPTIVE_R_RATE_DURING_FLOOR`, `MPC_ADAPTIVE_R_RATE_ENTERING_FLOOR`) as
-commented-out shell variables near the top of that script — uncomment and
-set one to override it for that launch without touching `fsae_params.yaml`.
+`MPC_CORNER_FACTOR_K`) as commented-out shell variables near the top of
+that script — uncomment and set one to override it for that launch without
+touching `fsae_params.yaml`.
 
 Must be kept numerically identical to `fsae_MPCTest/settings.py`'s matching
 constants (see the outer repo's `CLAUDE.md` for the parity rule) — that repo

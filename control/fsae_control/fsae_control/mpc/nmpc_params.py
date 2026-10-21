@@ -312,7 +312,7 @@ class NMPCParams:
     # violating the boundary, so slack stays 0 and this term adds nothing).
     # Raise it to ~1000 alongside any progress-term experiment; it is
     # necessary there, just not sufficient.
-    nmpc_slack_linear_weight: float = field(default=500.0, metadata={
+    nmpc_slack_linear_weight: float = field(default=1000.0, metadata={
         "unit": "1/m",
         "desc": "LINEAR track-bound slack penalty, additional to the "
                 "quadratic nmpc_slack_weight above. 0.0 disables it. "
@@ -401,6 +401,25 @@ class NMPCParams:
         "controller": "nmpc_only",
     })
 
+    # ── Prediction state frame ───────────────────────────────────────────
+    nmpc_cartesian_model_enabled: bool = field(default=True, metadata={
+        "unit": "bool",
+        "desc": "true (default) -> predict in the world frame (CoG x, y, "
+                "heading) instead of the Frenet frame (s, e_y, e_psi), and "
+                "measure e_y/e_psi only in the cost by projecting each "
+                "predicted front axle onto the path. Path curvature then "
+                "never enters the integrated prediction, so a curvature "
+                "artefact cannot steer the car the way it can through the "
+                "Frenet e_psi_dot = r - kappa*s_dot; kappa remains only in "
+                "the e_psi_dot cost row and the projection's Newton step. "
+                "Same weights, constraints and tyre model either way. Read "
+                "once at construction. Default since live runs on "
+                "comp_test_map_3 drove cleanly in both precomputed and "
+                "live-planner mode; false restores the original Frenet "
+                "model unchanged, for A/B comparison",
+        "controller": "nmpc_only",
+    })
+
     # ── Path reference construction ─────────────────────────────────────
     nmpc_spline_reference_enabled: bool = field(default=True, metadata={
         "unit": "bool",
@@ -481,7 +500,7 @@ class NMPCParams:
                 "is IDENTICAL to before this feature existed",
         "controller": "nmpc_only",
     })
-    nmpc_progress_reach: float = field(default=3.0, metadata={
+    nmpc_progress_reach: float = field(default=2.0, metadata={
         "unit": "-",
         "desc": "s_target_N = X[0,s] + max(v_cap*N*dt*REACH, "
                 "0.5*a_max*(N*dt)^2*REACH); >1 keeps the target always out "
