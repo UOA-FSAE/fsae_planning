@@ -21,7 +21,17 @@ republishes it on the exact topics/messages the car stack expects.
                                                                   by anything in this repo.
     out  /fsae/slam/left_track     fsae_interfaces/Track         blue (left) boundary, global frame
     out  /fsae/slam/right_track    fsae_interfaces/Track         yellow (right) boundary, global frame
+    out  /fsae/slam/big_orange_track    fsae_interfaces/Track    big orange cones (start/finish line), global frame
+    out  /fsae/slam/small_orange_track  fsae_interfaces/Track    small orange cones (e.g. accel braking zone), global frame
     out  /fsae/perception/cone_detection  fsae_interfaces/ConeDetection  local-frame detections + car_pose
+                                                                  (blue, yellow, big_orange, small_orange)
+
+Orange cones: FSDS's oracle map carries them (ORANGE_BIG = the 4-cone start/
+finish gate on every map; Acceleration also has ORANGE_SMALL along the braking
+zone). They are kept on their own topics, never mixed into left/right_track,
+because they mark the start/finish line rather than a track edge -- the same
+split the real car's SLAM makes. Cropped to the same FOV window as blue/yellow,
+so the start gate drops out of view after launch and reappears on the next lap.
 
 Set the `full_track` parameter true to publish the entire map every frame (used by
 the skidpad planner, which reconstructs the whole figure-8 up front); the default
@@ -115,11 +125,15 @@ class SimPerception(Node):
         self.pub_odom  = self.create_publisher(Odometry,      '/fsae/slam/car_odom',            10)
         self.pub_left  = self.create_publisher(Track,         '/fsae/slam/left_track',          10)
         self.pub_right = self.create_publisher(Track,         '/fsae/slam/right_track',         10)
+        self.pub_big_orange   = self.create_publisher(Track, '/fsae/slam/big_orange_track',   10)
+        self.pub_small_orange = self.create_publisher(Track, '/fsae/slam/small_orange_track', 10)
         self.pub_det   = self.create_publisher(ConeDetection, '/fsae/perception/cone_detection', 10)
 
         # Oracle map, split by colour into global (N, 2) arrays once received.
         self._blue_all:   np.ndarray = np.empty((0, 2))
         self._yellow_all: np.ndarray = np.empty((0, 2))
+        self._big_orange_all:   np.ndarray = np.empty((0, 2))
+        self._small_orange_all: np.ndarray = np.empty((0, 2))
         self._have_map = False
         self._have_odom = False
         self._car_x = 0.0
@@ -157,19 +171,30 @@ class SimPerception(Node):
     # ------------------------------------------------------------------
 
     def _track_cb(self, msg: FsTrack) -> None:
-        blue, yellow = [], []
+        blue, yellow, big_orange, small_orange = [], [], [], []
         for cone in msg.track:
             pt = [cone.location.x, cone.location.y]
             if cone.color == Cone.BLUE:
                 blue.append(pt)
             elif cone.color == Cone.YELLOW:
                 yellow.append(pt)
-        self._blue_all   = np.array(blue,   dtype=np.float64) if blue   else np.empty((0, 2))
-        self._yellow_all = np.array(yellow, dtype=np.float64) if yellow else np.empty((0, 2))
+            elif cone.color == Cone.ORANGE_BIG:
+                big_orange.append(pt)
+            elif cone.color == Cone.ORANGE_SMALL:
+                small_orange.append(pt)
+        self._blue_all   = self._as_array(blue)
+        self._yellow_all = self._as_array(yellow)
+        self._big_orange_all   = self._as_array(big_orange)
+        self._small_orange_all = self._as_array(small_orange)
         self._have_map = True
         self.get_logger().info(
-            f'Oracle map received: {len(blue)} blue + {len(yellow)} yellow.', once=True
+            f'Oracle map received: {len(blue)} blue + {len(yellow)} yellow + '
+            f'{len(big_orange)} big orange + {len(small_orange)} small orange.', once=True
         )
+
+    @staticmethod
+    def _as_array(pts: list) -> np.ndarray:
+        return np.array(pts, dtype=np.float64) if pts else np.empty((0, 2))
 
     def _odom_cb(self, msg: Odometry) -> None:
         p = msg.pose.pose.position
@@ -300,8 +325,12 @@ class SimPerception(Node):
 
         blue_vis   = self._visible(self._blue_all)
         yellow_vis = self._visible(self._yellow_all)
+        big_orange_vis   = self._visible(self._big_orange_all)
+        small_orange_vis = self._visible(self._small_orange_all)
         self.pub_left.publish(self._global_track(blue_vis))
         self.pub_right.publish(self._global_track(yellow_vis))
+        self.pub_big_orange.publish(self._global_track(big_orange_vis))
+        self.pub_small_orange.publish(self._global_track(small_orange_vis))
 
         det = ConeDetection()
         det.header.stamp    = self.get_clock().now().to_msg()
@@ -309,6 +338,8 @@ class SimPerception(Node):
         det.car_pose = pose.pose   # ConeDetection.car_pose is geometry_msgs/Pose, not Stamped
         det.blue   = self._local_points(blue_vis)
         det.yellow = self._local_points(yellow_vis)
+        det.big_orange   = self._local_points(big_orange_vis)
+        det.small_orange = self._local_points(small_orange_vis)
         self.pub_det.publish(det)
 
 
