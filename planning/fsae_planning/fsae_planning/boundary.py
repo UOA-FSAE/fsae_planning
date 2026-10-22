@@ -126,7 +126,7 @@ _WALK_NEAR_ENTRY = 0.5
 # maximum; 5.0 m is the team's design bound: FSG-style start areas and our
 # (equal or narrower) test tracks fit inside it -- every FSDS gate is
 # 3.45-4.34 m -- and a wider cap would let more mislabelled orange objects pair
-# up. A start area wider than 5 m gets no orange pairs (orange-off behaviour).
+# up. A start area wider than 5 m gets no valid orange pairs (orange-off behaviour).
 # (The real SLAM's start_line_max_width of 8.0 m is a lap-counting bound, not a
 # pairing one.)
 _START_LINE_MAX_WIDTH = 5.0
@@ -145,9 +145,9 @@ _START_SIDE_RADIUS = 8.0
 # orange cones on the SAME side of the track see each colour split ~50/50
 # along their axis and are rejected.
 _START_SIDE_MIN_FRAC = 0.75
-# cos(45 deg): a leftover orange must sit more than 45 deg off a pair's axis
-# from an assigned orange, i.e. along the track from it, to share its side
-# (see assign_orange_sides).
+# cos(45 deg): an orange cone with no valid pair must sit more than 45 deg off
+# a valid pair's axis from a classified orange, i.e. along the track from it,
+# to share its side (see assign_orange_sides).
 _START_SIDE_MAX_AXIS_COS = math.cos(math.radians(45.0))
 # Boundary-line test for each orange end (see _end_on_line). Probe cones are
 # the own-colour cones 1-6 m from the end: closer ones give no direction (a
@@ -162,20 +162,13 @@ _START_LINE_MAX_TILT = 40.0
 # Max distance (m) from an orange end to the line through its two probe cones:
 # up to ~1 m of gate inset plus line-extrapolation error on a curve.
 _START_LINE_MAX_OFFSET = 1.5
-# A leftover orange must sit within this (m) of an assigned orange ACROSS the
-# track, i.e. on the same boundary line, to share its side.
+# An orange cone with no valid pair must sit within this (m) of a classified
+# orange ACROSS the track, i.e. on the same boundary line, to share its side.
 _ORANGE_SAME_SIDE_LATERAL = 0.5
-# A leftover orange cone takes the side of an assigned orange at most this far
-# (m) from it along the track. FSDS 4-cone gates put same-side cones 1.30 m
-# apart.
+# An orange cone with no valid pair takes the side of a classified orange at
+# most this far (m) from it along the track. FSDS 4-cone gates put same-side
+# cones 1.30 m apart.
 _ORANGE_SAME_SIDE_MAX = 2.0
-# Valid pairs kept for the exhaustive matching (squarest first). A real gate
-# gives at most 4 (2 across, 2 diagonals); this only bounds the search when
-# many objects are mislabelled big_orange.
-_START_MAX_EDGES = 12
-# Pairs whose midpoints are this close (m) are treated as one 4-cone gate (see
-# _best_matching). FSDS gates: 1.30 m between the two pairs.
-_START_GATE_GROUP_DIST = 4.0
 
 
 def build_wall_segments(
@@ -367,7 +360,7 @@ def _end_on_line(end: np.ndarray, own: np.ndarray, u: np.ndarray) -> float | Non
     With one, the end -> cone chord is the line direction. With none in that
     band, the nearest own-colour cone farther out (up to the vote radius)
     gives the chord; with no own-colour cone at all there is no evidence and
-    the tilt counts as the worst allowed, so such a pair loses every tie.
+    the tilt counts as the worst allowed (the pair still passes this test).
 
     Measured in the track frame, not along the pair axis: a pair tilted
     across the track (a gate cone and a stray) makes along-track cone offsets
@@ -399,15 +392,11 @@ def _gate_sides(
     blue: np.ndarray,
     yellow: np.ndarray,
     radius: float,
-) -> tuple[np.ndarray, np.ndarray, float, float] | None:
+) -> tuple[np.ndarray, np.ndarray] | None:
     """
     Decide which end of the orange pair o1-o2 is the blue side. Returns
-    (blue_end, yellow_end, margin, tilt), or None if the nearby boundary cones
-    don't put the two colours clearly at opposite ends. Both rank competing
-    pairings (see _best_matching): tilt is the summed |u . t| of the two ends
-    (0 = the gate crosses both boundary lines square, see _end_on_line);
-    margin (m, >= 0, larger is clearer) is how far both colour means sit past
-    the quarter-width mark.
+    (blue_end, yellow_end), or None if the nearby boundary cones don't put the
+    two colours clearly at opposite ends.
 
     Uses only the cones' positions relative to the o1->o2 axis -- never the
     car's heading -- so a gate classifies the same way from either direction.
@@ -438,75 +427,9 @@ def _gate_sides(
         b_end, y_end = o2, o1
     else:
         return None
-    tilt_b = _end_on_line(b_end, near_b, u)
-    tilt_y = _end_on_line(y_end, near_y, u)
-    if tilt_b is None or tilt_y is None:
+    if _end_on_line(b_end, near_b, u) is None or _end_on_line(y_end, near_y, u) is None:
         return None
-    margin = min(abs(mb), abs(my)) - quarter
-    return b_end, y_end, margin, tilt_b + tilt_y
-
-
-def _best_matching(
-    orange: np.ndarray,
-    same_side_max: float,
-    edges: list[tuple[int, int, np.ndarray, np.ndarray, float, float]],
-) -> list[tuple[int, int, np.ndarray, np.ndarray, float, float]]:
-    """
-    Pick the set of valid pairs (edges: i, j, blue_end, yellow_end, margin,
-    tilt) that is disjoint, non-crossing and consistent -- two pairs within
-    _START_GATE_GROUP_DIST of each other are one 4-cone gate, so their blue
-    ends must share a boundary line and so must their yellow ends -- with the
-    most pairs; ties go to
-    the smallest summed tilt (squarest gates), then the larger summed margin.
-    Tilt before margin: a real gate crosses the track square, while a pair of
-    a gate cone and a stray is tilted 25-35 deg -- and tilt leaks along-track
-    offsets into the side projections, so such a pair can out-score the real
-    one on margin. Exhaustive -- the valid-pair graph is tiny (a gate is 2-4
-    cones, and the width limit keeps far cones apart).
-    """
-    best: list = []
-    best_key = (0, 0.0, 0.0)
-
-    def same_line(p, q, u) -> bool:
-        v = q - p
-        return (float(np.linalg.norm(v)) <= same_side_max
-                and abs(float(v @ u)) <= _ORANGE_SAME_SIDE_LATERAL)
-
-    def conflicts(e, chosen) -> bool:
-        a1, a2 = orange[e[0]], orange[e[1]]
-        u = (e[3] - e[2]) / float(np.linalg.norm(e[3] - e[2]))
-        for c in chosen:
-            if _seg_intersect(a1, a2, orange[c[0]], orange[c[1]]):
-                return True
-            # Two pairs this close claim to be one 4-cone gate: their blue
-            # ends must share a boundary line, and so must their yellow ends.
-            mid_e, mid_c = (e[2] + e[3]) * 0.5, (c[2] + c[3]) * 0.5
-            if float(np.linalg.norm(mid_e - mid_c)) <= _START_GATE_GROUP_DIST:
-                if not (same_line(e[2], c[2], u) and same_line(e[3], c[3], u)):
-                    return True
-        return False
-
-    def search(k: int, used: set, chosen: list) -> None:
-        nonlocal best, best_key
-        key = (len(chosen), -round(sum(c[5] for c in chosen), 6), sum(c[4] for c in chosen))
-        if key > best_key:
-            best, best_key = list(chosen), key
-        # Even taking every remaining edge can't reach the best pair count:
-        # stop. Strict '<' keeps equal-count branches, so ties are still
-        # compared and the result is unchanged -- only the work is cut (a
-        # flood of 24 mislabelled oranges went from ~190 ms to a few ms).
-        if len(chosen) + (len(edges) - k) < best_key[0]:
-            return
-        for idx in range(k, len(edges)):
-            e = edges[idx]
-            if e[0] in used or e[1] in used or conflicts(e, chosen):
-                continue
-            chosen.append(e)
-            search(idx + 1, used | {e[0], e[1]}, chosen)
-            chosen.pop()
-
-    search(0, set(), [])
-    return best
+    return b_end, y_end
 
 
 def assign_orange_sides(
@@ -529,31 +452,34 @@ def assign_orange_sides(
     the orange-orange edge into an ordinary cross-colour gate -- track_mesh
     needs no special case.
 
-      1. Pair by matching, not closest-first. A valid pair is two cones
-         min_w..max_w apart (start_line_min_width/max_width) that pass
-         _gate_sides. Of all sets of valid pairs that are disjoint, don't
-         cross each other and are consistent (see _best_matching), take the
-         one with the most pairs, ties to the squarest gates, then to the
-         larger summed side-test margin. Closest-first let two same-side gate
-         cones claim each other whenever they passed the side test, which
-         sparse perception makes possible (FSDS's 1.30 m same-side pairs are
-         now below start_line_min_width; wider same-side spacings are not). Nothing is rejected for sitting close to a blue/yellow
-         cone: the rules put big orange cones on the border rows.
-      2. Append each pair's blue-end cone to blue and its yellow-end cone to
-         yellow.
-      3. A leftover orange cone (3 seen, or its partner failed) takes the side
-         of an assigned orange within same_side_max of it that sits along the
-         track from it: more than 45 deg off that pair's axis and at most
-         _ORANGE_SAME_SIDE_LATERAL across it (on the same boundary line, so a
-         stray inside the track never becomes a wall cone). Nearest wins.
+      1. Every valid pair votes. A valid pair is two cones min_w..max_w
+         apart (start_line_min_width/max_width) that pass _gate_sides. There
+         is no one-partner rule: a cone can be in any number of valid pairs
+         (a 4-cone gate gives up to 4: 2 across, 2 diagonals), and each one
+         votes its blue-end cone blue and its yellow-end cone yellow.
+      2. Each cone takes its majority side; a tie (as many blue as yellow
+         votes) leaves it unclassified. Nothing is rejected for sitting close
+         to a blue/yellow cone: the rules put big orange cones on the border
+         rows.
+      3. An orange cone in no valid pair takes the side of a classified
+         orange within same_side_max of it that sits along the track from
+         it: more than 45 deg off that cone's valid-pair axis and at most
+         _ORANGE_SAME_SIDE_LATERAL across it, i.e. on that classified cone's
+         boundary line (it is only as far inside the track as that cone is).
+         Nearest wins.
+      4. Every classified cone is appended to blue or yellow and from then on
+         is exactly a blue or yellow cone: the mesh walls and gates it like
+         any other.
 
-    Other unpaired orange cones stay out of the mesh (callers should still
+    Unclassified orange cones stay out of the mesh (callers should still
     keep them in their clearance checks). Pass big orange only -- small orange
     cones (accel braking zone) don't mark a line.
 
-    Returns (blue_aug, yellow_aug, start_pairs), start_pairs being a list of
-    (blue_end, yellow_end) points. With orange None/empty, or no pair found,
-    blue/yellow come back unchanged and start_pairs is empty.
+    Returns (blue_aug, yellow_aug, start_pairs), start_pairs being the valid
+    pairs whose two cones ended up on the sides that pair gave them, as
+    (blue_end, yellow_end) points (debug display only). With orange None/
+    empty, or no valid pair, blue/yellow come back unchanged and start_pairs
+    is empty.
     """
     blue = np.asarray(blue, dtype=np.float64).reshape(-1, 2)
     yellow = np.asarray(yellow, dtype=np.float64).reshape(-1, 2)
@@ -567,61 +493,76 @@ def assign_orange_sides(
     # rows, so a genuine one can sit right next to a blue/yellow cone (on
     # Skidpad nearly touching; FSDS CompetitionMap1: 0.62 m). Dropping oranges
     # within 0.5 m of a border cone lost real gate cones to perception noise.
-    # Strays are left to the pairing tests below.
+    # Strays are left to the side tests below.
     n = len(orange)
-    edges = []
+    edges = []        # (i, j, blue_end_idx, yellow_end_idx) per valid pair
+    votes = np.zeros((n, 2), dtype=int)     # [blue votes, yellow votes]
     for i in range(n):
         for j in range(i + 1, n):
             d = float(np.linalg.norm(orange[i] - orange[j]))
             if not (min_w <= d <= max_w):
                 continue
-            sides = _gate_sides(orange[i], orange[j], blue, yellow, radius)
-            if sides is not None:
-                edges.append((i, j, *sides))
+            oi = orange[i]
+            sides = _gate_sides(oi, orange[j], blue, yellow, radius)
+            if sides is None:
+                continue
+            bi, yi = (i, j) if sides[0] is oi else (j, i)
+            edges.append((i, j, bi, yi))
+            votes[bi, 0] += 1
+            votes[yi, 1] += 1
     if not edges:
         return blue, yellow, []
-    # Backstop for a flood of mislabelled cones: keep the search exhaustive
-    # over the clearest pairs only.
-    edges.sort(key=lambda e: (e[5], -e[4]))
-    chosen = _best_matching(orange, same_side_max, edges[:_START_MAX_EDGES])
 
-    pairs = [(e[2], e[3]) for e in chosen]
-    add_b = [e[2] for e in chosen]
-    add_y = [e[3] for e in chosen]
-
-    used = {e[0] for e in chosen} | {e[1] for e in chosen}
+    # side[k]: True = blue, False = yellow, None = unclassified.
+    side: list = [None] * n
     for k in range(n):
-        if k in used:
+        if votes[k, 0] > votes[k, 1]:
+            side[k] = True
+        elif votes[k, 1] > votes[k, 0]:
+            side[k] = False
+
+    # Cones in no valid pair: side of a classified neighbour on the same row.
+    for k in range(n):
+        if votes[k].any():
             continue
         best = None   # (dist, is_blue)
-        for (i, j, b_end, y_end, _, _) in chosen:
-            u = (y_end - b_end) / float(np.linalg.norm(y_end - b_end))
-            for end, is_b in ((b_end, True), (y_end, False)):
-                v = orange[k] - end
+        for (_, _, bi, yi) in edges:
+            u = orange[yi] - orange[bi]
+            u = u / float(np.linalg.norm(u))
+            for c in (bi, yi):
+                if side[c] is None or side[c] != (c == bi):
+                    continue   # only a cone classified as this pair says
+                v = orange[k] - orange[c]
                 dist = float(np.linalg.norm(v))
                 if dist > same_side_max or dist < 1e-9:
                     continue
                 lateral = abs(float(v @ u))
                 if (lateral / dist >= _START_SIDE_MAX_AXIS_COS
                         or lateral > _ORANGE_SAME_SIDE_LATERAL):
-                    continue   # across the track from `end`, not along its boundary line
+                    continue   # across the track from `c`, not along its boundary line
                 if best is None or dist < best[0]:
-                    best = (dist, is_b)
+                    best = (dist, side[c])
         if best is not None:
-            (add_b if best[1] else add_y).append(orange[k])
+            side[k] = best[1]
 
-    blue_aug = np.vstack([blue, np.array(add_b)])
-    yellow_aug = np.vstack([yellow, np.array(add_y)])
-    return blue_aug, yellow_aug, pairs
+    add_b = orange[[k for k in range(n) if side[k] is True]]
+    add_y = orange[[k for k in range(n) if side[k] is False]]
+    pairs = [(orange[bi], orange[yi]) for (_, _, bi, yi) in edges
+             if side[bi] is True and side[yi] is False]
+    return np.vstack([blue, add_b]), np.vstack([yellow, add_y]), pairs
 
 
-def _is_start_edge(p1, p2, start_pairs) -> bool:
-    for a, b in start_pairs:
-        if np.allclose(p1, a) and np.allclose(p2, b):
-            return True
-        if np.allclose(p1, b) and np.allclose(p2, a):
-            return True
-    return False
+def _point_key(p) -> tuple[float, float]:
+    return (round(float(p[0]), 6), round(float(p[1]), 6))
+
+
+def _start_edge_keys(start_pairs) -> set:
+    """
+    Order-free lookup keys for start_pairs.
+
+    Tagging stays O(edges) when orange clutter yields many valid pairs.
+    """
+    return {frozenset((_point_key(a), _point_key(b))) for a, b in start_pairs}
 
 
 def debug_triangulation_edges(
@@ -655,8 +596,9 @@ def debug_triangulation_edges(
       'cross' — cross colour, but every mixed triangle it belongs to failed
                 that length check (an implausibly short/long gate, usually
                 from a missing intermediate cone or a stray/mislabelled one).
-      'start' — the orange-orange edge of a start-line pair (see
-                assign_orange_sides); only with orange_cones given.
+      'start' — an orange-orange edge that is one of the valid pairs the
+                cones were classified from (see assign_orange_sides); only
+                with orange_cones given.
 
     The edges are those of track_mesh.build_track_mesh, i.e. exactly the mesh
     build_path_walls planned on, bridges included (a bridge is tagged 'wall'
@@ -693,10 +635,12 @@ def debug_triangulation_edges(
         for e in cross_edges:
             gate_ok[e] = gate_ok.get(e, False) or ok
 
+    start_keys = _start_edge_keys(start_pairs)
     tagged: list[tuple[np.ndarray, np.ndarray, str]] = []
     for i, j in mesh.edges():
         if is_blue[i] != is_blue[j]:
-            if start_pairs and _is_start_edge(points[i], points[j], start_pairs):
+            edge_key = frozenset((_point_key(points[i]), _point_key(points[j])))
+            if start_keys and edge_key in start_keys:
                 tag = 'start'
             else:
                 tag = 'mid' if gate_ok.get((i, j), False) else 'cross'
@@ -1430,13 +1374,14 @@ def build_path_walls(
     mid_max_gate even though its true cross-track width does not (a straight
     3 m-wide corridor with cones spaced 5 m apart has ~5.83 m diagonals).
 
-    orange_cones: big orange (start/finish line) cones, or None. Paired ones
+    orange_cones: big orange (start/finish line) cones, or None. Classified ones
     are given a side by assign_orange_sides and join blue/yellow for every
     method and the fallback, closing the wall gap at the start line. None (or
-    no pair found) leaves the output identical to not passing it.
-    start_line_min_width/start_line_max_width bound the pair width.
-    same_side_max: how far a leftover orange may sit from an assigned one
-    along the track and still share its side (see assign_orange_sides).
+    no cone classified) leaves the output identical to not passing it.
+    start_line_min_width/start_line_max_width bound the valid-pair width.
+    same_side_max: how far an orange cone in no valid pair may sit from a
+    classified one along the track and still share its side (see
+    assign_orange_sides).
 
     Returns
     -------

@@ -226,17 +226,19 @@ class CenterlinePlanner(Node):
         self.declare_parameter('fallback_max_pair_dist', MAX_PAIR_DIST)
 
         # Orange cones. use_orange is the rollback switch: false ignores both
-        # orange topics entirely (the pre-orange behaviour). Big orange pairs
-        # start_line_min_width..start_line_max_width apart are given a
-        # side and close the wall gap at the start line -- see
-        # boundary.assign_orange_sides. Unpaired big orange and all small
-        # orange cones only join the min_cone_clearance set.
+        # orange topics entirely (the pre-orange behaviour). Each big orange
+        # cone is classified from the valid pairs it is in (any number per
+        # cone; pairs are start_line_min_width..start_line_max_width apart)
+        # and then planned exactly like a blue/yellow cone, closing the wall
+        # gap at the start line -- see boundary.assign_orange_sides.
+        # Unclassified big orange and all small orange cones only join the
+        # min_cone_clearance set.
         self.declare_parameter('use_orange', True)
         self.declare_parameter('start_line_max_width', _START_LINE_MAX_WIDTH)
         self.declare_parameter('start_line_min_width', _START_LINE_MIN_WIDTH)
-        # A leftover orange (3 seen, or its partner failed the side test)
-        # takes the side of an assigned orange at most this far (m) away
-        # along the track; otherwise it is clearance-only.
+        # An orange cone in no valid pair takes the side of a classified
+        # orange at most this far (m) away along the track; otherwise it is
+        # clearance-only.
         self.declare_parameter('same_side_max', _ORANGE_SAME_SIDE_MAX)
 
         # -- input staleness gates. Ported from the real stack, where a

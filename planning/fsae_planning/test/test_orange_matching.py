@@ -1,4 +1,4 @@
-"""Orange start-line pairing under sparse perception, entry-skip guard, held-path clearance."""
+"""Orange start-line classification, entry-skip guard, held-path clearance."""
 import itertools
 import math
 
@@ -8,6 +8,7 @@ import pytest
 from fsae_planning.boundary import (
     _build_corridor_path,
     _seg_intersect,
+    _START_LINE_MAX_OFFSET,
     assign_orange_sides,
     build_path_walls,
     path_ahead_too_close,
@@ -38,10 +39,10 @@ def test_p1_sparse_perception_pairs_across_not_along():
     blue = np.array([[9.0, 1.75]])
     yellow = np.array([[13.5, -1.75]])
     blue_aug, yellow_aug, pairs = assign_orange_sides(blue, yellow, GATE)
-    assert len(pairs) == 2
+    assert len(pairs) >= 2
     for b_end, y_end in pairs:
-        assert b_end[1] > 0.0 and y_end[1] < 0.0
-        assert abs(b_end[0] - y_end[0]) < 1e-9     # straight across
+        assert b_end[1] > 0.0 and y_end[1] < 0.0     # across the track, never along it
+    assert len(blue_aug) - 1 + len(yellow_aug) - 1 == 4
     assert _sides_ok(blue_aug, yellow_aug, 1, 1)
 
 
@@ -64,10 +65,11 @@ def test_every_subset_of_the_four_cone_gate(k, perception):
         if across or (diagonal and perception == 'full'):
             assert len(pairs) >= 1, idx
         if k == 3:
-            # One pair plus a leftover that shares a side with its neighbour.
+            # All three classified: through a valid pair, or along the row
+            # from a classified neighbour.
             assert len(blue_aug) - len(blue) + len(yellow_aug) - len(yellow) == 3, idx
         if k == 4:
-            assert len(pairs) == 2, idx
+            assert len(blue_aug) - len(blue) == 2 and len(yellow_aug) - len(yellow) == 2, idx
         if k == 1:
             assert pairs == [], idx
 
@@ -116,14 +118,22 @@ def test_strays_never_make_a_false_wall(stray):
     blue, yellow = _straight()
     orange = np.vstack([GATE, [stray]])
     blue_aug, yellow_aug, pairs = assign_orange_sides(blue, yellow, orange)
-    assert len(pairs) == 2
+    for g in GATE:                                   # every gate cone still classified
+        assert tuple(g) in {tuple(p) for p in np.vstack([blue_aug, yellow_aug])}
     assert _sides_ok(blue_aug, yellow_aug, len(blue), len(yellow))
-    if abs(stray[1]) < HALF_W:                       # inside the track: never a wall cone
-        assert tuple(stray) not in {tuple(p) for p in np.vstack([blue_aug, yellow_aug])}
+    # No one-partner rule: a stray that passes the side test is classified and
+    # walled like any blue/yellow cone. Only one on (within
+    # _START_LINE_MAX_OFFSET of) its boundary row can be -- (12.8, 0.5) is
+    # 1.25 m inside the blue row and is; one farther inside never is.
+    in_mesh = tuple(stray) in {tuple(p) for p in np.vstack([blue_aug, yellow_aug])}
+    if HALF_W - abs(stray[1]) > _START_LINE_MAX_OFFSET:
+        assert not in_mesh
     cl, b_segs, y_segs, _ = build_path_walls(
         blue, yellow, np.array([1.0, 0.2]), 0.0, mid_max_gate=5.0, orange_cones=orange)
     assert not _walls_cross_centreline(b_segs + y_segs)
     assert cl[:, 0].max() > 20.0
+    if in_mesh:                                      # walled off, so the path clears it
+        assert np.min(np.linalg.norm(cl - np.array(stray), axis=1)) > 0.4
 
 
 def test_lone_stray_inside_track_is_ignored():
@@ -167,7 +177,7 @@ def test_gate_cones_close_to_border_cones_are_used(gap):
     gate = np.array([[12.0 + gap, HALF_W], [12.0 + gap, -HALF_W],
                      [13.3 + gap, HALF_W], [13.3 + gap, -HALF_W]])
     blue_aug, yellow_aug, pairs = assign_orange_sides(blue, yellow, gate)
-    assert len(pairs) == 2
+    assert len(pairs) >= 2
     assert len(blue_aug) - len(blue) == 2 and len(yellow_aug) - len(yellow) == 2
     assert _sides_ok(blue_aug, yellow_aug, len(blue), len(yellow))
     cl, b_segs, y_segs, _ = build_path_walls(
@@ -185,8 +195,9 @@ def _width_result(width, mid_max):
     blue_aug, yellow_aug, pairs = assign_orange_sides(blue, yellow, gate)
     cl, b_segs, y_segs, _ = build_path_walls(
         blue, yellow, np.array([1.0, 0.2]), 0.0, mid_max_gate=mid_max, orange_cones=gate)
+    # Valid-pair count is not compared: the gate diagonals drop out past
+    # start_line_max_width on the widest tracks, the classification doesn't.
     return dict(
-        pairs=len(pairs),
         n_blue=len(blue_aug) - len(blue), n_yellow=len(yellow_aug) - len(yellow),
         sides_ok=_sides_ok(blue_aug, yellow_aug, len(blue), len(yellow)),
         false_wall=_walls_cross_centreline(b_segs + y_segs),
@@ -203,7 +214,7 @@ def test_same_result_across_track_widths(mid_max, widths):
     results = [_width_result(w, mid_max) for w in widths]
     for w, r in zip(widths, results):
         assert r == results[0], (w, r, results[0])
-    assert results[0] == dict(pairs=2, n_blue=2, n_yellow=2, sides_ok=True,
+    assert results[0] == dict(n_blue=2, n_yellow=2, sides_ok=True,
                               false_wall=False, reaches_horizon=True, centred=True)
 
 
@@ -211,4 +222,63 @@ def test_gate_wider_than_the_width_bound_is_not_paired():
     # The 5.0 m start-line width bound is deliberate: a wider orange "pair" is
     # left out of the mesh rather than risk pairing mislabelled objects.
     r = _width_result(5.5, 6.5)
-    assert r['pairs'] == 0 and r['n_blue'] == 0 and r['n_yellow'] == 0
+    assert r['n_blue'] == 0 and r['n_yellow'] == 0
+
+
+# -- voting: no one-partner rule ------------------------------------------------------
+
+def _fake_sides(monkeypatch, blue_end_of):
+    """
+    Replace _gate_sides with a lookup.
+
+    blue_end_of[(i, j)] is the index (i or j) of the blue end for orange cones
+    i < j; pairs not listed are invalid.
+    """
+    import fsae_planning.boundary as b
+    pts = {}
+
+    def fake(o1, o2, blue, yellow, radius):
+        i, j = pts[tuple(o1)], pts[tuple(o2)]
+        key = (min(i, j), max(i, j))
+        if key not in blue_end_of:
+            return None
+        return (o1, o2) if blue_end_of[key] == i else (o2, o1)
+
+    monkeypatch.setattr(b, '_gate_sides', fake)
+    return pts
+
+
+def _classify(monkeypatch, orange, blue_end_of):
+    pts = _fake_sides(monkeypatch, blue_end_of)
+    pts.update({tuple(p): k for k, p in enumerate(orange)})
+    blue, yellow = _straight(skip=())
+    ba, ya, pairs = assign_orange_sides(blue, yellow, orange)
+    in_b = {tuple(p) for p in ba[len(blue):]}
+    in_y = {tuple(p) for p in ya[len(yellow):]}
+    side = ['b' if tuple(p) in in_b else 'y' if tuple(p) in in_y else None for p in orange]
+    return side, pairs
+
+
+# Four cones spread along x, all 2.5 m apart pairwise or more, inside min_w..max_w.
+_V = np.array([[10.0, 1.75], [10.0, -1.75], [12.5, 1.75], [12.5, -1.75]])
+
+
+def test_majority_vote_overrides_a_single_conflicting_pair(monkeypatch):
+    # Cone 0 is the blue end of two pairs and the yellow end of one: blue.
+    side, pairs = _classify(monkeypatch, _V, {(0, 1): 0, (0, 3): 0, (0, 2): 2})
+    assert side[0] == 'b'
+    # Cone 2 wins its only vote (blue) even though cone 0 outvoted that pair.
+    assert side[2] == 'b'
+    # The (2 blue, 0 yellow) pair contradicts cone 0's final side: not a start pair.
+    keys = {(tuple(a), tuple(b)) for a, b in pairs}
+    assert (tuple(_V[2]), tuple(_V[0])) not in keys
+    assert (tuple(_V[0]), tuple(_V[1])) in keys and (tuple(_V[0]), tuple(_V[3])) in keys
+
+
+def test_tied_votes_leave_a_cone_unclassified(monkeypatch):
+    # Cone 0: blue in (0, 1), yellow in (0, 2) -> tie -> out of the mesh, even
+    # though classified cones sit right next to it on its row.
+    side, pairs = _classify(monkeypatch, _V, {(0, 1): 0, (0, 2): 2})
+    assert side[0] is None
+    assert side[1] == 'y' and side[2] == 'b'
+    assert pairs == []        # both pairs contradict cone 0's (missing) side

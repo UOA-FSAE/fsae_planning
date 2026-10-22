@@ -81,13 +81,15 @@ sim_perception:
 # hold is dropped (localisation jump, or simply too much motion since).
 # `use_orange`: plan with the big orange start/finish cones (rollback switch;
 # false ignores both orange topics). `start_line_min_width`/`start_line_max_width`
-# (m): orange pair width band for a start-line gate. The gate is as wide as
+# (m): width band for a valid orange pair; each big orange cone is classified
+# from the valid pairs it is in (any number per cone) and then planned exactly
+# like a blue/yellow cone. The gate is as wide as
 # the track; 5.0 m is the team's bound for FSG-style start areas (FSDS gates
 # are 3.45-4.34 m, test tracks are no wider). The kart's run-4 gate is 2.4 m;
 # FSDS same-side gate cones are 1.30 m apart, below the 2.0 m min.
-# `same_side_max` (m): a leftover orange cone (3 seen, or its partner failed
-# the side test) takes the side of an assigned orange this close along the
-# track; otherwise it only counts for clearance.
+# `same_side_max` (m): an orange cone in no valid pair takes the side of a
+# classified orange this close along the track; otherwise it only counts for
+# clearance.
 centerline_planner:
   ros__parameters:
     smooth: 0.015

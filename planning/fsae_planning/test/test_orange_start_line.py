@@ -54,22 +54,25 @@ def test_straight_start_line_no_longer_dead_ends():
 
 
 def test_fsds_style_four_cone_gate():
-    # FSDS: 2 orange per side, 1.30 m apart along the track (inside the
-    # default min_w..max_w band) -- the same-side pairs must not be taken.
+    # FSDS: 2 orange per side, 1.30 m apart along the track (below
+    # start_line_min_width) -- no same-side pair is ever valid. No one-partner
+    # rule: both straight-across pairs and both diagonals are valid, and all
+    # four cones are classified.
     blue, yellow, _ = _straight()
     orange = np.array([[11.35, HALF_W], [11.35, -HALF_W], [12.65, -HALF_W], [12.65, HALF_W]])
     blue_aug, yellow_aug, pairs = assign_orange_sides(blue, yellow, orange)
-    assert len(pairs) == 2
+    assert len(pairs) == 4
     for b_end, y_end in pairs:
-        assert b_end[1] > 0.0 and y_end[1] < 0.0
-        assert abs(b_end[0] - y_end[0]) < 1e-9      # straight across, not diagonal
+        assert b_end[1] > 0.0 and y_end[1] < 0.0     # across the track, never along it
     assert len(blue_aug) == len(blue) + 2 and len(yellow_aug) == len(yellow) + 2
 
     cl = _plan(blue, yellow, orange, (1.0, 0.2), 0.0)
     assert cl[:, 0].max() > 24.0
 
+    # Whichever O-O edges the mesh builds are tagged; Delaunay keeps both
+    # straight-across edges and one diagonal of the 4-cone quad.
     tags = [t for *_, t in debug_triangulation_edges(blue, yellow, orange_cones=orange)]
-    assert tags.count('start') == 2
+    assert tags.count('start') >= 2
 
 
 def _bend(radius=40.0, s_max=30.0, gate_s=12.0):
