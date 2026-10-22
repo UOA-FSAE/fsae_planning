@@ -58,11 +58,14 @@ from fsae_planning.boundary import (
     build_path_walls,
     build_wall_segments_delaunay,
     debug_triangulation_edges,
+    path_ahead_too_close,
     segment_crosses_walls,
     _WALL_MAX_TURN_COS,
     _WALL_MID_MIN_DELAUNAY,
     _WALL_MID_MAX_DELAUNAY,
     _START_LINE_MAX_WIDTH,
+    _START_LINE_MIN_WIDTH,
+    _ORANGE_SAME_SIDE_MAX,
 )
 from fsae_planning.cone_sorting import MAX_PAIR_DIST
 from fsae_planning.path_utils import (
@@ -224,12 +227,17 @@ class CenterlinePlanner(Node):
 
         # Orange cones. use_orange is the rollback switch: false ignores both
         # orange topics entirely (the pre-orange behaviour). Big orange pairs
-        # at most start_line_max_width apart (min is mid_min_gate) are given a
+        # start_line_min_width..start_line_max_width apart are given a
         # side and close the wall gap at the start line -- see
         # boundary.assign_orange_sides. Unpaired big orange and all small
         # orange cones only join the min_cone_clearance set.
         self.declare_parameter('use_orange', True)
         self.declare_parameter('start_line_max_width', _START_LINE_MAX_WIDTH)
+        self.declare_parameter('start_line_min_width', _START_LINE_MIN_WIDTH)
+        # A leftover orange (3 seen, or its partner failed the side test)
+        # takes the side of an assigned orange at most this far (m) away
+        # along the track; otherwise it is clearance-only.
+        self.declare_parameter('same_side_max', _ORANGE_SAME_SIDE_MAX)
 
         # -- input staleness gates. Ported from the real stack, where a
         # camera/SLAM pipeline can stall or drop frames. The simulator's
@@ -285,6 +293,10 @@ class CenterlinePlanner(Node):
         self._use_orange = self.get_parameter('use_orange').get_parameter_value().bool_value
         self._start_line_max_width = \
             self.get_parameter('start_line_max_width').get_parameter_value().double_value
+        self._same_side_max = \
+            self.get_parameter('same_side_max').get_parameter_value().double_value
+        self._start_line_min_width = \
+            self.get_parameter('start_line_min_width').get_parameter_value().double_value
         self._max_pose_age       = self.get_parameter('max_pose_age').get_parameter_value().double_value
         self._max_track_age      = self.get_parameter('max_track_age').get_parameter_value().double_value
         self._max_track_skew     = self.get_parameter('max_track_skew').get_parameter_value().double_value
@@ -312,6 +324,8 @@ class CenterlinePlanner(Node):
             ('plan_horizon', self._plan_horizon),
             ('look_radius', self._look_radius),
             ('start_line_max_width', self._start_line_max_width),
+            ('same_side_max', self._same_side_max),
+            ('start_line_min_width', self._start_line_min_width),
         ):
             if not (math.isfinite(val) and val > 0.0):
                 raise ValueError(f'{name} must be a finite positive number, got {val!r}')
@@ -752,8 +766,10 @@ class CenterlinePlanner(Node):
         Before republishing a held (previous-tick) path unchanged, check that
         the car hasn't drifted away from it (localisation jump, or simply
         enough real motion that the cached path no longer describes where
-        the car is) and that it doesn't now cross the latest wall mesh
-        (newly observed cones since the path was cached).
+        the car is), that it doesn't now cross the latest wall mesh, and that
+        the part ahead of the car keeps min_cone_clearance from the current
+        cones, orange included (newly observed cones since the path was
+        cached).
 
         A held path was already validated in full when it was first computed
         (it's exactly a previous `final` from _finalize), so this only needs
@@ -790,6 +806,20 @@ class CenterlinePlanner(Node):
                     )
                     return False
 
+        # A cone seen since the path was planned (a late detection, or an
+        # orange start-line cone coming into view) can sit right on the held
+        # path even though it crosses no wall edge -- same clearance set as
+        # _sanitize, checked only ahead of the car.
+        if self._min_cone_clearance > 0.0:
+            cones = np.vstack([self._blue_cones, self._yellow_cones, self._clearance_extra])
+            if path_ahead_too_close(pts, self._car_pos, cones, self._min_cone_clearance):
+                self.get_logger().warn(
+                    f'hold rejected: held path passes within min_cone_clearance='
+                    f'{self._min_cone_clearance} of a current cone',
+                    throttle_duration_sec=1.0,
+                )
+                return False
+
         return True
 
     # ------------------------------------------------------------------
@@ -813,6 +843,8 @@ class CenterlinePlanner(Node):
                     mid_max_gate=self._mid_max_gate,
                     orange_cones=self._orange_tick,
                     start_line_max_width=self._start_line_max_width,
+                    same_side_max=self._same_side_max,
+                    start_line_min_width=self._start_line_min_width,
                 )
             dt = time.perf_counter() - t0
             if dt > _SLOW_TICK_WARN_SEC:
@@ -836,7 +868,8 @@ class CenterlinePlanner(Node):
                 try:
                     blue, yellow, _ = assign_orange_sides(
                         blue, yellow, self._orange_tick,
-                        min_w=self._mid_min_gate, max_w=self._start_line_max_width,
+                        min_w=self._start_line_min_width, max_w=self._start_line_max_width,
+                        same_side_max=self._same_side_max,
                     )
                 except Exception:
                     blue, yellow = self._blue_cones, self._yellow_cones
@@ -981,6 +1014,8 @@ class CenterlinePlanner(Node):
             mid_max=self._mid_max_gate,
             orange_cones=self._orange_tick,
             start_line_max_width=self._start_line_max_width,
+            same_side_max=self._same_side_max,
+            start_line_min_width=self._start_line_min_width,
         )
         markers = MarkerArray()
         for i, tag in enumerate(('wall', 'mid', 'long', 'cross', 'start')):

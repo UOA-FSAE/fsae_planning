@@ -80,9 +80,14 @@ sim_perception:
 # `max_hold_deviation` (m): how far the car may be from a HELD path before the
 # hold is dropped (localisation jump, or simply too much motion since).
 # `use_orange`: plan with the big orange start/finish cones (rollback switch;
-# false ignores both orange topics). `start_line_max_width` (m): widest orange
-# pair accepted as a start-line gate -- the FSDS gate is 3.45 m across (4.34 m
-# on CompetitionMap2), see boundary._START_LINE_MAX_WIDTH.
+# false ignores both orange topics). `start_line_min_width`/`start_line_max_width`
+# (m): orange pair width band for a start-line gate. The gate is as wide as
+# the track; 5.0 m is the team's bound for FSG-style start areas (FSDS gates
+# are 3.45-4.34 m, test tracks are no wider). The kart's run-4 gate is 2.4 m;
+# FSDS same-side gate cones are 1.30 m apart, below the 2.0 m min.
+# `same_side_max` (m): a leftover orange cone (3 seen, or its partner failed
+# the side test) takes the side of an assigned orange this close along the
+# track; otherwise it only counts for clearance.
 centerline_planner:
   ros__parameters:
     smooth: 0.015
@@ -101,7 +106,9 @@ centerline_planner:
     min_usable_path_length: 2.0
     max_hold_deviation: 2.0
     use_orange: true
+    start_line_min_width: 2.0
     start_line_max_width: 5.0
+    same_side_max: 2.0
 skidpad_planner:
   ros__parameters:
     v_start: 3.0        # m/s — speed at the start of the ramp

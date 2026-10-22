@@ -118,17 +118,23 @@ def test_lone_orange_is_ignored():
     assert _plan(blue, yellow, lone, (1.0, 0.2), 0.0) is not None
 
 
-def test_stray_orange_next_to_boundary_cone_is_dropped():
-    blue, yellow, orange = _straight()
-    stray = np.array([[15.3, HALF_W]])          # 0.3 m from the blue cone at x=15
-    blue_aug, _, pairs = assign_orange_sides(blue, yellow, np.vstack([orange, stray]))
+def test_orange_next_to_boundary_cone_is_kept():
+    # The rules put big orange cones on the border rows, so one can sit right
+    # beside a blue/yellow cone. It used to be dropped as a "stray" within
+    # 0.5 m; now it must still pair, on the correct side.
+    blue, yellow, _ = _straight(gate_xs=())
+    orange = np.array([[15.3, HALF_W], [15.3, -HALF_W]])   # 0.3 m past the x=15 cones
+    blue_aug, yellow_aug, pairs = assign_orange_sides(blue, yellow, orange)
     assert len(pairs) == 1
-    assert tuple(stray[0]) not in _sets(blue_aug)
+    assert tuple(orange[0]) in _sets(blue_aug) and tuple(orange[1]) in _sets(yellow_aug)
 
-    # On its own with a partner across the track, a stray still forms no gate.
-    lonely = np.array([[15.3, HALF_W], [15.3, -HALF_W - 1.0]])
-    blue2, yellow2, _ = _straight(gate_xs=())
-    assert assign_orange_sides(blue2, yellow2, lonely)[2] == []
+    # A third orange on the blue row next to a border cone, beside a real
+    # gate, never ends up on the yellow side.
+    blue, yellow, orange = _straight()
+    extra = np.array([[15.3, HALF_W]])
+    blue_aug, yellow_aug, pairs = assign_orange_sides(blue, yellow, np.vstack([orange, extra]))
+    assert len(pairs) >= 1
+    assert tuple(extra[0]) not in _sets(yellow_aug)
 
 
 def test_none_matches_todays_output():

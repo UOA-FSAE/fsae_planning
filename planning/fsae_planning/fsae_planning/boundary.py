@@ -120,27 +120,62 @@ _WALK_NEAR_ENTRY = 0.5
 
 # Start/finish-line orange cones (see assign_orange_sides).
 # _START_LINE_MAX_WIDTH: widest orange pair accepted as one start-line gate.
-# Measured on all 7 FSDS v2.2.0 trackdrive maps: the gate is 4 big orange cones,
-# 2 per side 1.30 m apart along the track, 3.45 m across (4.34 m on
-# CompetitionMap2); the across-gate diagonal is 3.69 m (4.53 m). Closest-first
-# pairing takes the straight-across pairs before any diagonal, so 5.0 m covers
-# every measured width with margin while staying well under a second gate's
-# reach. (The real SLAM's start_line_max_width of 8.0 m is a lap-counting bound,
-# not a pairing one.)
+# FS rules place the big orange cones before and after the line on the border
+# rows (FS Driverless Specification DS 1.1, Figures 2-4), so the gate is as
+# wide as the track there. The rules set a 3 m minimum track width and no
+# maximum; 5.0 m is the team's design bound: FSG-style start areas and our
+# (equal or narrower) test tracks fit inside it -- every FSDS gate is
+# 3.45-4.34 m -- and a wider cap would let more mislabelled orange objects pair
+# up. A start area wider than 5 m gets no orange pairs (orange-off behaviour).
+# (The real SLAM's start_line_max_width of 8.0 m is a lap-counting bound, not a
+# pairing one.)
 _START_LINE_MAX_WIDTH = 5.0
+# Narrowest orange pair accepted as a start-line gate. FSDS 4-cone gates put
+# their two same-side cones 1.30 m apart; the narrowest real gate seen is the
+# kart's 2.4 m (bag run 4). 2.0 m keeps every same-side pair out of the search
+# entirely -- from a single boundary cone near the gate a same-side pair and a
+# gate set ~1 m inside the track look identical, so no side test can tell them
+# apart. Set it to mid_min_gate (1.2) to allow narrower gates.
+_START_LINE_MIN_WIDTH = 2.0
 # Radius (m) around a candidate pair's midpoint whose blue/yellow cones decide
 # which orange cone sits on which side.
 _START_SIDE_RADIUS = 8.0
-# An orange cone this close (m) to a blue/yellow cone is treated as a stray: the
-# real camera labels unknown objects big_orange, and a stray next to a real cone
-# would otherwise pair into a gate too short to accept. The closest genuine FSDS
-# gate cone sits 0.62 m from its neighbouring yellow.
-_ORANGE_STRAY_DIST = 0.5
 # Fraction of each colour's nearby cones that must lie on that colour's end of
 # the pair. A genuine gate puts every boundary cone on its own side (~1.0); two
 # orange cones on the SAME side of the track see each colour split ~50/50
 # along their axis and are rejected.
 _START_SIDE_MIN_FRAC = 0.75
+# cos(45 deg): a leftover orange must sit more than 45 deg off a pair's axis
+# from an assigned orange, i.e. along the track from it, to share its side
+# (see assign_orange_sides).
+_START_SIDE_MAX_AXIS_COS = math.cos(math.radians(45.0))
+# Boundary-line test for each orange end (see _end_on_line). Probe cones are
+# the own-colour cones 1-6 m from the end: closer ones give no direction (a
+# gate inside the track, like run 4's 2.4 m gate in a 2.5-4.4 m track, puts
+# its cone up to ~1 m off the line), farther ones bend away on a tight curve.
+_START_LINE_PROBE_MIN = 1.0
+_START_LINE_PROBE_MAX = 6.0
+# The gate axis may be at most this far (deg) off the boundary line's normal.
+# 4-cone gate diagonals are 17-21 deg; two probe cones on one side of an end
+# on an R=6 m curve tilt the line ~35 deg.
+_START_LINE_MAX_TILT = 40.0
+# Max distance (m) from an orange end to the line through its two probe cones:
+# up to ~1 m of gate inset plus line-extrapolation error on a curve.
+_START_LINE_MAX_OFFSET = 1.5
+# A leftover orange must sit within this (m) of an assigned orange ACROSS the
+# track, i.e. on the same boundary line, to share its side.
+_ORANGE_SAME_SIDE_LATERAL = 0.5
+# A leftover orange cone takes the side of an assigned orange at most this far
+# (m) from it along the track. FSDS 4-cone gates put same-side cones 1.30 m
+# apart.
+_ORANGE_SAME_SIDE_MAX = 2.0
+# Valid pairs kept for the exhaustive matching (squarest first). A real gate
+# gives at most 4 (2 across, 2 diagonals); this only bounds the search when
+# many objects are mislabelled big_orange.
+_START_MAX_EDGES = 12
+# Pairs whose midpoints are this close (m) are treated as one 4-cone gate (see
+# _best_matching). FSDS gates: 1.30 m between the two pairs.
+_START_GATE_GROUP_DIST = 4.0
 
 
 def build_wall_segments(
@@ -164,6 +199,47 @@ def segment_crosses_walls(
 ) -> bool:
     """True if the segment p1→p2 crosses any cone-wall segment."""
     return any(_seg_intersect(p1, p2, w1, w2) for (w1, w2) in wall_segs)
+
+
+def path_ahead_too_close(
+    path: np.ndarray,
+    car_pos: np.ndarray,
+    cones: np.ndarray,
+    clearance: float,
+) -> bool:
+    """
+    True if any part of `path` from the car's projection onwards passes within
+    `clearance` of a cone (segment-to-point distance, not just vertices).
+
+    For re-checking a held path against the CURRENT cones: a cone seen since
+    the path was planned (a late detection, an orange start-line cone) can sit
+    on it. The part already behind the car is ignored.
+    """
+    pts = np.asarray(path, dtype=np.float64).reshape(-1, 2)
+    cones = np.asarray(cones, dtype=np.float64).reshape(-1, 2)
+    if clearance <= 0.0 or len(pts) < 2 or len(cones) == 0:
+        return False
+    a, b = pts[:-1], pts[1:]
+    ab = b - a
+    ab2 = np.einsum('ij,ij->i', ab, ab)
+    ab2_safe = np.where(ab2 < 1e-12, 1.0, ab2)
+
+    # Segment the car projects onto, and where on it.
+    t_car = np.clip(np.einsum('ij,ij->i', car_pos - a, ab) / ab2_safe, 0.0, 1.0)
+    d_car = np.linalg.norm(a + t_car[:, None] * ab - car_pos, axis=1)
+    k = int(np.argmin(d_car))
+    a = np.vstack([(a[k] + t_car[k] * ab[k])[None, :], a[k + 1:]])
+    b = b[k:]
+    ab = b - a
+    ab2 = np.einsum('ij,ij->i', ab, ab)
+    ab2_safe = np.where(ab2 < 1e-12, 1.0, ab2)
+
+    # (segments, cones) distances.
+    ac = cones[None, :, :] - a[:, None, :]
+    t = np.clip(np.einsum('skd,sd->sk', ac, ab) / ab2_safe[:, None], 0.0, 1.0)
+    closest = a[:, None, :] + t[..., None] * ab[:, None, :]
+    d = np.linalg.norm(closest - cones[None, :, :], axis=2)
+    return bool(np.any(d < clearance))
 
 
 _SEG_EPS = 1e-9   # tolerance on the [0, 1] parametric range -- see _seg_intersect
@@ -277,20 +353,69 @@ def build_wall_segments_delaunay(
     return mesh.wall_segments(max_dist)
 
 
+def _end_on_line(end: np.ndarray, own: np.ndarray, u: np.ndarray) -> float | None:
+    """
+    How squarely does the gate axis u cross the boundary line at the orange
+    cone `end`? Returns the tilt |u . t| (0 = square, t the line direction),
+    or None if `end` is not on its own colour's line.
+
+    The local line comes from the own-colour cones nearest `end` that are
+    _START_LINE_PROBE_MIN..._START_LINE_PROBE_MAX away (a cone closer than
+    that gives no usable direction -- a gate set inside the track puts its
+    orange cone up to ~1 m from the line). With two such cones the line runs
+    through them, and `end` must also be within _START_LINE_MAX_OFFSET of it.
+    With one, the end -> cone chord is the line direction. With none in that
+    band, the nearest own-colour cone farther out (up to the vote radius)
+    gives the chord; with no own-colour cone at all there is no evidence and
+    the tilt counts as the worst allowed, so such a pair loses every tie.
+
+    Measured in the track frame, not along the pair axis: a pair tilted
+    across the track (a gate cone and a stray) makes along-track cone offsets
+    leak into axis projections, which is what let such pairs through.
+    """
+    max_tilt = math.sin(math.radians(_START_LINE_MAX_TILT))
+    d = np.linalg.norm(own - end, axis=1)
+    keep = (d >= _START_LINE_PROBE_MIN) & (d <= _START_LINE_PROBE_MAX)
+    cand = own[keep][np.argsort(d[keep])][:2]
+    if len(cand) == 0:
+        far = d >= _START_LINE_PROBE_MIN
+        if not np.any(far):
+            return max_tilt
+        cand = own[far][np.argsort(d[far])][:1]
+    if len(cand) == 2 and float(np.linalg.norm(cand[1] - cand[0])) >= _START_LINE_PROBE_MIN:
+        t = (cand[1] - cand[0]) / float(np.linalg.norm(cand[1] - cand[0]))
+        rel = end - cand[0]
+        if abs(float(rel[0] * t[1] - rel[1] * t[0])) > _START_LINE_MAX_OFFSET:
+            return None
+    else:
+        t = (cand[0] - end) / float(np.linalg.norm(cand[0] - end))
+    tilt = abs(float(u @ t))
+    return tilt if tilt <= max_tilt else None
+
+
 def _gate_sides(
     o1: np.ndarray,
     o2: np.ndarray,
     blue: np.ndarray,
     yellow: np.ndarray,
     radius: float,
-) -> tuple[np.ndarray, np.ndarray] | None:
+) -> tuple[np.ndarray, np.ndarray, float, float] | None:
     """
     Decide which end of the orange pair o1-o2 is the blue side. Returns
-    (blue_end, yellow_end), or None if the nearby boundary cones don't put the
-    two colours clearly at opposite ends.
+    (blue_end, yellow_end, margin, tilt), or None if the nearby boundary cones
+    don't put the two colours clearly at opposite ends. Both rank competing
+    pairings (see _best_matching): tilt is the summed |u . t| of the two ends
+    (0 = the gate crosses both boundary lines square, see _end_on_line);
+    margin (m, >= 0, larger is clearer) is how far both colour means sit past
+    the quarter-width mark.
 
-    Uses only the cones' positions along the o1->o2 axis -- never the car's
-    heading -- so a gate classifies the same way from either direction.
+    Uses only the cones' positions relative to the o1->o2 axis -- never the
+    car's heading -- so a gate classifies the same way from either direction.
+
+    Each end must also sit on its own colour's boundary line, with the axis
+    crossing that line roughly square (see _end_on_line). The mean test alone
+    accepts a pair whose "blue end" is really a yellow-side or stray cone as
+    long as the blue cones project the right way along a tilted axis.
     """
     mid = (o1 + o2) * 0.5
     w = float(np.linalg.norm(o2 - o1))
@@ -301,26 +426,97 @@ def _gate_sides(
         return None
     tb = (near_b - mid) @ u
     ty = (near_y - mid) @ u
-    margin = 0.25 * w
+    quarter = 0.25 * w
     mb, my = float(tb.mean()), float(ty.mean())
-    if (mb <= -margin and my >= margin
+    if (mb <= -quarter and my >= quarter
             and np.mean(tb < 0.0) >= _START_SIDE_MIN_FRAC
             and np.mean(ty > 0.0) >= _START_SIDE_MIN_FRAC):
-        return o1, o2
-    if (mb >= margin and my <= -margin
+        b_end, y_end = o1, o2
+    elif (mb >= quarter and my <= -quarter
             and np.mean(tb > 0.0) >= _START_SIDE_MIN_FRAC
             and np.mean(ty < 0.0) >= _START_SIDE_MIN_FRAC):
-        return o2, o1
-    return None
+        b_end, y_end = o2, o1
+    else:
+        return None
+    tilt_b = _end_on_line(b_end, near_b, u)
+    tilt_y = _end_on_line(y_end, near_y, u)
+    if tilt_b is None or tilt_y is None:
+        return None
+    margin = min(abs(mb), abs(my)) - quarter
+    return b_end, y_end, margin, tilt_b + tilt_y
+
+
+def _best_matching(
+    orange: np.ndarray,
+    same_side_max: float,
+    edges: list[tuple[int, int, np.ndarray, np.ndarray, float, float]],
+) -> list[tuple[int, int, np.ndarray, np.ndarray, float, float]]:
+    """
+    Pick the set of valid pairs (edges: i, j, blue_end, yellow_end, margin,
+    tilt) that is disjoint, non-crossing and consistent -- two pairs within
+    _START_GATE_GROUP_DIST of each other are one 4-cone gate, so their blue
+    ends must share a boundary line and so must their yellow ends -- with the
+    most pairs; ties go to
+    the smallest summed tilt (squarest gates), then the larger summed margin.
+    Tilt before margin: a real gate crosses the track square, while a pair of
+    a gate cone and a stray is tilted 25-35 deg -- and tilt leaks along-track
+    offsets into the side projections, so such a pair can out-score the real
+    one on margin. Exhaustive -- the valid-pair graph is tiny (a gate is 2-4
+    cones, and the width limit keeps far cones apart).
+    """
+    best: list = []
+    best_key = (0, 0.0, 0.0)
+
+    def same_line(p, q, u) -> bool:
+        v = q - p
+        return (float(np.linalg.norm(v)) <= same_side_max
+                and abs(float(v @ u)) <= _ORANGE_SAME_SIDE_LATERAL)
+
+    def conflicts(e, chosen) -> bool:
+        a1, a2 = orange[e[0]], orange[e[1]]
+        u = (e[3] - e[2]) / float(np.linalg.norm(e[3] - e[2]))
+        for c in chosen:
+            if _seg_intersect(a1, a2, orange[c[0]], orange[c[1]]):
+                return True
+            # Two pairs this close claim to be one 4-cone gate: their blue
+            # ends must share a boundary line, and so must their yellow ends.
+            mid_e, mid_c = (e[2] + e[3]) * 0.5, (c[2] + c[3]) * 0.5
+            if float(np.linalg.norm(mid_e - mid_c)) <= _START_GATE_GROUP_DIST:
+                if not (same_line(e[2], c[2], u) and same_line(e[3], c[3], u)):
+                    return True
+        return False
+
+    def search(k: int, used: set, chosen: list) -> None:
+        nonlocal best, best_key
+        key = (len(chosen), -round(sum(c[5] for c in chosen), 6), sum(c[4] for c in chosen))
+        if key > best_key:
+            best, best_key = list(chosen), key
+        # Even taking every remaining edge can't reach the best pair count:
+        # stop. Strict '<' keeps equal-count branches, so ties are still
+        # compared and the result is unchanged -- only the work is cut (a
+        # flood of 24 mislabelled oranges went from ~190 ms to a few ms).
+        if len(chosen) + (len(edges) - k) < best_key[0]:
+            return
+        for idx in range(k, len(edges)):
+            e = edges[idx]
+            if e[0] in used or e[1] in used or conflicts(e, chosen):
+                continue
+            chosen.append(e)
+            search(idx + 1, used | {e[0], e[1]}, chosen)
+            chosen.pop()
+
+    search(0, set(), [])
+    return best
 
 
 def assign_orange_sides(
     blue: np.ndarray,
     yellow: np.ndarray,
     orange: np.ndarray | None,
-    min_w: float = _WALL_MID_MIN_DELAUNAY,
+    min_w: float = _START_LINE_MIN_WIDTH,
     max_w: float = _START_LINE_MAX_WIDTH,
     radius: float = _START_SIDE_RADIUS,
+    same_side_max: float = _ORANGE_SAME_SIDE_MAX,
 ) -> tuple[np.ndarray, np.ndarray, list[tuple[np.ndarray, np.ndarray]]]:
     """
     Give each start-line (big) orange cone a side so the track mesh can use it.
@@ -333,18 +529,26 @@ def assign_orange_sides(
     the orange-orange edge into an ordinary cross-colour gate -- track_mesh
     needs no special case.
 
-      1. Drop strays: any orange cone within _ORANGE_STRAY_DIST of a blue/
-         yellow cone.
-      2. Pair closest-first. A pair is two cones min_w..max_w apart whose
-         sides _gate_sides can tell apart; each cone is used once. The side
-         test is part of acceptance, so two same-side gate cones (1.30 m apart
-         in FSDS, inside min_w..max_w) are rejected without using up either
-         cone, and the straight-across pairs are found next.
-      3. Append each pair's blue-end cone to blue and its yellow-end cone to
+      1. Pair by matching, not closest-first. A valid pair is two cones
+         min_w..max_w apart (start_line_min_width/max_width) that pass
+         _gate_sides. Of all sets of valid pairs that are disjoint, don't
+         cross each other and are consistent (see _best_matching), take the
+         one with the most pairs, ties to the squarest gates, then to the
+         larger summed side-test margin. Closest-first let two same-side gate
+         cones claim each other whenever they passed the side test, which
+         sparse perception makes possible (FSDS's 1.30 m same-side pairs are
+         now below start_line_min_width; wider same-side spacings are not). Nothing is rejected for sitting close to a blue/yellow
+         cone: the rules put big orange cones on the border rows.
+      2. Append each pair's blue-end cone to blue and its yellow-end cone to
          yellow.
+      3. A leftover orange cone (3 seen, or its partner failed) takes the side
+         of an assigned orange within same_side_max of it that sits along the
+         track from it: more than 45 deg off that pair's axis and at most
+         _ORANGE_SAME_SIDE_LATERAL across it (on the same boundary line, so a
+         stray inside the track never becomes a wall cone). Nearest wins.
 
-    Unpaired orange cones stay out of the mesh (callers should still keep
-    them in their clearance checks). Pass big orange only -- small orange
+    Other unpaired orange cones stay out of the mesh (callers should still
+    keep them in their clearance checks). Pass big orange only -- small orange
     cones (accel braking zone) don't mark a line.
 
     Returns (blue_aug, yellow_aug, start_pairs), start_pairs being a list of
@@ -359,34 +563,55 @@ def assign_orange_sides(
     if len(orange) < 2 or len(blue) == 0 or len(yellow) == 0:
         return blue, yellow, []
 
-    others = np.vstack([blue, yellow])
-    clear = np.linalg.norm(orange[:, None, :] - others[None, :, :], axis=2).min(axis=1)
-    orange = orange[clear >= _ORANGE_STRAY_DIST]
-
+    # No distance-based rejection: the rules put big orange cones on the border
+    # rows, so a genuine one can sit right next to a blue/yellow cone (on
+    # Skidpad nearly touching; FSDS CompetitionMap1: 0.62 m). Dropping oranges
+    # within 0.5 m of a border cone lost real gate cones to perception noise.
+    # Strays are left to the pairing tests below.
     n = len(orange)
-    cands = []
+    edges = []
     for i in range(n):
         for j in range(i + 1, n):
             d = float(np.linalg.norm(orange[i] - orange[j]))
-            if min_w <= d <= max_w:
-                cands.append((d, i, j))
-    cands.sort()
-
-    used: set = set()
-    pairs: list[tuple[np.ndarray, np.ndarray]] = []
-    for _, i, j in cands:
-        if i in used or j in used:
-            continue
-        sides = _gate_sides(orange[i], orange[j], blue, yellow, radius)
-        if sides is None:
-            continue
-        used.update((i, j))
-        pairs.append(sides)
-
-    if not pairs:
+            if not (min_w <= d <= max_w):
+                continue
+            sides = _gate_sides(orange[i], orange[j], blue, yellow, radius)
+            if sides is not None:
+                edges.append((i, j, *sides))
+    if not edges:
         return blue, yellow, []
-    blue_aug = np.vstack([blue, np.array([p[0] for p in pairs])])
-    yellow_aug = np.vstack([yellow, np.array([p[1] for p in pairs])])
+    # Backstop for a flood of mislabelled cones: keep the search exhaustive
+    # over the clearest pairs only.
+    edges.sort(key=lambda e: (e[5], -e[4]))
+    chosen = _best_matching(orange, same_side_max, edges[:_START_MAX_EDGES])
+
+    pairs = [(e[2], e[3]) for e in chosen]
+    add_b = [e[2] for e in chosen]
+    add_y = [e[3] for e in chosen]
+
+    used = {e[0] for e in chosen} | {e[1] for e in chosen}
+    for k in range(n):
+        if k in used:
+            continue
+        best = None   # (dist, is_blue)
+        for (i, j, b_end, y_end, _, _) in chosen:
+            u = (y_end - b_end) / float(np.linalg.norm(y_end - b_end))
+            for end, is_b in ((b_end, True), (y_end, False)):
+                v = orange[k] - end
+                dist = float(np.linalg.norm(v))
+                if dist > same_side_max or dist < 1e-9:
+                    continue
+                lateral = abs(float(v @ u))
+                if (lateral / dist >= _START_SIDE_MAX_AXIS_COS
+                        or lateral > _ORANGE_SAME_SIDE_LATERAL):
+                    continue   # across the track from `end`, not along its boundary line
+                if best is None or dist < best[0]:
+                    best = (dist, is_b)
+        if best is not None:
+            (add_b if best[1] else add_y).append(orange[k])
+
+    blue_aug = np.vstack([blue, np.array(add_b)])
+    yellow_aug = np.vstack([yellow, np.array(add_y)])
     return blue_aug, yellow_aug, pairs
 
 
@@ -408,6 +633,8 @@ def debug_triangulation_edges(
     mesh: TrackMesh | None = None,
     orange_cones: np.ndarray | None = None,
     start_line_max_width: float = _START_LINE_MAX_WIDTH,
+    same_side_max: float = _ORANGE_SAME_SIDE_MAX,
+    start_line_min_width: float = _START_LINE_MIN_WIDTH,
 ) -> list[tuple[np.ndarray, np.ndarray, str]]:
     """
     Return every edge of the track mesh build_wall_segments_delaunay/
@@ -433,9 +660,9 @@ def debug_triangulation_edges(
 
     The edges are those of track_mesh.build_track_mesh, i.e. exactly the mesh
     build_path_walls planned on, bridges included (a bridge is tagged 'wall'
-    like any other kept same-colour edge). orange_cones/start_line_max_width
-    must match what build_path_walls was given for that to hold; a passed-in
-    `mesh` must already include the assigned orange cones.
+    like any other kept same-colour edge). orange_cones/start_line_max_width/
+    same_side_max must match what build_path_walls was given for that to
+    hold; a passed-in `mesh` must already include the assigned orange cones.
 
     Returns an empty list on degenerate input (fewer than 3 cones total, or a
     triangulation-raising point set) -- same conditions
@@ -445,7 +672,9 @@ def debug_triangulation_edges(
     start_pairs: list = []
     if orange_cones is not None:
         blue, yellow, start_pairs = assign_orange_sides(
-            blue, yellow, orange_cones, min_w=mid_min, max_w=start_line_max_width,
+            blue, yellow, orange_cones,
+            min_w=start_line_min_width, max_w=start_line_max_width,
+            same_side_max=same_side_max,
         )
     if mesh is None:
         mesh = build_track_mesh(blue, yellow, max_dist=max_dist)
@@ -922,8 +1151,13 @@ def _walk_corridor(
         if arc_len >= max_arc_length:
             break
 
+    # Drop the skipped entry point only when the car can reach the next point
+    # directly. If car -> path[1] crosses a wall, the entry gate is what keeps
+    # the path on the car's side of that wall (the car is beside the gate,
+    # not past it), so it stays.
     if skip_entry and len(path) > 1:
-        path = path[1:]
+        if not (wall_segs and segment_crosses_walls(car_pos, path[1], wall_segs)):
+            path = path[1:]
     return np.array(path, dtype=np.float64)
 
 
@@ -1143,6 +1377,8 @@ def build_path_walls(
     mid_max_gate: float = _WALL_MID_MAX_DELAUNAY,
     orange_cones: np.ndarray | None = None,
     start_line_max_width: float = _START_LINE_MAX_WIDTH,
+    same_side_max: float = _ORANGE_SAME_SIDE_MAX,
+    start_line_min_width: float = _START_LINE_MIN_WIDTH,
 ) -> tuple[np.ndarray | None,
            list[tuple[np.ndarray, np.ndarray]],
            list[tuple[np.ndarray, np.ndarray]],
@@ -1198,7 +1434,9 @@ def build_path_walls(
     are given a side by assign_orange_sides and join blue/yellow for every
     method and the fallback, closing the wall gap at the start line. None (or
     no pair found) leaves the output identical to not passing it.
-    start_line_max_width bounds the pair width; the min is mid_min_gate.
+    start_line_min_width/start_line_max_width bound the pair width.
+    same_side_max: how far a leftover orange may sit from an assigned one
+    along the track and still share its side (see assign_orange_sides).
 
     Returns
     -------
@@ -1210,7 +1448,8 @@ def build_path_walls(
     if orange_cones is not None:
         blue_cones, yellow_cones, _ = assign_orange_sides(
             blue_cones, yellow_cones, orange_cones,
-            min_w=mid_min_gate, max_w=start_line_max_width,
+            min_w=start_line_min_width, max_w=start_line_max_width,
+            same_side_max=same_side_max,
         )
 
     # One mesh for walls AND corridor -- see track_mesh.build_track_mesh.
