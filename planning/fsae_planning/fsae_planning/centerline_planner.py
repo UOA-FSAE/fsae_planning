@@ -17,6 +17,8 @@ Interface (matches the fsae_autonomous car stack):
     in   /fsae/slam/small_orange_track  fsae_interfaces/Track  accel braking zone (clearance only)
     in   /fsae/slam/car_position  geometry_msgs/PoseStamped x,y in position; yaw in orientation.w
     out  /fsae/planning/selected_trajectory  geometry_msgs/PoseArray   centreline waypoints
+    out  /fsae/planning/one_sided  std_msgs/Bool  true while the published path follows one
+                                                  boundary only (see the one_sided params)
 
 The plan loop is triggered by each car_position update (upstream convention),
 using whatever left_track/right_track cones are cached at that moment. An
@@ -50,7 +52,7 @@ from rclpy.node import Node
 from builtin_interfaces.msg import Duration
 from fsae_interfaces.msg import Track
 from geometry_msgs.msg import Point, Pose, PoseArray, PoseStamped, Vector3
-from std_msgs.msg import ColorRGBA, Empty
+from std_msgs.msg import Bool, ColorRGBA, Empty
 from visualization_msgs.msg import Marker, MarkerArray
 
 from fsae_planning.boundary import (
@@ -61,6 +63,14 @@ from fsae_planning.boundary import (
     first_close_segment,
     path_ahead_too_close,
     segment_crosses_walls,
+    _ONE_SIDED_CAR_HALF_WIDTH,
+    _ONE_SIDED_MIN_WALK,
+    _ONE_SIDED_OFFSET_DEFAULT,
+    _ONE_SIDED_OFFSET_MAX,
+    _ONE_SIDED_OFFSET_MIN,
+    _ONE_SIDED_TAPER,
+    _ONE_SIDED_TRACE_MAX_STEP,
+    _ONE_SIDED_TRACE_MAX_TURN,
     _WALL_MAX_TURN_COS,
     _WALL_MID_MIN_DELAUNAY,
     _WALL_MID_MAX_DELAUNAY,
@@ -99,6 +109,25 @@ _TRI_EDGE_STYLE = {
 _SLOW_TICK_WARN_SEC = 0.05
 
 _CONE_DEDUP_DIST = 0.01   # metres — merge-distance for coincident/near-duplicate cones
+
+# /fsae/planning/debug/one_sided: the followed boundary's trace (thin) and
+# the offset path appended to the gate walk (thick). Cyan, so it can't be
+# mistaken for the magenta corridor gates.
+_ONE_SIDED_TRACE_STYLE = (ColorRGBA(r=0.0, g=0.8, b=0.8, a=0.6), 0.04)
+_ONE_SIDED_EXT_STYLE   = (ColorRGBA(r=0.0, g=1.0, b=1.0, a=1.0), 0.12)
+
+
+class _NullLog:
+    """Logger stand-in that drops everything (see CenterlinePlanner._sanitize's quiet)."""
+
+    def warn(self, *_args, **_kwargs) -> None:
+        pass
+
+    def info(self, *_args, **_kwargs) -> None:
+        pass
+
+
+_NULL_LOG = _NullLog()
 
 
 def cones_to_array(cones, logger=None, label: str = 'cones') -> np.ndarray:
@@ -242,6 +271,36 @@ class CenterlinePlanner(Node):
         # clearance-only.
         self.declare_parameter('same_side_max', _ORANGE_SAME_SIDE_MAX)
 
+        # One-sided offset trace (see boundary.build_path_walls' one_sided):
+        # where the gate walk ends short (or finds nothing) but one boundary
+        # is still seen, follow it at an inward offset up to its last seen
+        # cone. one_sided false is the rollback. Defaults are the go-kart's:
+        # offset_min = car half width 0.5 + 0.4 m margin to the seen side;
+        # offset_max = min track width 2.3 - 0.5 - 0.5 m margin to the UNSEEN
+        # side, which no clearance check covers; offset_default = 2.3 / 2.
+        # car_half_width also stops the offset path before any cone that
+        # close; min_track_width is only checked against the offsets.
+        self.declare_parameter('one_sided', True)
+        self.declare_parameter('one_sided_offset_min', _ONE_SIDED_OFFSET_MIN)
+        self.declare_parameter('one_sided_offset_max', _ONE_SIDED_OFFSET_MAX)
+        self.declare_parameter('one_sided_offset_default', _ONE_SIDED_OFFSET_DEFAULT)
+        self.declare_parameter('one_sided_car_half_width', _ONE_SIDED_CAR_HALF_WIDTH)
+        self.declare_parameter('one_sided_min_track_width', 2.3)
+        self.declare_parameter('one_sided_taper', _ONE_SIDED_TAPER)
+        self.declare_parameter('one_sided_min_walk', _ONE_SIDED_MIN_WALK)
+        self.declare_parameter('one_sided_trace_max_step', _ONE_SIDED_TRACE_MAX_STEP)
+        self.declare_parameter('one_sided_trace_max_turn_deg', _ONE_SIDED_TRACE_MAX_TURN)
+        # Hysteresis between the two-sided path and the one-sided one. The
+        # two-sided path is "good" when it survives _sanitize with at least
+        # one_sided_good_len metres. Enter one-sided mode at once when the
+        # two-sided path is unusable (or the car would stop), else after
+        # one_sided_enter_ticks consecutive ticks of a short two-sided path;
+        # leave after one_sided_exit_ticks consecutive good ticks, or at once
+        # when no one-sided path exists.
+        self.declare_parameter('one_sided_good_len', _ONE_SIDED_MIN_WALK)
+        self.declare_parameter('one_sided_enter_ticks', 3)
+        self.declare_parameter('one_sided_exit_ticks', 5)
+
         # -- input staleness gates. Ported from the real stack, where a
         # camera/SLAM pipeline can stall or drop frames. The simulator's
         # perception is synchronous ground truth so these rarely fire here,
@@ -309,6 +368,27 @@ class CenterlinePlanner(Node):
             self.get_parameter('min_usable_path_length').get_parameter_value().double_value
         self._max_hold_deviation = self.get_parameter('max_hold_deviation').get_parameter_value().double_value
 
+        def _dbl(name: str) -> float:
+            return self.get_parameter(name).get_parameter_value().double_value
+
+        self._one_sided = self.get_parameter('one_sided').get_parameter_value().bool_value
+        self._one_sided_params = {
+            'offset_min':     _dbl('one_sided_offset_min'),
+            'offset_max':     _dbl('one_sided_offset_max'),
+            'offset_default': _dbl('one_sided_offset_default'),
+            'car_half_width': _dbl('one_sided_car_half_width'),
+            'taper':          _dbl('one_sided_taper'),
+            'min_walk':       _dbl('one_sided_min_walk'),
+            'max_step':       _dbl('one_sided_trace_max_step'),
+            'max_turn_deg':   _dbl('one_sided_trace_max_turn_deg'),
+        }
+        self._one_sided_min_track_width = _dbl('one_sided_min_track_width')
+        self._one_sided_good_len = _dbl('one_sided_good_len')
+        self._one_sided_enter_ticks = \
+            self.get_parameter('one_sided_enter_ticks').get_parameter_value().integer_value
+        self._one_sided_exit_ticks = \
+            self.get_parameter('one_sided_exit_ticks').get_parameter_value().integer_value
+
         # -- parameter sanity. An unrecognised midpoint_method used to
         # silently fall through to the 'nn' branch in
         # boundary.build_path_walls (its `if 'delaunay' ... else` gate) --
@@ -329,6 +409,11 @@ class CenterlinePlanner(Node):
             ('start_line_max_width', self._start_line_max_width),
             ('same_side_max', self._same_side_max),
             ('start_line_min_width', self._start_line_min_width),
+            *((name, _dbl(name)) for name in (
+                'one_sided_offset_min', 'one_sided_offset_max', 'one_sided_offset_default',
+                'one_sided_car_half_width', 'one_sided_taper', 'one_sided_min_walk',
+                'one_sided_trace_max_step', 'one_sided_trace_max_turn_deg',
+                'one_sided_min_track_width')),
         ):
             if not (math.isfinite(val) and val > 0.0):
                 raise ValueError(f'{name} must be a finite positive number, got {val!r}')
@@ -343,6 +428,22 @@ class CenterlinePlanner(Node):
         ):
             if not (math.isfinite(val) and val >= 0.0):
                 raise ValueError(f'{name} must be a finite non-negative number, got {val!r}')
+        osp = self._one_sided_params
+        if not osp['offset_min'] <= osp['offset_default'] <= osp['offset_max']:
+            raise ValueError(
+                'one_sided offsets must satisfy offset_min <= offset_default <= offset_max, got '
+                f"{osp['offset_min']}/{osp['offset_default']}/{osp['offset_max']}")
+        # Not fatal (the offsets are what the planner uses), but say so when
+        # they no longer fit the car and track they are meant to describe.
+        if osp['offset_min'] < osp['car_half_width']:
+            self.get_logger().warn(
+                f"one_sided_offset_min={osp['offset_min']} < one_sided_car_half_width="
+                f"{osp['car_half_width']}: the one-sided path lets the car body reach the seen boundary")
+        if osp['offset_max'] > self._one_sided_min_track_width - osp['car_half_width']:
+            self.get_logger().warn(
+                f"one_sided_offset_max={osp['offset_max']} > one_sided_min_track_width - "
+                f"car_half_width={self._one_sided_min_track_width - osp['car_half_width']}: on the "
+                'narrowest track the car body can reach the unseen boundary')
 
         self.create_subscription(Track, '/fsae/slam/left_track',  self._left_cb,  10)
         self.create_subscription(Track, '/fsae/slam/right_track', self._right_cb, 10)
@@ -359,6 +460,7 @@ class CenterlinePlanner(Node):
         self.create_subscription(Empty, '/fsae/planning/reset_map', self._reset_cb, 10)
 
         self.pub_traj = self.create_publisher(PoseArray, '/fsae/planning/selected_trajectory', 10)
+        self.pub_one_sided = self.create_publisher(Bool, '/fsae/planning/one_sided', 10)
 
         # Debug: expose the wall mesh and candidate midpoints that build_path_walls
         # computes but otherwise keeps to itself.  Off by default — this is pure
@@ -377,6 +479,8 @@ class CenterlinePlanner(Node):
                 # pairs) so each tag gets its own colour in RViz and the
                 # dashboard's track view.
                 'triangulation': self.create_publisher(MarkerArray, '/fsae/planning/debug/triangulation', 10),
+                # The one-sided trace and offset path (see _ONE_SIDED_*_STYLE).
+                'one_sided': self.create_publisher(MarkerArray, '/fsae/planning/debug/one_sided', 10),
             }
             self.get_logger().info('debug_viz on — publishing /fsae/planning/debug/*')
 
@@ -405,6 +509,15 @@ class CenterlinePlanner(Node):
         self._blue_segs:   list = []
         self._yellow_segs: list = []
         self._midpoints:   np.ndarray = np.empty((0, 2))
+        # One-sided mode (see the one_sided params): whether the current path
+        # follows one boundary, the hysteresis counters, and this tick's
+        # build_path_walls info (trace/extension, for debug).
+        self._one_sided_mode = False
+        self._one_sided_enter = 0
+        self._one_sided_exit = 0
+        self._one_sided_info: dict = {}
+        self._path_one_sided = False          # this tick's fresh candidate
+        self._last_valid_one_sided = False    # the cached path, for the hold
 
         # Local reception clocks — see the max_pose_age/max_track_age block
         # above for why arrival time and not message stamps.
@@ -470,6 +583,12 @@ class CenterlinePlanner(Node):
         self._blue_segs    = []
         self._yellow_segs  = []
         self._midpoints    = np.empty((0, 2))
+        self._one_sided_mode = False
+        self._one_sided_enter = 0
+        self._one_sided_exit = 0
+        self._one_sided_info = {}
+        self._path_one_sided = False
+        self._last_valid_one_sided = False
         # Also drop pose/freshness state -- otherwise a stale-but-still-fresh
         # pose/track arrival time from before the reset could let the very next
         # tick silently rebuild a plan from pre-reset inputs instead of
@@ -543,7 +662,7 @@ class CenterlinePlanner(Node):
     # Output sanitisation
     # ------------------------------------------------------------------
 
-    def _sanitize(self, path: np.ndarray) -> np.ndarray | None:
+    def _sanitize(self, path: np.ndarray, quiet: bool = False) -> np.ndarray | None:
         """
         Returns a safe-to-publish path (possibly truncated), or None if
         nothing of it is usable.
@@ -557,16 +676,20 @@ class CenterlinePlanner(Node):
         a single bad segment out near the horizon blanked the entire
         trajectory, including the good near-field part directly in front of
         the car.
+
+        quiet: no log output (used to grade the two-sided path while the
+        one-sided one may be published instead, see _choose_path).
         """
+        log = _NULL_LOG if quiet else self.get_logger()
         pts = np.asarray(path, dtype=np.float64)
         if len(pts) < 2 or not np.all(np.isfinite(pts)):
-            self.get_logger().warn(
+            log.warn(
                 'sanitize: rejected (path too short or non-finite)', throttle_duration_sec=2.0)
             return None
 
         seg_lens = np.linalg.norm(np.diff(pts, axis=0), axis=1)
         if np.any(seg_lens > self._max_point_jump):
-            self.get_logger().warn(
+            log.warn(
                 f'sanitize: rejected (point-to-point jump > max_point_jump={self._max_point_jump})',
                 throttle_duration_sec=2.0)
             return None
@@ -582,7 +705,7 @@ class CenterlinePlanner(Node):
         heading = np.array([math.cos(self._car_yaw), math.sin(self._car_yaw)])
         d_norm = float(np.linalg.norm(d))
         if d_norm > 1e-6 and float(d @ heading) / d_norm < _WALL_MAX_TURN_COS:
-            self.get_logger().warn(
+            log.warn(
                 'sanitize: rejected (initial heading disagrees with car heading)',
                 throttle_duration_sec=2.0)
             return None
@@ -621,11 +744,11 @@ class CenterlinePlanner(Node):
 
         if cut_idx < len(pts):
             if cut_idx < 2:
-                self.get_logger().warn(
+                log.warn(
                     'sanitize: rejected (wall/cone-clearance violation at the very first segment)',
                     throttle_duration_sec=2.0)
                 return None
-            self.get_logger().info(
+            log.info(
                 f'sanitize: truncated at wall/cone-clearance violation ({cut_idx}/{len(pts)} pts kept)',
                 throttle_duration_sec=2.0)
             pts = pts[:cut_idx]
@@ -635,7 +758,7 @@ class CenterlinePlanner(Node):
         # outright rather than publish/hold something driveable in name only.
         usable_len = float(np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
         if usable_len < self._min_usable_path_length:
-            self.get_logger().warn(
+            log.warn(
                 f'sanitize: rejected (usable path length {usable_len:.2f}m < '
                 f'min_usable_path_length={self._min_usable_path_length})',
                 throttle_duration_sec=2.0)
@@ -675,6 +798,7 @@ class CenterlinePlanner(Node):
 
     def _run_planning_tick(self) -> None:
         self._orange_tick, self._clearance_extra = self._orange_inputs()
+        self._path_one_sided = False
         if self._inputs_fresh():
             self._compute_path()
             if not self._inputs_fresh():
@@ -728,7 +852,9 @@ class CenterlinePlanner(Node):
             self._prev_centreline = final
             self._last_valid_centreline = final
             self._last_valid_time = now
+            self._last_valid_one_sided = self._path_one_sided
             self._prev_path_dir = _direction_from_path(final, self._car_pos)
+            one_sided = self._path_one_sided
         elif (
             self._last_valid_centreline is not None
             and self._last_valid_time is not None
@@ -743,6 +869,7 @@ class CenterlinePlanner(Node):
             # the hold has a hard deadline from the last GOOD plan, rather than
             # resetting on every held tick and holding forever.
             self._centreline = self._last_valid_centreline
+            one_sided = self._last_valid_one_sided
             self.get_logger().info(
                 'holding last path (no fresh valid plan this tick)',
                 throttle_duration_sec=1.0,
@@ -751,8 +878,10 @@ class CenterlinePlanner(Node):
             self._centreline = None
             self._prev_centreline = None
             self._prev_path_dir = None
+            one_sided = False
 
         self._publish_trajectory()
+        self.pub_one_sided.publish(Bool(data=bool(one_sided and self._centreline is not None)))
         self._publish_debug()
 
         if self._centreline is None:
@@ -851,7 +980,11 @@ class CenterlinePlanner(Node):
                     start_line_max_width=self._start_line_max_width,
                     same_side_max=self._same_side_max,
                     start_line_min_width=self._start_line_min_width,
+                    one_sided=self._one_sided,
+                    one_sided_params=self._one_sided_params,
+                    info=self._one_sided_info,
                 )
+            self._choose_path()
             dt = time.perf_counter() - t0
             if dt > _SLOW_TICK_WARN_SEC:
                 n_blue, n_yellow = len(self._blue_cones), len(self._yellow_cones)
@@ -866,6 +999,8 @@ class CenterlinePlanner(Node):
                 f'Wall-barrier planner failed ({exc!r}), falling back to simple pairing',
                 throttle_duration_sec=5.0,
             )
+            self._one_sided_info = {}
+            self._path_one_sided = False
             # Same orange side assignment as the primary build, so the
             # fallback sees the start-line gap closed too. Guarded on its own:
             # if it is what raised, plan from blue/yellow alone.
@@ -897,6 +1032,56 @@ class CenterlinePlanner(Node):
             except Exception:
                 self._blue_segs, self._yellow_segs = [], []
             self._midpoints = np.empty((0, 2))
+
+    def _choose_path(self) -> None:
+        """
+        Pick this tick's candidate: the two-sided path or the one-sided one.
+
+        build_path_walls returns the one-sided path whenever it could build
+        one, plus the two-sided path in info['two_sided']. Hysteresis (see the
+        one_sided_* params) keeps the published path from flicking between
+        the two: the two-sided path is graded by _sanitize (quietly) and is
+        "good" with at least one_sided_good_len metres left. Entering is
+        immediate when it is unusable -- otherwise the car would be left with
+        no path at all -- or when it is build_local_path's fallback (the walk
+        found no gates; its naive pairing cuts across a hairpin's infield and
+        still passes _sanitize), and after one_sided_enter_ticks short ticks
+        otherwise; leaving takes one_sided_exit_ticks good ticks, or happens
+        at once when no one-sided path exists.
+        """
+        info = self._one_sided_info
+        was = self._one_sided_mode
+        if not info.get('one_sided'):
+            self._one_sided_mode = False
+            self._one_sided_enter = self._one_sided_exit = 0
+        else:
+            two = info.get('two_sided')
+            if info.get('two_sided_fallback'):
+                two = None
+            two_ok = self._sanitize(two, quiet=True) if two is not None and len(two) >= 2 else None
+            two_len = (float(np.sum(np.linalg.norm(np.diff(two_ok, axis=0), axis=1)))
+                       if two_ok is not None else 0.0)
+            good = two_len >= self._one_sided_good_len
+            if self._one_sided_mode:
+                self._one_sided_exit = self._one_sided_exit + 1 if good else 0
+                if self._one_sided_exit >= self._one_sided_exit_ticks:
+                    self._one_sided_mode = False
+            elif two_ok is None:
+                self._one_sided_mode = True
+            elif not good:
+                self._one_sided_enter += 1
+                if self._one_sided_enter >= self._one_sided_enter_ticks:
+                    self._one_sided_mode = True
+            else:
+                self._one_sided_enter = 0
+            if self._one_sided_mode:
+                self._path_one_sided = True
+            else:
+                self._centreline = two
+        if self._one_sided_mode != was:
+            self._one_sided_enter = self._one_sided_exit = 0
+            self.get_logger().info(
+                f"one-sided mode {'ON (following ' + str(info.get('side')) + ')' if self._one_sided_mode else 'OFF'}")
 
     # ------------------------------------------------------------------
     # Publishing / visualisation
@@ -984,6 +1169,24 @@ class CenterlinePlanner(Node):
             marker.points.append(Point(x=float(p2[0]), y=float(p2[1]), z=0.0))
         return marker
 
+    def _strip_marker(self, points, marker_id: int, ns: str, style) -> Marker:
+        """LINE_STRIP marker through `points` (map frame), same lifetime as _edges_marker."""
+        color, width = style
+        marker = Marker()
+        marker.header.frame_id = 'map'
+        marker.header.stamp    = self.get_clock().now().to_msg()
+        marker.ns     = ns
+        marker.id     = marker_id
+        marker.type   = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.pose.orientation.w = 1.0
+        marker.scale  = Vector3(x=width, y=0.0, z=0.0)
+        marker.color  = color
+        marker.lifetime = Duration(sec=1, nanosec=500_000_000)
+        for p in points:
+            marker.points.append(Point(x=float(p[0]), y=float(p[1]), z=0.0))
+        return marker
+
     def _publish_debug(self) -> None:
         """
         Publish the wall mesh, candidate midpoints, and the full wall-build
@@ -1028,6 +1231,15 @@ class CenterlinePlanner(Node):
             edges = [(p1, p2) for p1, p2, t in tagged if t == tag]
             markers.markers.append(self._edges_marker(edges, i, tag))
         self._dbg_pubs['triangulation'].publish(markers)
+
+        # Empty strips while two-sided, so the last one-sided drawing clears.
+        info = self._one_sided_info if self._path_one_sided else {}
+        one = MarkerArray()
+        one.markers.append(self._strip_marker(
+            info.get('trace', ()), 0, 'one_sided_trace', _ONE_SIDED_TRACE_STYLE))
+        one.markers.append(self._strip_marker(
+            info.get('extension', ()), 1, 'one_sided_extension', _ONE_SIDED_EXT_STYLE))
+        self._dbg_pubs['one_sided'].publish(one)
 
 
 def main(args=None):

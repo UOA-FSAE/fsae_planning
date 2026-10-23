@@ -21,10 +21,21 @@ def generate_launch_description():
     plan_horizon = LaunchConfiguration('plan_horizon')
     debug_viz = LaunchConfiguration('debug_viz')
     use_orange = LaunchConfiguration('use_orange')
+    one_sided = LaunchConfiguration('one_sided')
+    planner_cone_source = LaunchConfiguration('planner_cone_source')
 
     run_centerline = IfCondition(
-        PythonExpression(["'", planner, "' == 'centerline_planner'"])
+        PythonExpression(["'", planner, "' == 'centerline_planner' and '",
+                          planner_cone_source, "' != 'memory'"])
     )
+    # Same planner, cones from cone_memory: its four track inputs remapped to
+    # /fsae/cone_memory/* (no code change -- the node only knows /fsae/slam/*).
+    run_centerline_memory = IfCondition(
+        PythonExpression(["'", planner, "' == 'centerline_planner' and '",
+                          planner_cone_source, "' == 'memory'"])
+    )
+    memory_remaps = [(f'/fsae/slam/{t}', f'/fsae/cone_memory/{t}')
+                     for t in ('left_track', 'right_track', 'big_orange_track', 'small_orange_track')]
     run_skidpad = IfCondition(
         PythonExpression(["'", planner, "' == 'skidpad_planner'"])
     )
@@ -62,6 +73,16 @@ def generate_launch_description():
             description='centerline_planner only -- plan with the big orange start-line '
                         'cones (overrides fsae_params.yaml centerline_planner.use_orange; '
                         'false is the rollback). Read once at startup.'),
+        DeclareLaunchArgument(
+            'planner_cone_source', default_value='slam',
+            description="centerline_planner only -- 'slam' reads /fsae/slam/*_track as on "
+                        "the kart; 'memory' reads cone_memory's /fsae/cone_memory/*_track."),
+        DeclareLaunchArgument(
+            'one_sided', default_value='true',
+            description='centerline_planner only -- extend the path along the one '
+                        'visible boundary when the gate walk ends (overrides '
+                        'fsae_params.yaml centerline_planner.one_sided; false is the '
+                        'rollback).'),
         Node(
             package='fsae_planning',
             executable=planner,
@@ -72,8 +93,24 @@ def generate_launch_description():
                 'plan_horizon': plan_horizon,
                 'debug_viz': debug_viz,
                 'use_orange': use_orange,
+                'one_sided': one_sided,
             }],
             condition=run_centerline,
+        ),
+        Node(
+            package='fsae_planning',
+            executable=planner,
+            name=planner,
+            output='screen',
+            parameters=[config, {
+                'look_radius': look_radius,
+                'plan_horizon': plan_horizon,
+                'debug_viz': debug_viz,
+                'use_orange': use_orange,
+                'one_sided': one_sided,
+            }],
+            remappings=memory_remaps,
+            condition=run_centerline_memory,
         ),
         Node(
             package='fsae_planning',
