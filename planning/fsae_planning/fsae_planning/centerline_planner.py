@@ -58,6 +58,7 @@ from fsae_planning.boundary import (
     build_path_walls,
     build_wall_segments_delaunay,
     debug_triangulation_edges,
+    first_close_segment,
     path_ahead_too_close,
     segment_crosses_walls,
     _WALL_MAX_TURN_COS,
@@ -609,11 +610,14 @@ class CenterlinePlanner(Node):
 
         if self._min_cone_clearance > 0.0:
             cones = np.vstack([self._blue_cones, self._yellow_cones, self._clearance_extra])
-            if len(cones) > 0:
-                d = np.linalg.norm(pts[:, None, :] - cones[None, :, :], axis=2)
-                too_close = np.where(d.min(axis=1) < self._min_cone_clearance)[0]
-                if len(too_close) > 0:
-                    cut_idx = min(cut_idx, int(too_close[0]))
+            # Measured along each SEGMENT, not only at the vertices: a cone
+            # between two waypoints could otherwise sit inside the clearance
+            # (or right on the path) unnoticed. Cut before the first segment
+            # that comes too close -- the vertex at its start is the last one
+            # known to be clear of every cone on the way there.
+            k = first_close_segment(pts, cones, self._min_cone_clearance)
+            if k >= 0:
+                cut_idx = min(cut_idx, k + 1)
 
         if cut_idx < len(pts):
             if cut_idx < 2:

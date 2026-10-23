@@ -194,6 +194,34 @@ def segment_crosses_walls(
     return any(_seg_intersect(p1, p2, w1, w2) for (w1, w2) in wall_segs)
 
 
+def first_close_segment(
+    path: np.ndarray,
+    cones: np.ndarray,
+    clearance: float,
+) -> int:
+    """
+    Return the index of the first path segment that comes too close to a cone.
+
+    Segment k is path[k] -> path[k+1]; it is too close if any point on it is
+    within `clearance` of any cone (segment-to-point, not just the vertices).
+    Returns -1 if none is, or if clearance <= 0 / there is nothing to check.
+    """
+    pts = np.asarray(path, dtype=np.float64).reshape(-1, 2)
+    cones = np.asarray(cones, dtype=np.float64).reshape(-1, 2)
+    if clearance <= 0.0 or len(pts) < 2 or len(cones) == 0:
+        return -1
+    a, b = pts[:-1], pts[1:]
+    ab = b - a
+    ab2 = np.einsum('ij,ij->i', ab, ab)
+    ab2_safe = np.where(ab2 < 1e-12, 1.0, ab2)
+    ac = cones[None, :, :] - a[:, None, :]
+    t = np.clip(np.einsum('skd,sd->sk', ac, ab) / ab2_safe[:, None], 0.0, 1.0)
+    closest = a[:, None, :] + t[..., None] * ab[:, None, :]
+    d = np.linalg.norm(closest - cones[None, :, :], axis=2)
+    bad = np.where(d.min(axis=1) < clearance)[0]
+    return int(bad[0]) if len(bad) else -1
+
+
 def path_ahead_too_close(
     path: np.ndarray,
     car_pos: np.ndarray,
@@ -209,30 +237,19 @@ def path_ahead_too_close(
     on it. The part already behind the car is ignored.
     """
     pts = np.asarray(path, dtype=np.float64).reshape(-1, 2)
-    cones = np.asarray(cones, dtype=np.float64).reshape(-1, 2)
-    if clearance <= 0.0 or len(pts) < 2 or len(cones) == 0:
+    if clearance <= 0.0 or len(pts) < 2:
         return False
     a, b = pts[:-1], pts[1:]
     ab = b - a
     ab2 = np.einsum('ij,ij->i', ab, ab)
     ab2_safe = np.where(ab2 < 1e-12, 1.0, ab2)
 
-    # Segment the car projects onto, and where on it.
+    # Segment the car projects onto, and where on it; check from there on.
     t_car = np.clip(np.einsum('ij,ij->i', car_pos - a, ab) / ab2_safe, 0.0, 1.0)
     d_car = np.linalg.norm(a + t_car[:, None] * ab - car_pos, axis=1)
     k = int(np.argmin(d_car))
-    a = np.vstack([(a[k] + t_car[k] * ab[k])[None, :], a[k + 1:]])
-    b = b[k:]
-    ab = b - a
-    ab2 = np.einsum('ij,ij->i', ab, ab)
-    ab2_safe = np.where(ab2 < 1e-12, 1.0, ab2)
-
-    # (segments, cones) distances.
-    ac = cones[None, :, :] - a[:, None, :]
-    t = np.clip(np.einsum('skd,sd->sk', ac, ab) / ab2_safe[:, None], 0.0, 1.0)
-    closest = a[:, None, :] + t[..., None] * ab[:, None, :]
-    d = np.linalg.norm(closest - cones[None, :, :], axis=2)
-    return bool(np.any(d < clearance))
+    ahead = np.vstack([(a[k] + t_car[k] * ab[k])[None, :], pts[k + 1:]])
+    return first_close_segment(ahead, cones, clearance) >= 0
 
 
 _SEG_EPS = 1e-9   # tolerance on the [0, 1] parametric range -- see _seg_intersect
@@ -361,6 +378,8 @@ def _end_on_line(end: np.ndarray, own: np.ndarray, u: np.ndarray) -> float | Non
     band, the nearest own-colour cone farther out (up to the vote radius)
     gives the chord; with no own-colour cone at all there is no evidence and
     the tilt counts as the worst allowed (the pair still passes this test).
+    A chord from `end` assumes `end` is on the row, so it is not independent
+    evidence of the row's direction -- see _row_line_supports.
 
     Measured in the track frame, not along the pair axis: a pair tilted
     across the track (a gate cone and a stray) makes along-track cone offsets
@@ -384,6 +403,36 @@ def _end_on_line(end: np.ndarray, own: np.ndarray, u: np.ndarray) -> float | Non
         t = (cand[0] - end) / float(np.linalg.norm(cand[0] - end))
     tilt = abs(float(u @ t))
     return tilt if tilt <= max_tilt else None
+
+
+def _row_line_supports(end: np.ndarray, own: np.ndarray, u: np.ndarray) -> bool:
+    """
+    Check for independent evidence that `end` lies on its own colour's row.
+
+    That is a line through two own-colour cones (within _START_LINE_PROBE_MAX
+    of `end`, at least _START_LINE_PROBE_MIN apart) that passes within
+    _START_LINE_MAX_OFFSET of `end` and that the gate axis u crosses within
+    _START_LINE_MAX_TILT of square.
+
+    Unlike _end_on_line's chord fallback, this never uses `end` itself to set
+    the row direction, and cones close to `end` are fine here (they are not
+    used as a direction FROM `end`).
+    """
+    max_tilt = math.sin(math.radians(_START_LINE_MAX_TILT))
+    d = np.linalg.norm(own - end, axis=1)
+    near = own[d <= _START_LINE_PROBE_MAX][np.argsort(d[d <= _START_LINE_PROBE_MAX])]
+    for i in range(len(near)):
+        for j in range(i + 1, len(near)):
+            v = near[j] - near[i]
+            L = float(np.linalg.norm(v))
+            if L < _START_LINE_PROBE_MIN:
+                continue
+            t = v / L
+            rel = end - near[i]
+            if (abs(float(rel[0] * t[1] - rel[1] * t[0])) <= _START_LINE_MAX_OFFSET
+                    and abs(float(u @ t)) <= max_tilt):
+                return True
+    return False
 
 
 def _gate_sides(
@@ -428,6 +477,14 @@ def _gate_sides(
     else:
         return None
     if _end_on_line(b_end, near_b, u) is None or _end_on_line(y_end, near_y, u) is None:
+        return None
+    # At least one end needs a row direction from two of its own-colour cones.
+    # With only chords from the orange cones themselves (e.g. one blue and one
+    # yellow cone in view), two oranges on the SAME row a few metres apart
+    # pass every other test, and the near one is walled on the wrong side
+    # across the track. Abstaining there is safe; that frame simply plans as
+    # if orange were off.
+    if not (_row_line_supports(b_end, near_b, u) or _row_line_supports(y_end, near_y, u)):
         return None
     return b_end, y_end
 

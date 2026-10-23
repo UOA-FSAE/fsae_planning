@@ -11,6 +11,7 @@ from fsae_planning.boundary import (
     _START_LINE_MAX_OFFSET,
     assign_orange_sides,
     build_path_walls,
+    first_close_segment,
     path_ahead_too_close,
 )
 
@@ -35,24 +36,56 @@ def _walls_cross_centreline(segs, x_lo=-5.0, x_hi=40.0):
 
 # -- P1: same-side pairs ------------------------------------------------------
 
-def test_p1_sparse_perception_pairs_across_not_along():
+def test_p1_one_blue_one_yellow_abstains():
+    # One blue and one yellow cone give no row direction that doesn't pass
+    # through an orange cone itself, so the gate is left unclassified (safe:
+    # that frame plans as if orange were off) rather than risk a wrong side.
     blue = np.array([[9.0, 1.75]])
     yellow = np.array([[13.5, -1.75]])
+    blue_aug, yellow_aug, pairs = assign_orange_sides(blue, yellow, GATE)
+    assert pairs == [] and len(blue_aug) == 1 and len(yellow_aug) == 1
+
+
+def test_p1_sparse_with_a_row_direction_pairs_across_not_along():
+    # One blue + two yellow (the kart's usual view): the yellow row's
+    # direction is known, so the gate is classified -- across, never along.
+    blue = np.array([[9.0, 1.75]])
+    yellow = np.array([[10.5, -1.75], [13.5, -1.75]])
     blue_aug, yellow_aug, pairs = assign_orange_sides(blue, yellow, GATE)
     assert len(pairs) >= 2
     for b_end, y_end in pairs:
         assert b_end[1] > 0.0 and y_end[1] < 0.0     # across the track, never along it
-    assert len(blue_aug) - 1 + len(yellow_aug) - 1 == 4
+    assert len(blue_aug) - 1 + len(yellow_aug) - 2 == 4
+    assert _sides_ok(blue_aug, yellow_aug, 1, 2)
+
+
+def test_same_row_oranges_with_one_cone_per_colour_are_not_walled_across():
+    # Codex validation repro: both oranges are on the yellow row (y=-1.75).
+    # With only chords as evidence, (5,-1.75) used to be classified blue and
+    # walled to (7.5,1.75) across the track.
+    blue = np.array([[7.5, 1.75]])
+    yellow = np.array([[1.0, -1.75]])
+    orange = np.array([[5.0, -1.75], [1.4, -1.75]])
+    blue_aug, yellow_aug, _ = assign_orange_sides(blue, yellow, orange)
     assert _sides_ok(blue_aug, yellow_aug, 1, 1)
+    cl, b_segs, y_segs, _ = build_path_walls(
+        blue, yellow, np.array([1.0, 0.0]), 0.0, mid_max_gate=5.0, orange_cones=orange)
+    assert not _walls_cross_centreline(b_segs + y_segs)
 
 
 @pytest.mark.parametrize('k', [1, 2, 3, 4])
-@pytest.mark.parametrize('perception', ['full', 'sparse'])
+@pytest.mark.parametrize('perception', ['full', 'sparse', 'one_each'])
 def test_every_subset_of_the_four_cone_gate(k, perception):
     if perception == 'full':
         blue, yellow = _straight()
-    else:
+    elif perception == 'sparse':      # 1 blue + 2 yellow: the kart's usual view
+        blue, yellow = np.array([[9.0, 1.75]]), np.array([[10.5, -1.75], [13.5, -1.75]])
+    else:                             # 1 + 1: no row direction -> abstain, never wrong
         blue, yellow = np.array([[9.0, 1.75]]), np.array([[13.5, -1.75]])
+        for idx in itertools.combinations(range(4), k):
+            blue_aug, yellow_aug, _ = assign_orange_sides(blue, yellow, GATE[list(idx)])
+            assert _sides_ok(blue_aug, yellow_aug, 1, 1), idx
+        return
     for idx in itertools.combinations(range(4), k):
         sub = GATE[list(idx)]
         blue_aug, yellow_aug, pairs = assign_orange_sides(blue, yellow, sub)
@@ -282,3 +315,30 @@ def test_tied_votes_leave_a_cone_unclassified(monkeypatch):
     assert side[0] is None
     assert side[1] == 'y' and side[2] == 'b'
     assert pairs == []        # both pairs contradict cone 0's (missing) side
+
+
+# -- fresh-path clearance is measured along segments, not just at vertices -------
+
+def test_clearance_catches_a_cone_between_waypoints():
+    # Codex validation repro: the planned path passes 0.395 m from an
+    # unclassified orange while its nearest WAYPOINT is 0.413 m away, so the
+    # old vertex-only check (clearance 0.4) let it through.
+    blue = np.array([[4.6, 1.75]])
+    yellow = np.array([[4.6, -1.75]])
+    orange = np.array([[2.5421052631578944, 0.395]])
+    cl, *_ = build_path_walls(blue, yellow, np.array([0.0, 0.0]), 0.0,
+                              mid_max_gate=5.0, orange_cones=orange)
+    cones = np.vstack([blue, yellow, orange])
+    assert np.linalg.norm(cl - orange[0], axis=1).min() >= 0.4     # vertices look clear
+    assert first_close_segment(cl, cones, 0.4) >= 0                # a segment is not
+
+
+def test_first_close_segment_index():
+    path = np.c_[np.arange(0.0, 6.0), np.zeros(6)]              # segments 0..4 along y=0
+    assert first_close_segment(path, np.array([[2.5, 0.3]]), 0.4) == 2   # mid-segment cone
+    # A cone at a vertex: the segment ending there is the first too close.
+    assert first_close_segment(path, np.array([[3.0, 0.3]]), 0.4) == 2
+    assert first_close_segment(path, np.array([[2.5, 0.5]]), 0.4) == -1  # clear
+    assert first_close_segment(path, np.array([[0.1, 0.0]]), 0.4) == 0   # right at the start
+    assert first_close_segment(path, np.array([[2.5, 0.3]]), 0.0) == -1  # check disabled
+    assert first_close_segment(path, np.empty((0, 2)), 0.4) == -1
