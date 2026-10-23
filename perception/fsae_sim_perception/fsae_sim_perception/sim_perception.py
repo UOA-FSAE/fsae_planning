@@ -19,6 +19,7 @@ republishes it on the exact topics/messages the car stack expects.
                                                                   external tooling (e.g. the ros2_vis_dashboard,
                                                                   which colours the driven trail by speed), not
                                                                   by anything in this repo.
+    (the four *_track topics are window mode only; in camera mode cone_mapper_shim publishes them)
     out  /fsae/slam/left_track     fsae_interfaces/Track         blue (left) boundary, global frame
     out  /fsae/slam/right_track    fsae_interfaces/Track         yellow (right) boundary, global frame
     out  /fsae/slam/big_orange_track    fsae_interfaces/Track    big orange cones (start/finish line), global frame
@@ -36,6 +37,40 @@ so the start gate drops out of view after launch and reappears on the next lap.
 Set the `full_track` parameter true to publish the entire map every frame (used by
 the skidpad planner, which reconstructs the whole figure-8 up front); the default
 (false) publishes only the forward window, matching normal driving.
+
+Camera mode (`fov_mode: 'camera'`, default 'window'): the window above is
+much more generous than the real kart's sensing, so the sim never shows the
+one-colour views the kart sees in sparse corners. Camera mode instead
+emulates the kart's camera, and ONLY the camera: this node then publishes
+cone_detection frames (and the pose) but no *_track topics. The tracks come
+from cone_mapper_shim (fsae_planning, the kart's own node, unchanged), fed
+these frames by perception.launch.py -- the same camera -> shim -> planner
+chain as on the kart, retention included. The camera:
+  * a forward wedge, `camera_hfov_deg` wide and `camera_range` deep from the
+    car origin. The kart's ZED 2i (2.1 mm lens) is 110 deg horizontal with
+    0.3-20 m depth;
+  * `camera_rate`: frames per second. The kart's fused detections run at
+    8.0-8.5 Hz (ZED grabbing at 15 Hz, then YOLO and the LiDAR fusion);
+  * `camera_dropout`: each cone is independently missed per frame with this
+    probability;
+  * `camera_fixed_miss`: this fraction of the map's blue/yellow cones is
+    never detected at all (chosen once, seeded by camera_seed). FSDS maps are
+    all 3.5 m wide with ~4 m spacing, so the wedge alone always sees both
+    colours; permanent misses open the multi-metre gaps and one-colour
+    stretches of the kart's sparser tracks, which is what makes the planner's
+    gate walk dead-end. Cones within _FIXED_MISS_START_CLEAR of the map
+    origin (the car's start pose in FSDS) are never dropped, so the car can
+    always launch -- the start gate is not what this emulates;
+  * `camera_noise_std`: Gaussian position noise per detection, this many
+    metres (per axis) at 10 m range and growing linearly with range (stereo
+    depth error grows with distance). The shim averages it out per cone;
+  * `camera_both_colours_gate`: the kart's cone_detection publishes a frame
+    only when it holds >= 1 blue AND >= 1 yellow cone; with this on, a
+    one-colour frame is not published at all, so the shim only ages its
+    cones. fsds_bridge's cone e-brake (car-frame) then keeps reading the
+    last frame it got.
+Every non-blue/yellow cone is reported as big_orange, as the kart's camera
+does (it never fills small_orange).
 
 Two publish rates (`pose_rate` 20 Hz, `cone_rate` 10 Hz): pose and cones are
 published on separate timers. `pose_rate` must be >= the controller's rate --
@@ -72,6 +107,11 @@ from geometry_msgs.msg import Point, PoseStamped
 from nav_msgs.msg import Odometry
 
 
+# Camera mode: camera_fixed_miss never drops cones this close (m) to the
+# map origin, which is where FSDS puts the car at the start.
+_FIXED_MISS_START_CLEAR = 10.0
+
+
 class SimPerception(Node):
     def __init__(self):
         super().__init__('sim_perception')
@@ -92,6 +132,17 @@ class SimPerception(Node):
                 # the control loop is directly triggered by car_position.
                 ('pose_rate', 20.0),
                 ('cone_rate', 10.0),
+                # Camera mode -- see the module docstring. 'window' keeps the
+                # look_radius/box crop above.
+                ('fov_mode', 'window'),
+                ('camera_hfov_deg', 110.0),
+                ('camera_range', 10.0),
+                ('camera_rate', 8.0),
+                ('camera_dropout', 0.0),
+                ('camera_fixed_miss', 0.0),
+                ('camera_noise_std', 0.0),
+                ('camera_both_colours_gate', False),
+                ('camera_seed', 0),     # dropout/noise RNG seed, for repeatable runs
             ],
         )
         self._look_ahead  = self.get_parameter('look_ahead').get_parameter_value().double_value
@@ -105,6 +156,28 @@ class SimPerception(Node):
         # a timer that never fires.
         self._pose_rate = self._pose_rate if self._pose_rate > 0.0 else 20.0
         self._cone_rate = self._cone_rate if self._cone_rate > 0.0 else 10.0
+
+        self._fov_mode = self.get_parameter('fov_mode').get_parameter_value().string_value
+        if self._fov_mode not in ('window', 'camera'):
+            self.get_logger().error(
+                f"unrecognised fov_mode '{self._fov_mode}' (expected 'window' or 'camera') "
+                "-- using 'window'")
+            self._fov_mode = 'window'
+        self._cam_half_fov = math.radians(
+            0.5 * self.get_parameter('camera_hfov_deg').get_parameter_value().double_value)
+        self._cam_range   = self.get_parameter('camera_range').get_parameter_value().double_value
+        self._cam_dropout = self.get_parameter('camera_dropout').get_parameter_value().double_value
+        self._cam_fixed_miss = self.get_parameter('camera_fixed_miss').get_parameter_value().double_value
+        self._cam_gate    = self.get_parameter('camera_both_colours_gate').get_parameter_value().bool_value
+        self._cam_noise   = self.get_parameter('camera_noise_std').get_parameter_value().double_value
+        self._cam_rate    = self.get_parameter('camera_rate').get_parameter_value().double_value
+        self._cam_rate = self._cam_rate if self._cam_rate > 0.0 else 8.0
+        self._camera = self._fov_mode == 'camera' and not self._full_track
+        self._rng = np.random.default_rng(
+            self.get_parameter('camera_seed').get_parameter_value().integer_value)
+        # Camera mode: per colour, the oracle cones the camera never detects
+        # (camera_fixed_miss). Index-aligned with *_all.
+        self._never_seen: dict = {}
 
         latched_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -123,10 +196,13 @@ class SimPerception(Node):
 
         self.pub_pose  = self.create_publisher(PoseStamped,   '/fsae/slam/car_position',        10)
         self.pub_odom  = self.create_publisher(Odometry,      '/fsae/slam/car_odom',            10)
-        self.pub_left  = self.create_publisher(Track,         '/fsae/slam/left_track',          10)
-        self.pub_right = self.create_publisher(Track,         '/fsae/slam/right_track',         10)
-        self.pub_big_orange   = self.create_publisher(Track, '/fsae/slam/big_orange_track',   10)
-        self.pub_small_orange = self.create_publisher(Track, '/fsae/slam/small_orange_track', 10)
+        # Camera mode leaves the tracks to cone_mapper_shim (see the module
+        # docstring), so it doesn't even advertise them.
+        if not self._camera:
+            self.pub_left  = self.create_publisher(Track,         '/fsae/slam/left_track',          10)
+            self.pub_right = self.create_publisher(Track,         '/fsae/slam/right_track',         10)
+            self.pub_big_orange   = self.create_publisher(Track, '/fsae/slam/big_orange_track',   10)
+            self.pub_small_orange = self.create_publisher(Track, '/fsae/slam/small_orange_track', 10)
         self.pub_det   = self.create_publisher(ConeDetection, '/fsae/perception/cone_detection', 10)
 
         # Oracle map, split by colour into global (N, 2) arrays once received.
@@ -151,13 +227,22 @@ class SimPerception(Node):
         # docstring's "Two publish rates" note. Pose must keep up with the
         # controller; the cone map does not need to.
         self.create_timer(1.0 / self._pose_rate, self._publish_pose)
-        self.create_timer(1.0 / self._cone_rate, self._publish_cones)
+        self.create_timer(1.0 / (self._cam_rate if self._camera else self._cone_rate),
+                          self._publish_cones)
 
-        mode = ('full map' if self._full_track else
-                f'radius {self._look_radius} m ∪ box {self._look_ahead}×{2 * self._look_wide} m')
+        if self._full_track:
+            mode = 'full map'
+        elif self._camera:
+            mode = (f'camera {math.degrees(2 * self._cam_half_fov):g} deg × {self._cam_range:g} m '
+                    f'@ {self._cam_rate:g} Hz, dropout {self._cam_dropout:g}, '
+                    f'fixed miss {self._cam_fixed_miss:g}, noise {self._cam_noise:g} m @ 10 m, '
+                    f'both-colours gate {self._cam_gate}; tracks from cone_mapper_shim')
+        else:
+            mode = f'radius {self._look_radius} m ∪ box {self._look_ahead}×{2 * self._look_wide} m'
         self.get_logger().info(
             f'sim_perception ready ({mode}); '
-            f'pose @ {self._pose_rate:g} Hz, cones @ {self._cone_rate:g} Hz.'
+            f'pose @ {self._pose_rate:g} Hz, cones @ '
+            f'{self._cam_rate if self._camera else self._cone_rate:g} Hz.'
         )
         if self._pose_rate < 20.0:
             self.get_logger().warn(
@@ -186,6 +271,18 @@ class SimPerception(Node):
         self._yellow_all = self._as_array(yellow)
         self._big_orange_all   = self._as_array(big_orange)
         self._small_orange_all = self._as_array(small_orange)
+        # Camera mode: cones the camera never detects (camera_fixed_miss).
+        # Blue/yellow only -- the start gate's orange cones stay visible.
+        miss_rng = np.random.default_rng(
+            self.get_parameter('camera_seed').get_parameter_value().integer_value + 1000)
+        self._never_seen = {
+            key: (miss_rng.random(len(arr)) < self._cam_fixed_miss
+                  if key in ('blue', 'yellow') else np.zeros(len(arr), dtype=bool))
+            for key, arr in self._all_cones().items()
+        }
+        for key, arr in self._all_cones().items():
+            if len(arr):
+                self._never_seen[key] &= np.hypot(arr[:, 0], arr[:, 1]) > _FIXED_MISS_START_CLEAR
         self._have_map = True
         self.get_logger().info(
             f'Oracle map received: {len(blue)} blue + {len(yellow)} yellow + '
@@ -237,6 +334,51 @@ class SimPerception(Node):
         box = (x_car > self._min_ahead) & (x_car < self._look_ahead) & \
               (np.abs(y_car) < self._look_wide)
         return cones[(dist < self._look_radius) | box]
+
+    def _all_cones(self) -> dict:
+        return {
+            'blue': self._blue_all, 'yellow': self._yellow_all,
+            'big_orange': self._big_orange_all, 'small_orange': self._small_orange_all,
+        }
+
+    def _camera_detect(self, cones: np.ndarray) -> np.ndarray:
+        """
+        Boolean mask of the cones the camera detects this frame: inside the
+        forward wedge (camera_hfov_deg, camera_range from the car origin),
+        each then independently missed with probability camera_dropout.
+        """
+        if len(cones) == 0:
+            return np.zeros(0, dtype=bool)
+        cos_y, sin_y = math.cos(self._car_yaw), math.sin(self._car_yaw)
+        rel = cones - np.array([self._car_x, self._car_y])
+        x_car =  rel[:, 0] * cos_y + rel[:, 1] * sin_y
+        y_car = -rel[:, 0] * sin_y + rel[:, 1] * cos_y
+        seen = ((x_car > 0.0) & (np.hypot(x_car, y_car) <= self._cam_range)
+                & (np.abs(np.arctan2(y_car, x_car)) <= self._cam_half_fov))
+        if self._cam_dropout > 0.0:
+            seen &= self._rng.random(len(cones)) >= self._cam_dropout
+        return seen
+
+    def _camera_frame(self) -> dict | None:
+        """
+        One camera frame: global positions of this frame's detections per
+        colour (orange all as big_orange, as the kart's camera labels them),
+        or None when the both-colours gate (if enabled) drops the frame.
+        """
+        cones = self._all_cones()
+        det = {}
+        for key, arr in cones.items():
+            pts = arr[self._camera_detect(arr) & ~self._never_seen[key]]
+            if self._cam_noise > 0.0 and len(pts):
+                rng_m = np.hypot(pts[:, 0] - self._car_x, pts[:, 1] - self._car_y)
+                sigma = self._cam_noise * rng_m / 10.0
+                pts = pts + self._rng.normal(0.0, 1.0, pts.shape) * sigma[:, None]
+            det[key] = pts
+        det['big_orange'] = np.vstack([det['big_orange'], det['small_orange']])
+        det['small_orange'] = np.empty((0, 2))
+        if self._cam_gate and not (len(det['blue']) and len(det['yellow'])):
+            return None
+        return det
 
     def _car_pose_msg(self) -> PoseStamped:
         msg = PoseStamped()
@@ -309,7 +451,8 @@ class SimPerception(Node):
 
     def _publish_cones(self) -> None:
         """
-        Cone/track tick, run at cone_rate (default 10 Hz).  Cropping the
+        Cone/track tick, run at cone_rate (default 10 Hz; camera_rate in
+        camera mode, which publishes cone_detection only).  Cropping the
         oracle map and building three messages is the expensive part of this
         node, and the planner gains nothing from it running at the control
         rate.
@@ -323,23 +466,25 @@ class SimPerception(Node):
         # cone transforms computed immediately below.
         pose = self._car_pose_msg()
 
-        blue_vis   = self._visible(self._blue_all)
-        yellow_vis = self._visible(self._yellow_all)
-        big_orange_vis   = self._visible(self._big_orange_all)
-        small_orange_vis = self._visible(self._small_orange_all)
-        self.pub_left.publish(self._global_track(blue_vis))
-        self.pub_right.publish(self._global_track(yellow_vis))
-        self.pub_big_orange.publish(self._global_track(big_orange_vis))
-        self.pub_small_orange.publish(self._global_track(small_orange_vis))
+        if self._camera:
+            det_cones = self._camera_frame()
+            if det_cones is None:
+                return   # gated: the kart's camera publishes nothing this frame
+        else:
+            det_cones = {key: self._visible(arr) for key, arr in self._all_cones().items()}
+            self.pub_left.publish(self._global_track(det_cones['blue']))
+            self.pub_right.publish(self._global_track(det_cones['yellow']))
+            self.pub_big_orange.publish(self._global_track(det_cones['big_orange']))
+            self.pub_small_orange.publish(self._global_track(det_cones['small_orange']))
 
         det = ConeDetection()
         det.header.stamp    = self.get_clock().now().to_msg()
         det.header.frame_id = 'base_link'
         det.car_pose = pose.pose   # ConeDetection.car_pose is geometry_msgs/Pose, not Stamped
-        det.blue   = self._local_points(blue_vis)
-        det.yellow = self._local_points(yellow_vis)
-        det.big_orange   = self._local_points(big_orange_vis)
-        det.small_orange = self._local_points(small_orange_vis)
+        det.blue   = self._local_points(det_cones['blue'])
+        det.yellow = self._local_points(det_cones['yellow'])
+        det.big_orange   = self._local_points(det_cones['big_orange'])
+        det.small_orange = self._local_points(det_cones['small_orange'])
         self.pub_det.publish(det)
 
 

@@ -61,6 +61,15 @@ def generate_launch_description():
     # crop and greedy walk in boundary.py). It is a sim-only cheat -- there
     # is no equivalent oracle map on the real car.
     full_track = LaunchConfiguration('full_track')
+    fov_mode = LaunchConfiguration('fov_mode')
+    camera_hfov_deg = LaunchConfiguration('camera_hfov_deg')
+    camera_range = LaunchConfiguration('camera_range')
+    camera_dropout = LaunchConfiguration('camera_dropout')
+    camera_fixed_miss = LaunchConfiguration('camera_fixed_miss')
+    camera_both_colours_gate = LaunchConfiguration('camera_both_colours_gate')
+    one_sided = LaunchConfiguration('one_sided')
+    cone_memory = LaunchConfiguration('cone_memory')
+    planner_cone_source = LaunchConfiguration('planner_cone_source')
 
     def include(name, args):
         return IncludeLaunchDescription(
@@ -181,13 +190,63 @@ def generate_launch_description():
                         "map visibility, e.g. to check whether a tight/teardrop "
                         "corner's speed-profile issue is a sensing-range limit or a "
                         "planning-logic one -- sim-only, no real-car equivalent."),
-        include('perception.launch.py', {'full_track': full_track}),
+        DeclareLaunchArgument(
+            'fov_mode', default_value='window',
+            description="Passed through to sim_perception: 'camera' emulates the "
+                        "kart's forward camera + cone_mapper_shim (see "
+                        "fsae_params.yaml) so one-colour corner views happen in the sim."),
+        DeclareLaunchArgument(
+            'camera_hfov_deg', default_value='110.0',
+            description='Passed through to sim_perception (camera mode only): horizontal '
+                        'field of view (deg). 110 = ZED 2i with the 2.1 mm lens (72 for 4 mm).'),
+        DeclareLaunchArgument(
+            'camera_range', default_value='10.0',
+            description='Passed through to sim_perception (camera mode only): detection range '
+                        '(m). The ZED 2i (2.1 mm) measures depth to 20 m.'),
+        DeclareLaunchArgument(
+            'camera_dropout', default_value='0.0',
+            description='Passed through to sim_perception (camera mode only).'),
+        DeclareLaunchArgument(
+            'camera_fixed_miss', default_value='0.0',
+            description='Passed through to sim_perception (camera mode only): fraction of '
+                        'blue/yellow cones never detected, to emulate a sparse track.'),
+        DeclareLaunchArgument(
+            'camera_both_colours_gate', default_value='false',
+            description='Passed through to sim_perception (camera mode only).'),
+        DeclareLaunchArgument(
+            'cone_memory', default_value='false',
+            description='Passed through to perception.launch.py -- also run cone_memory, a '
+                        'longer-lived local cone map in its own process (fsae_planning/'
+                        'cone_memory.py), publishing /fsae/cone_memory/*_track.'),
+        DeclareLaunchArgument(
+            'planner_cone_source', default_value='slam',
+            description="'slam' (the /fsae/slam/*_track the kart's planner reads: "
+                        "sim_perception's window, or cone_mapper_shim in camera mode) | "
+                        "'memory' (cone_memory's tracks; starts cone_memory)."),
+        DeclareLaunchArgument(
+            'one_sided', default_value='true',
+            description="Passed through to planning.launch.py -- the planner's "
+                        "one-sided offset-trace extension (centerline_planner only; "
+                        "false is the rollback)."),
+        include('perception.launch.py', {
+            'full_track': full_track,
+            'fov_mode': fov_mode,
+            'camera_hfov_deg': camera_hfov_deg,
+            'camera_range': camera_range,
+            'camera_dropout': camera_dropout,
+            'camera_fixed_miss': camera_fixed_miss,
+            'camera_both_colours_gate': camera_both_colours_gate,
+            'cone_memory': cone_memory,
+            'planner_cone_source': planner_cone_source,
+        }),
         include('planning.launch.py',   {
             'planner': planner,
             'look_radius': look_radius,
             'plan_horizon': plan_horizon,
             'debug_viz': debug_viz,
             'use_orange': use_orange,
+            'one_sided': one_sided,
+            'planner_cone_source': planner_cone_source,
         }),
         include('control.launch.py',    {
             'planner': planner,

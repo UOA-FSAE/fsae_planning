@@ -118,6 +118,46 @@ _WALL_PLAN_HORIZON  = 25.0
 # for a first midpoint behind the car).
 _WALK_NEAR_ENTRY = 0.5
 
+# One-sided offset trace (see _one_sided_extension). Where the gate walk ends
+# (or finds nothing) but one boundary is still seen further on, the path
+# follows that boundary at a fixed inward offset, up to its last seen cone.
+# Defaults are the go-kart's: testing tracks are never narrower than 2.3 m and
+# the kart is ~1.0 m at its widest (half 0.5 m).
+#   _ONE_SIDED_OFFSET_MIN     0.5 half kart + 0.4 m margin to the SEEN side.
+#   _ONE_SIDED_OFFSET_MAX     2.3 - 0.5 - 0.5 m margin: the UNSEEN side, which
+#                             no clearance check covers, gets the conservative
+#                             bound.
+#   _ONE_SIDED_OFFSET_DEFAULT centre of the narrowest track (2.3 / 2).
+# The path starts at the measured offset (the last real gate, or the car),
+# clamped to [min, max], and tapers to the default over _ONE_SIDED_TAPER m.
+_ONE_SIDED_OFFSET_MIN     = 0.9
+_ONE_SIDED_OFFSET_MAX     = 1.3
+_ONE_SIDED_OFFSET_DEFAULT = 1.15
+_ONE_SIDED_CAR_HALF_WIDTH = 0.5    # m; the extension stops before any cone this close
+_ONE_SIDED_TAPER          = 3.0    # m of arc to go from the measured to the default offset
+_ONE_SIDED_DS             = 0.5    # m; resample spacing of the offset path
+# The trace must reach at least this far (m of arc) past where the extension
+# starts, or there is nothing worth adding.
+_ONE_SIDED_MIN_EXT        = 1.0
+# A walk shorter than this (m of arc from the car) is too short to drive on:
+# the extension is then built even if an opposite cone could still gate the
+# trace (see _one_sided_extension's require_orphan).
+_ONE_SIDED_MIN_WALK       = 4.0
+# Boundary trace (_side_trace): longest step between consecutive cones (a
+# normal gap, same bound as a wall edge) and the sharpest turn at one cone.
+# The inner cones of a hairpin turn 60-80 deg each.
+_ONE_SIDED_TRACE_MAX_STEP = _WALL_MAX_DIST
+_ONE_SIDED_TRACE_MAX_TURN = 80.0   # deg
+_ONE_SIDED_TRACE_MIN_STEP = 0.5    # m; closer cones are duplicates (see _side_trace)
+# Step cost = distance + this (m per rad of turn). A cone on the other leg of
+# a hairpin, across a narrow infield, can be closer than the next cone on our
+# own row but needs a ~60-90 deg turn to reach; this makes the straight-on
+# own-row cone win (e.g. 2.2 m at 63 deg costs 5.5 vs 5.0 m straight on).
+_ONE_SIDED_TURN_WEIGHT    = 3.0
+# Offsetting toward the centre of a curve whose radius is below this factor
+# times the offset folds the offset curve; the path stops there instead.
+_ONE_SIDED_RADIUS_FACTOR  = 1.2
+
 # Start/finish-line orange cones (see assign_orange_sides).
 # _START_LINE_MAX_WIDTH: widest orange pair accepted as one start-line gate.
 # FS rules place the big orange cones before and after the line on the border
@@ -1251,6 +1291,290 @@ def _build_corridor_path(
     return ordered, all_mids
 
 
+def _side_trace(
+    cones: np.ndarray,
+    car_pos: np.ndarray,
+    seed_dir: np.ndarray,
+    max_step: float = _ONE_SIDED_TRACE_MAX_STEP,
+    max_turn_deg: float = _ONE_SIDED_TRACE_MAX_TURN,
+    turn_weight: float = _ONE_SIDED_TURN_WEIGHT,
+) -> np.ndarray:
+    """
+    Order one colour's cones into the boundary line the car is driving along.
+
+    Starts at the cone nearest the car (it may be beside or behind it; none
+    within max_step means no trace) and walks forward: each step goes to the
+    unvisited cone within max_step that minimises distance + turn_weight *
+    turn, among those within max_turn_deg of the current direction (seed_dir
+    for the first step). A step that would cross an earlier step of the trace
+    is not taken.
+
+    The turn limit and turn cost are what keep the trace on its own row: the
+    other leg of a hairpin runs the opposite way, so continuing along it needs
+    a turn of ~180 deg, and the jump across the infield to it costs more than
+    the straight-on cone of our own row (see _ONE_SIDED_TURN_WEIGHT).
+
+    Returns the (K, 2) ordered cones, K >= 2, or an empty array.
+    """
+    cones = np.asarray(cones, dtype=np.float64).reshape(-1, 2)
+    empty = np.empty((0, 2), dtype=np.float64)
+    if len(cones) < 2:
+        return empty
+    d_car = np.linalg.norm(cones - car_pos, axis=1)
+    start = int(np.argmin(d_car))
+    if d_car[start] > max_step:
+        return empty
+
+    min_cos = math.cos(math.radians(max_turn_deg))
+    order = [start]
+    used = np.zeros(len(cones), dtype=bool)
+    used[start] = True
+    cur_dir = np.asarray(seed_dir, dtype=np.float64)
+    for _ in range(len(cones) - 1):
+        p = cones[order[-1]]
+        rel = cones - p
+        dist = np.linalg.norm(rel, axis=1)
+        # A cone this close to the current one is the same cone seen twice
+        # (a noisy duplicate detection), not the next one: absorb it, or the
+        # trace zig-zags and the offset normal swings with it.
+        used |= dist < _ONE_SIDED_TRACE_MIN_STEP
+        best, best_cost = -1, math.inf
+        for j in np.where(~used & (dist > 1e-6) & (dist <= max_step))[0]:
+            c = float(rel[j] @ cur_dir) / float(dist[j])
+            if c <= min_cos:
+                continue
+            cost = float(dist[j]) + turn_weight * math.acos(min(1.0, c))
+            if cost >= best_cost:
+                continue
+            if any(_seg_intersect(p, cones[j], cones[order[k]], cones[order[k + 1]])
+                   for k in range(len(order) - 2)):
+                continue
+            best, best_cost = int(j), cost
+        if best < 0:
+            break
+        cur_dir = rel[best] / float(dist[best])
+        order.append(best)
+        used[best] = True
+    return cones[order] if len(order) >= 2 else empty
+
+
+def _project_on_polyline(pt: np.ndarray, line: np.ndarray) -> tuple[float, float]:
+    """
+    Project pt onto the polyline: (arc position, signed lateral offset).
+
+    The lateral offset is + to the left of travel. The first segment is
+    extended backwards and the last one
+    forwards, so a point before the first or past the last vertex still gets
+    a lateral offset from the line through that end segment.
+    """
+    a, b = line[:-1], line[1:]
+    ab = b - a
+    seg = np.linalg.norm(ab, axis=1)
+    arc0 = np.concatenate([[0.0], np.cumsum(seg)])
+    ab2 = np.maximum(seg ** 2, 1e-12)
+    t = np.einsum('ij,ij->i', pt - a, ab) / ab2
+    lo = np.zeros(len(t))
+    hi = np.ones(len(t))
+    lo[0] = -np.inf
+    hi[-1] = np.inf
+    t = np.clip(t, lo, hi)
+    foot = a + t[:, None] * ab
+    k = int(np.argmin(np.linalg.norm(foot - pt, axis=1)))
+    u = ab[k] / max(seg[k], 1e-12)
+    rel = pt - foot[k]
+    return float(arc0[k] + t[k] * seg[k]), float(u[0] * rel[1] - u[1] * rel[0])
+
+
+def _one_sided_extension(
+    trace: np.ndarray,
+    is_blue: bool,
+    start_pt: np.ndarray,
+    car_pos: np.ndarray,
+    other_cones: np.ndarray,
+    all_cones: np.ndarray,
+    mid_max: float,
+    max_len: float,
+    seed_dir: np.ndarray | None = None,
+    require_orphan: bool = True,
+    offset_min: float = _ONE_SIDED_OFFSET_MIN,
+    offset_max: float = _ONE_SIDED_OFFSET_MAX,
+    offset_default: float = _ONE_SIDED_OFFSET_DEFAULT,
+    car_half_width: float = _ONE_SIDED_CAR_HALF_WIDTH,
+    taper: float = _ONE_SIDED_TAPER,
+    ds: float = _ONE_SIDED_DS,
+    radius_factor: float = _ONE_SIDED_RADIUS_FACTOR,
+) -> np.ndarray:
+    """
+    Offset path along one boundary trace, from start_pt to its last cone.
+
+    start_pt is where the two-sided path ends: the last gate midpoint of the
+    walk, or the car when the walk found nothing. The extension is built only
+    when all of these hold, else an empty array comes back:
+      * start_pt is on the track side of the trace (blue is the left wall, so
+        the track is to its right; yellow the opposite) and within mid_max of
+        it -- otherwise this trace is not the boundary of the car's corridor.
+        When start_pt is before the first trace cone (the camera only sees
+        cones ahead), either of two lines may show it on the track side: the
+        first trace segment extended back, or the line through the first cone
+        along seed_dir (the travel direction). One alone is not enough: on
+        the inside of a bend the extended segment passes on the wrong side of
+        the car, and at a hairpin's outer wall the cone is dead ahead along
+        seed_dir. A row the car is really outside of fails both;
+      * the trace reaches at least _ONE_SIDED_MIN_EXT past start_pt and past
+        the car (no point is emitted behind the car);
+      * with require_orphan, the first trace cone past start_pt has no
+        opposite-colour cone within mid_max (no gate could be formed with
+        it). This is what keeps the normal two-sided view unchanged: where
+        the gate walk stops only because the cones in view end, the other
+        side's last cones are still there and nothing is added. The caller
+        drops the requirement when the two-sided path is too short to drive
+        on -- then an opposite cone nearby that forms no gate AHEAD (it is
+        beside or behind the car, or across a gap) must not block the path.
+
+    Offset: start at the measured distance of start_pt from the trace, clamped
+    to [offset_min, offset_max], and taper linearly to offset_default
+    (clamped too) over `taper` metres, so the mode change has no lateral jump.
+    Resampled every ds metres along the trace, ending at its last cone (no
+    extrapolation past what was seen). Cut short, at the first offending
+    sample, where:
+      * the trace bends toward the offset side with a radius below
+        radius_factor * offset (the offset curve would fold) -- stop one
+        offset before that cone;
+      * any real cone is within car_half_width of the path (the trace went
+        wrong, or the track is narrower than assumed);
+      * a sample would step backwards along the trace (fold at a kink);
+      * the extension would exceed max_len of arc.
+    Returns the (K, 2) extension, start_pt excluded.
+    """
+    empty = np.empty((0, 2), dtype=np.float64)
+    seg = np.linalg.norm(np.diff(trace, axis=0), axis=1)
+    cone_arc = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(cone_arc[-1])
+    s0, lat = _project_on_polyline(start_pt, trace)
+    inward = -lat if is_blue else lat
+    if s0 < 0.0 and seed_dir is not None:
+        rel = np.asarray(start_pt, dtype=np.float64) - trace[0]
+        lat_h = float(seed_dir[0] * rel[1] - seed_dir[1] * rel[0])
+        inward = max(inward, -lat_h if is_blue else lat_h)
+    s_car, _ = _project_on_polyline(np.asarray(car_pos, dtype=np.float64), trace)
+    if not (0.0 < inward <= mid_max) or max(s0, s_car) > total - _ONE_SIDED_MIN_EXT:
+        return empty
+
+    if require_orphan:
+        ahead = np.where(cone_arc > s0 + 1e-6)[0]
+        first = trace[ahead[0]]
+        if len(other_cones) and float(np.min(np.linalg.norm(other_cones - first, axis=1))) <= mid_max:
+            return empty
+
+    off_lo, off_hi = min(offset_min, offset_max), max(offset_min, offset_max)
+    d0 = min(max(inward, off_lo), off_hi)
+    target = min(max(offset_default, off_lo), off_hi)
+
+    def offset_at(s: float) -> float:
+        return d0 + (target - d0) * min(1.0, max(0.0, s - s0) / max(taper, 1e-6))
+
+    # Stop before a cone where the trace curves toward the offset side more
+    # tightly than radius_factor * offset (Menger curvature of 3 consecutive
+    # cones; + = left turn). The track side is right of blue, left of yellow.
+    s_end = total
+    for i in range(1, len(trace) - 1):
+        if cone_arc[i] <= s0:
+            continue
+        p0, p1, p2 = trace[i - 1], trace[i], trace[i + 1]
+        cross = float((p1 - p0)[0] * (p2 - p1)[1] - (p1 - p0)[1] * (p2 - p1)[0])
+        denom = float(np.linalg.norm(p1 - p0) * np.linalg.norm(p2 - p1) * np.linalg.norm(p2 - p0))
+        if denom < 1e-12:
+            continue
+        kappa = 2.0 * cross / denom
+        toward = -kappa if is_blue else kappa
+        if toward > 0.0 and 1.0 / toward < radius_factor * offset_at(cone_arc[i]):
+            s_end = float(cone_arc[i]) - offset_at(cone_arc[i])
+            break
+
+    s_first = max(s0, s_car, 0.0)
+    samples = np.arange(s_first + ds, s_end + 1e-9, ds)
+    if len(samples) == 0 or samples[-1] < s_end - 1e-6:
+        samples = np.append(samples, s_end)
+    samples = samples[samples > s_first + 1e-6]
+    if len(samples) == 0:
+        return empty
+
+    xs = np.interp(samples, cone_arc, trace[:, 0])
+    ys = np.interp(samples, cone_arc, trace[:, 1])
+    base = np.column_stack([xs, ys])
+    # Tangent from the trace one sample either side, so a cone (a kink of
+    # the polyline) turns the normal gradually instead of in one step.
+    lo = np.interp(np.maximum(samples - ds, 0.0), cone_arc, trace[:, 0]), \
+        np.interp(np.maximum(samples - ds, 0.0), cone_arc, trace[:, 1])
+    hi = np.interp(np.minimum(samples + ds, total), cone_arc, trace[:, 0]), \
+        np.interp(np.minimum(samples + ds, total), cone_arc, trace[:, 1])
+    tang = np.column_stack([hi[0] - lo[0], hi[1] - lo[1]])
+    tang /= np.maximum(np.linalg.norm(tang, axis=1), 1e-12)[:, None]
+    left = np.column_stack([-tang[:, 1], tang[:, 0]])
+    inward_n = -left if is_blue else left
+    offs = np.array([offset_at(s) for s in samples])
+    ext = base + offs[:, None] * inward_n
+
+    keep = len(ext)
+    prev = np.asarray(start_pt, dtype=np.float64)
+    arc = 0.0
+    for k in range(len(ext)):
+        step = ext[k] - prev
+        if k > 0 and float(step @ tang[k]) <= 0.0:
+            keep = k
+            break
+        if len(all_cones) and float(np.min(np.linalg.norm(all_cones - ext[k], axis=1))) < car_half_width:
+            keep = k
+            break
+        arc += float(np.linalg.norm(step))
+        if arc > max_len:
+            keep = k
+            break
+        prev = ext[k]
+    return ext[:keep]
+
+
+def _drop_trace_chords(
+    segs: list[tuple[np.ndarray, np.ndarray]],
+    trace: np.ndarray,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Remove wall edges joining two NON-consecutive cones of a boundary trace.
+
+    With the other colour out of view nothing stops Delaunay joining cones two
+    apart along a curve; that chord runs inside the track (a sagitta of ~1.5 m
+    on R=6 m with 4 m spacing) and would cut the one-sided path off as a
+    "wall crossing". The consecutive trace edges -- the real wall -- stay.
+    """
+    idx = {_point_key(p): i for i, p in enumerate(trace)}
+    out = []
+    for p1, p2 in segs:
+        i, j = idx.get(_point_key(p1)), idx.get(_point_key(p2))
+        if i is not None and j is not None and abs(i - j) > 1:
+            continue
+        out.append((p1, p2))
+    return out
+
+
+def _anchor_and_smooth(
+    car_pos: np.ndarray,
+    ordered: np.ndarray,
+    plan_horizon: float,
+    smooth_per_pt: float,
+) -> np.ndarray:
+    """Clamp car + chain to plan_horizon of arc, then smooth (see build_path_walls)."""
+    anchored = np.vstack([car_pos.reshape(1, 2), ordered])
+    seg = np.linalg.norm(np.diff(anchored, axis=0), axis=1)
+    arc = np.concatenate([[0.0], np.cumsum(seg)])
+    keep = arc <= plan_horizon
+    if int(keep.sum()) < 3:
+        keep[:min(3, len(anchored))] = True
+    anchored = anchored[keep]
+
+    return smooth_centreline(anchored, n_out=max(20, (len(anchored) - 1) * 5),
+                             smooth_per_pt=smooth_per_pt)
+
+
 _SEED_DIR_MIN_ALIGN = 0.3   # cos of ~72 deg -- see prev_dir note in _build_wall_path
 
 
@@ -1380,6 +1704,9 @@ def build_path_walls(
     start_line_max_width: float = _START_LINE_MAX_WIDTH,
     same_side_max: float = _ORANGE_SAME_SIDE_MAX,
     start_line_min_width: float = _START_LINE_MIN_WIDTH,
+    one_sided: bool = False,
+    one_sided_params: dict | None = None,
+    info: dict | None = None,
 ) -> tuple[np.ndarray | None,
            list[tuple[np.ndarray, np.ndarray]],
            list[tuple[np.ndarray, np.ndarray]],
@@ -1440,6 +1767,30 @@ def build_path_walls(
     classified one along the track and still share its side (see
     assign_orange_sides).
 
+    one_sided: where the walk ends short of plan_horizon (or finds nothing)
+    and one boundary is still seen further on with no opposite cone that
+    could gate it, continue along that boundary at an inward offset up to its
+    last seen cone (see _side_trace and _one_sided_extension). The mesh walk
+    itself runs unchanged on the real cones; nothing virtual enters the mesh.
+    When both colours are seen to the end of the view nothing is added, and
+    the output is identical to one_sided=False. one_sided_params overrides
+    _one_sided_extension's keyword defaults (offset_min, offset_max,
+    offset_default, car_half_width, taper, ds, radius_factor), _side_trace's
+    (max_step, max_turn_deg, turn_weight) and 'min_walk' (_ONE_SIDED_MIN_WALK:
+    below this much walk the opposite-cone requirement is dropped).
+
+    info: optional dict, filled in place with
+      'one_sided'  : True if the extension was used this tick;
+      'side'       : 'blue' or 'yellow' (the boundary followed), else None;
+      'trace'      : (K, 2) that boundary's ordered cones;
+      'extension'  : (M, 2) the offset points appended to the walk;
+      'two_sided'  : the path this call returns with one_sided=False (so a
+                     caller can apply hysteresis without a second call);
+      'two_sided_fallback' : True if that path is build_local_path's (the walk
+                     found nothing) -- naive cross-track pairing that can cut
+                     across a hairpin's infield, so a caller should not
+                     prefer it over a one-sided path.
+
     Returns
     -------
     centreline  : (N, 2) smoothed path, or None on failure
@@ -1496,22 +1847,85 @@ def build_path_walls(
     if len(ordered) < 1:
         cl = build_local_path(blue_cones, yellow_cones, car_pos, car_yaw,
                                max_ahead, max_lateral)
+    else:
+        # Clamp the chain to a fixed arc-length horizon (measured from the car
+        # through the midpoints) before smoothing.  This makes the near path in
+        # front of the car independent of how far the lookahead reaches — extra
+        # far midpoints no longer extend the chain or drag the global spline —
+        # and keeps the corner line on the true centreline instead of letting
+        # distant apex points pull it inward.  At least three points are
+        # retained so the spline stays well-posed.
+        cl = _anchor_and_smooth(car_pos, ordered, plan_horizon, smooth_per_pt)
+
+    if info is not None:
+        info.update(one_sided=False, side=None, trace=np.empty((0, 2)),
+                    extension=np.empty((0, 2)), two_sided=cl,
+                    two_sided_fallback=len(ordered) < 1)
+    if not one_sided:
         return cl, blue_segs, yellow_segs, midpoints
 
-    # Clamp the chain to a fixed arc-length horizon (measured from the car through
-    # the midpoints) before smoothing.  This makes the near path in front of the
-    # car independent of how far the lookahead reaches — extra far midpoints no
-    # longer extend the chain or drag the global spline — and keeps the corner
-    # line on the true centreline instead of letting distant apex points pull it
-    # inward.  At least three points are retained so the spline stays well-posed.
-    anchored = np.vstack([car_pos.reshape(1, 2), ordered])
-    seg = np.linalg.norm(np.diff(anchored, axis=0), axis=1)
-    arc = np.concatenate([[0.0], np.cumsum(seg)])
-    keep = arc <= plan_horizon
-    if int(keep.sum()) < 3:
-        keep[:min(3, len(anchored))] = True
-    anchored = anchored[keep]
+    # One-sided offset trace: only where the walk stopped short of the horizon.
+    start = ordered[-1] if len(ordered) else np.asarray(car_pos, dtype=np.float64)
+    walked = float(np.sum(np.linalg.norm(np.diff(np.vstack([car_pos.reshape(1, 2), ordered]),
+                                                 axis=0), axis=1))) if len(ordered) else 0.0
+    if walked >= plan_horizon:
+        return cl, blue_segs, yellow_segs, midpoints
 
-    cl = smooth_centreline(anchored, n_out=max(20, (len(anchored) - 1) * 5),
-                           smooth_per_pt=smooth_per_pt)
-    return cl, blue_segs, yellow_segs, midpoints
+    params = dict(one_sided_params or {})
+    trace_kw = {k: params.pop(k) for k in ('max_step', 'max_turn_deg', 'turn_weight') if k in params}
+    require_orphan = walked >= params.pop('min_walk', _ONE_SIDED_MIN_WALK)
+    seed = prev_dir if prev_dir is not None else np.array([math.cos(car_yaw), math.sin(car_yaw)])
+    blue_a = np.asarray(blue_cones, dtype=np.float64).reshape(-1, 2)
+    yellow_a = np.asarray(yellow_cones, dtype=np.float64).reshape(-1, 2)
+    all_cones = np.vstack([blue_a, yellow_a, np.asarray(orange_cones, dtype=np.float64).reshape(-1, 2)
+                           if orange_cones is not None else np.empty((0, 2))])
+    # Direction of travel where the extension starts: the walk's last step,
+    # or the seed when it starts at the car.
+    travel = seed
+    if len(ordered):
+        prev = ordered[-2] if len(ordered) > 1 else np.asarray(car_pos, dtype=np.float64)
+        step = ordered[-1] - prev
+        if float(np.linalg.norm(step)) > 1e-6:
+            travel = step / float(np.linalg.norm(step))
+    best = None   # (heads forward, extension length, side, trace, extension)
+    for side, own, other, is_blue in (('blue', blue_a, yellow_a, True),
+                                      ('yellow', yellow_a, blue_a, False)):
+        trace = _side_trace(own, car_pos, seed, **trace_kw)
+        if len(trace) < 2:
+            continue
+        ext = _one_sided_extension(
+            trace, is_blue, start, car_pos, other, all_cones, mid_max=mid_max_gate,
+            max_len=plan_horizon - walked, seed_dir=seed, require_orphan=require_orphan, **params,
+        )
+        if len(ext) == 0:
+            continue
+        # Prefer one that heads forward from where it starts, then the longer.
+        # A trace of cones beside or behind the car (e.g. the two inner cones
+        # either side of a hairpin's missing apex, joined by one long step)
+        # can pass every other test and still offset into a path that leaves
+        # sideways or backwards -- which _sanitize then rejects -- and on
+        # length alone it beat the other side's good path. Not a hard reject:
+        # where it is the only extension, _sanitize gets to judge it (replays
+        # lose a few paths that pass when it is dropped outright).
+        away = np.linalg.norm(ext - start, axis=1)
+        probe = ext[int(np.argmax(away >= 1.0))] if np.any(away >= 1.0) else ext[-1]
+        forward = float((probe - start) @ travel) > 0.0
+        length = float(np.sum(np.linalg.norm(np.diff(np.vstack([start, ext]), axis=0), axis=1)))
+        if best is None or (forward, length) > best[:2]:
+            best = (forward, length, side, trace, ext)
+    if best is None:
+        return cl, blue_segs, yellow_segs, midpoints
+
+    _, _, side, trace, ext = best
+    # Gate midpoints the car has already passed would put a hook between the
+    # car and the extension (which never starts behind the car).
+    ahead = ordered[(ordered - car_pos) @ seed > 0.0] if len(ordered) else ordered
+    chain = np.vstack([ahead, ext]) if len(ahead) else ext
+    cl_one = _anchor_and_smooth(car_pos, chain, plan_horizon, smooth_per_pt)
+    if side == 'blue':
+        blue_segs = _drop_trace_chords(blue_segs, trace)
+    else:
+        yellow_segs = _drop_trace_chords(yellow_segs, trace)
+    if info is not None:
+        info.update(one_sided=True, side=side, trace=trace, extension=ext)
+    return cl_one, blue_segs, yellow_segs, midpoints

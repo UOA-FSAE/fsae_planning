@@ -27,6 +27,57 @@ sim_perception:
     # messages is this node's expensive path, and the planner gains nothing
     # from it running at the control rate.
     cone_rate: 10.0     # Hz; left/right_track + cone_detection
+    # Kart camera emulation (see sim_perception's docstring). 'window' = the
+    # look_radius/box crop above, published straight as the *_track topics;
+    # 'camera' = a forward wedge publishing only cone_detection frames, which
+    # cone_mapper_shim (below, the kart's node) turns into the tracks -- the
+    # kart's camera -> shim -> planner chain. Overridable from sim.launch.py.
+    fov_mode: 'window'
+    camera_hfov_deg: 110.0        # ZED 2i, 2.1 mm lens (72 for the 4 mm lens)
+    # m; the ZED 2i measures depth to 20 m, 98% of the kart's fused cones are
+    # within 8 m. 10 is the floor for the sim: FSDS puts the first cones past
+    # the start gate 9.2-9.4 m ahead, and with less the car is left a ~2.7 m
+    # stub at the start, which sets a speed too low for the FSDS car to move off.
+    camera_range: 10.0
+    camera_rate: 8.0              # Hz; the kart's /cone_detection_fused runs 8.0-8.5 Hz
+    camera_dropout: 0.0           # per-cone, per-frame miss probability
+    camera_fixed_miss: 0.0        # fraction of blue/yellow cones never detected (sparse-track emulation)
+    camera_noise_std: 0.0         # m per axis at 10 m, linear in range
+    camera_both_colours_gate: false
+    camera_seed: 0
+
+# --- the kart's cone_mapper_shim (fsae_planning, verbatim copy) ---
+# Camera mode only (perception.launch.py starts it): turns sim_perception's
+# cone_detection frames into /fsae/slam/*_track exactly as on the kart.
+# Values copied from fsae_autonomous' fsae_params.yaml -- keep them in step.
+cone_mapper_shim:
+  ros__parameters:
+    invert_cones: false
+    match_radius: 0.8                # m, same-cone tolerance
+    persistence_sec: 1.0             # s, cone survival with no re-detection (code default 0.5)
+    filter_window: 5                 # detections averaged per cone (moving average)
+    publish_rate: 20.0               # Hz, fixed publish/expiry tick
+
+# --- cone_memory (fsae_planning): longer-lived local cone map, own process ---
+# Reads the same frames as the shim and publishes /fsae/cone_memory/*_track;
+# the planner reads those instead of /fsae/slam/* with
+# planner_cone_source:=memory (sim.launch.py). See cone_memory.py.
+# view_hfov_deg/view_range follow camera_hfov_deg/camera_range when launched
+# from sim.launch.py.
+cone_memory:
+  ros__parameters:
+    invert_cones: false
+    match_radius: 0.8                # m, as the shim
+    filter_window: 5                 # as the shim
+    persistence_sec: 1.0             # s, always kept this long (the shim's whole life)
+    keep_radius: 10.0                # m, then kept while this close to the car...
+    max_age: 30.0                    # s, ...up to this long since last seen
+    min_hits: 2                      # frames before a cone is published (phantom guard)
+    view_hfov_deg: 110.0
+    view_range: 16.0
+    max_misses: 3                    # consecutive in-view misses that drop a cone
+    reset_jump: 5.0                  # m, pose jump that clears the memory
+    publish_rate: 20.0               # Hz
 
 # --- planning (one planner runs at a time; node name == executable) ---
 # `smooth` is the per-point spline smoothing budget (splprep s = smooth * n_pts,
@@ -111,6 +162,26 @@ centerline_planner:
     start_line_min_width: 2.0
     start_line_max_width: 5.0
     same_side_max: 2.0
+    # One-sided offset trace (centerline_planner's one_sided_* params). The
+    # code defaults are the go-kart's (half width 0.5, min track 2.3 m ->
+    # offsets 0.9 / 1.3 / 1.15). These are the FSDS car's: ~1.5 m wide (half
+    # 0.75) on FS-rule tracks (min width 3.0 m; every FSDS map is 3.5 m):
+    #   offset_min = 0.75 + 0.4 m margin to the seen side          = 1.15
+    #   offset_max = 3.0 - 0.75 - 0.5 m margin to the unseen side  = 1.75
+    #   offset_default = 3.0 / 2                                   = 1.5
+    one_sided: true
+    one_sided_car_half_width: 0.75
+    one_sided_min_track_width: 3.0
+    one_sided_offset_min: 1.15
+    one_sided_offset_max: 1.75
+    one_sided_offset_default: 1.5
+    one_sided_taper: 3.0
+    one_sided_min_walk: 4.0
+    one_sided_trace_max_step: 7.0
+    one_sided_trace_max_turn_deg: 80.0
+    one_sided_good_len: 4.0
+    one_sided_enter_ticks: 3
+    one_sided_exit_ticks: 5
 skidpad_planner:
   ros__parameters:
     v_start: 3.0        # m/s — speed at the start of the ramp

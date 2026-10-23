@@ -26,6 +26,10 @@ setup(
         'console_scripts': [
             'centerline_planner = fsae_planning.centerline_planner:main',
             'skidpad_planner    = fsae_planning.special_utils.skidpad_planner:main',
+            # The kart's cone_mapper_shim (verbatim copy) and the long-retention
+            # cone_memory -- see perception.launch.py.
+            'cone_mapper_shim   = fsae_planning.cone_mapper_shim:main',
+            'cone_memory        = fsae_planning.cone_memory:main',
         ],
     },
 )
